@@ -83,8 +83,10 @@ _restore_profile() {
   local name="$1"
   local pfile
   pfile=$(_profile_file "$name")
-  [ -f "$pfile" ] && [ -f "$STATE_FILE" ] || return 0
-  python3 -c "
+  [ -f "$STATE_FILE" ] || return 0
+  if [ -f "$pfile" ]; then
+    # Restore saved profile for this account
+    python3 -c "
 import json, sys
 try:
     state = json.load(open('$STATE_FILE'))
@@ -95,6 +97,20 @@ try:
 except Exception:
     sys.exit(0)
 " 2>/dev/null || true
+  else
+    # No saved profile yet — clear cached identity so Claude Code re-fetches
+    python3 -c "
+import json, sys
+try:
+    state = json.load(open('$STATE_FILE'))
+    if 'oauthAccount' in state:
+        del state['oauthAccount']
+        with open('$STATE_FILE', 'w') as f:
+            json.dump(state, f)
+except Exception:
+    sys.exit(0)
+" 2>/dev/null || true
+  fi
 }
 
 _ensure_config_dir() {
