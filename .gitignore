@@ -1,0 +1,14 @@
+# Credentials (never commit these)
+.credentials*
+*.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
