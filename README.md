@@ -1,5 +1,7 @@
 # hats
 
+![hats — Switch between Claude Code accounts like changing hats](banner.png)
+
 Switch between Claude Code accounts like changing hats.
 
 Run multiple Claude Code subscriptions on the same machine with safe credential swapping, `flock`-based concurrency, and built-in backup/restore.
