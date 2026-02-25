@@ -361,8 +361,7 @@ cmd_swap() {
     exit 1
   }
 
-  # Swap cached profile so Claude Code shows the right identity
-  _save_profile "$default"
+  # Restore target account's cached identity (or clear to force re-fetch)
   _restore_profile "$name"
 
   # Clear env var that would override file-based auth
