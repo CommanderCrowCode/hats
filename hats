@@ -2,11 +2,13 @@
 # hats — Switch between Claude Code accounts like changing hats
 # https://github.com/CommanderCrowCode/hats
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 set -euo pipefail
 
 CLAUDE_DIR="${HATS_CLAUDE_DIR:-$HOME/.claude}"
 CREDS_FILE="$CLAUDE_DIR/.credentials.json"
+# Claude Code persists state (including cached identity) as a sibling of CLAUDE_DIR
+STATE_FILE="${CLAUDE_DIR%/.claude}/.claude.json"
 CONFIG_DIR="${HATS_CONFIG_DIR:-$HOME/.config/hats}"
 VAULT_DIR="$CONFIG_DIR/vault"
 LOCK_FILE="$CLAUDE_DIR/.credentials.lock"
@@ -14,6 +16,7 @@ LOCK_FILE="$CLAUDE_DIR/.credentials.lock"
 # ── Helpers ──────────────────────────────────────────────────────
 
 _creds_file() { echo "$CLAUDE_DIR/.credentials.${1}.json"; }
+_profile_file() { echo "$CLAUDE_DIR/.profile.${1}.json"; }
 
 _accounts() {
   for f in "$CLAUDE_DIR"/.credentials.*.json; do
@@ -55,6 +58,43 @@ try:
 except Exception as e:
     print(f'error={e}')
 " 2>/dev/null
+}
+
+_save_profile() {
+  local name="$1"
+  local pfile
+  pfile=$(_profile_file "$name")
+  [ -f "$STATE_FILE" ] || return 0
+  python3 -c "
+import json, sys
+try:
+    state = json.load(open('$STATE_FILE'))
+    profile = state.get('oauthAccount')
+    if profile:
+        with open('$pfile', 'w') as f:
+            json.dump(profile, f)
+except Exception:
+    sys.exit(0)
+" 2>/dev/null || true
+  [ -f "$pfile" ] && chmod 600 "$pfile"
+}
+
+_restore_profile() {
+  local name="$1"
+  local pfile
+  pfile=$(_profile_file "$name")
+  [ -f "$pfile" ] && [ -f "$STATE_FILE" ] || return 0
+  python3 -c "
+import json, sys
+try:
+    state = json.load(open('$STATE_FILE'))
+    profile = json.load(open('$pfile'))
+    state['oauthAccount'] = profile
+    with open('$STATE_FILE', 'w') as f:
+        json.dump(state, f)
+except Exception:
+    sys.exit(0)
+" 2>/dev/null || true
 }
 
 _ensure_config_dir() {
@@ -193,6 +233,7 @@ cmd_add() {
 
   cp "$CREDS_FILE" "$target"
   chmod 600 "$target"
+  _save_profile "$name"
   echo "Account '$name' added."
 
   if [ "$(_accounts | wc -l)" -eq 1 ]; then
@@ -227,6 +268,7 @@ cmd_remove() {
   fi
 
   rm -f "$target"
+  rm -f "$(_profile_file "$name")"
   echo "Account '$name' removed."
   echo "Vault backup (if any) kept at: $VAULT_DIR/"
 }
@@ -303,6 +345,10 @@ cmd_swap() {
     exit 1
   }
 
+  # Swap cached profile so Claude Code shows the right identity
+  _save_profile "$default"
+  _restore_profile "$name"
+
   # Clear env var that would override file-based auth
   unset CLAUDE_CODE_OAUTH_TOKEN 2>/dev/null || true
   [ -n "${TMUX:-}" ] && tmux setenv -u CLAUDE_CODE_OAUTH_TOKEN 2>/dev/null || true
@@ -311,13 +357,15 @@ cmd_swap() {
   claude "$@"
   local rc=$?
 
-  # Save back any token refreshes Claude Code made during the session
+  # Save back any token refreshes and profile updates Claude Code made
   if [ -f "$CREDS_FILE" ]; then
     flock -w 10 "$LOCK_FILE" cp "$CREDS_FILE" "$account_creds" 2>/dev/null || true
   fi
+  _save_profile "$name"
 
-  # Restore default account credentials
+  # Restore default account credentials and profile
   flock -w 10 "$LOCK_FILE" cp "$default_creds" "$CREDS_FILE" 2>/dev/null || true
+  _restore_profile "$default"
 
   return $rc
 }
@@ -329,11 +377,17 @@ cmd_backup() {
   local count=0
 
   for name in $(_accounts); do
-    local src dst
+    local src dst psrc pdst
     src=$(_creds_file "$name")
     dst="$VAULT_DIR/.credentials.${name}.json"
     cp "$src" "$dst"
     chmod 600 "$dst"
+    psrc=$(_profile_file "$name")
+    pdst="$VAULT_DIR/.profile.${name}.json"
+    if [ -f "$psrc" ]; then
+      cp "$psrc" "$pdst"
+      chmod 600 "$pdst"
+    fi
     echo "  $name: backed up"
     count=$((count + 1))
   done
@@ -379,6 +433,13 @@ _restore_one() {
   if [ -f "$src" ]; then
     cp "$src" "$dst"
     chmod 600 "$dst"
+    local psrc="$VAULT_DIR/.profile.${name}.json"
+    local pdst
+    pdst=$(_profile_file "$name")
+    if [ -f "$psrc" ]; then
+      cp "$psrc" "$pdst"
+      chmod 600 "$pdst"
+    fi
     echo "  $name: restored"
   else
     echo "  $name: FAILED (no vault backup)" >&2
@@ -408,6 +469,8 @@ cmd_fix() {
       chmod 600 "$CREDS_FILE"
       echo "  Active credentials set to $default."
     fi
+    _restore_profile "$default"
+    echo "  Profile restored to $default."
   fi
 
   rm -f "$LOCK_FILE"
@@ -490,6 +553,36 @@ cmd_version() {
   echo "hats $VERSION"
 }
 
+cmd_bump() {
+  local part="${1:-}"
+  if [ -z "$part" ]; then
+    echo "Usage: hats bump <major|minor|patch>" >&2
+    echo "" >&2
+    echo "Current version: $VERSION" >&2
+    exit 1
+  fi
+
+  local major minor patch
+  IFS='.' read -r major minor patch <<< "$VERSION"
+
+  case "$part" in
+    major) major=$((major + 1)); minor=0; patch=0 ;;
+    minor) minor=$((minor + 1)); patch=0 ;;
+    patch) patch=$((patch + 1)) ;;
+    *)
+      echo "Error: must be major, minor, or patch" >&2
+      exit 1
+      ;;
+  esac
+
+  local new_version="${major}.${minor}.${patch}"
+  local self
+  self=$(readlink -f "$0")
+
+  sed -i "s/^VERSION=\"$VERSION\"/VERSION=\"$new_version\"/" "$self"
+  echo "$VERSION -> $new_version"
+}
+
 # ── Main ─────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -505,6 +598,7 @@ case "${1:-}" in
   stash)            cmd_stash ;;
   unstash)          cmd_unstash ;;
   shell-init)       shift; cmd_shell_init "$@" ;;
+  bump)             cmd_bump "${2:-}" ;;
   version|-v|--version) cmd_version ;;
   help|-h|--help|"")
     cat <<EOF
@@ -534,6 +628,8 @@ Shell Integration:
                        Use: eval "\$(hats shell-init)"
                        Flags: --skip-permissions
 
+Development:
+  bump <part>          Bump version (major|minor|patch)
   version              Show version
 
 Environment Variables:

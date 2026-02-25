@@ -196,7 +196,7 @@ Claude Code's [Remote Control](https://docs.anthropic.com/en/docs/claude-code/re
 
 ```
 $ hats list
-Claude Code Accounts (hats 0.1.0)
+Claude Code Accounts (hats 0.2.0)
 ======================================
 
   * work         ok (expires 2026-02-26) [rc] [vault]
@@ -223,17 +223,19 @@ hats uses environment variables for configuration:
 ### File Layout
 
 ```
+~/.claude.json                        # Claude Code state (contains cached identity)
+
 ~/.claude/
-├── .credentials.json              # Active credentials (always default when idle)
-├── .credentials.<account1>.json   # Account 1's permanent credentials
-├── .credentials.<account2>.json   # Account 2's permanent credentials
-└── .credentials.lock              # flock lockfile (auto-created)
+├── .credentials.json                 # Active credentials (always default when idle)
+├── .credentials.<account>.json       # Per-account permanent credentials
+├── .profile.<account>.json           # Per-account cached identity (name, email)
+└── .credentials.lock                 # flock lockfile (auto-created)
 
 ~/.config/hats/
-├── default                        # Default account name
+├── default                           # Default account name
 └── vault/
-    ├── .credentials.<account1>.json
-    └── .credentials.<account2>.json
+    ├── .credentials.<account>.json   # Credential backup
+    └── .profile.<account>.json       # Identity backup
 ```
 
 ## Troubleshooting

@@ -1,6 +1,6 @@
 # Roadmap
 
-## v0.1 (Current)
+## v0.1
 
 Plaintext credential files with flock-based swapping.
 
@@ -13,7 +13,15 @@ Plaintext credential files with flock-based swapping.
 - [x] Stash/unstash for adding new accounts
 - [x] Configurable via environment variables
 
-## v0.2
+## v0.2 (Current)
+
+Identity-aware account switching and developer tooling.
+
+- [x] Profile identity swap — save/restore cached user identity (displayName, email) per account
+- [x] Save refreshed tokens back to account file after swap session
+- [x] `hats bump <major|minor|patch>` — semantic version bumping
+
+## v0.3
 
 Quality-of-life improvements.
 
