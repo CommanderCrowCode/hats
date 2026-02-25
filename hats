@@ -311,6 +311,11 @@ cmd_swap() {
   claude "$@"
   local rc=$?
 
+  # Save back any token refreshes Claude Code made during the session
+  if [ -f "$CREDS_FILE" ]; then
+    flock -w 10 "$LOCK_FILE" cp "$CREDS_FILE" "$account_creds" 2>/dev/null || true
+  fi
+
   # Restore default account credentials
   flock -w 10 "$LOCK_FILE" cp "$default_creds" "$CREDS_FILE" 2>/dev/null || true
 
