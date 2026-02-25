@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# bump — Semantic version bumping for hats development
+# Usage: ./bump <major|minor|patch>
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+HATS="$SCRIPT_DIR/hats"
+
+part="${1:-}"
+if [ -z "$part" ]; then
+  current=$(grep -oP '^VERSION="\K[^"]+' "$HATS")
+  echo "Usage: ./bump <major|minor|patch>" >&2
+  echo "" >&2
+  echo "Current version: $current" >&2
+  exit 1
+fi
+
+current=$(grep -oP '^VERSION="\K[^"]+' "$HATS")
+IFS='.' read -r major minor patch <<< "$current"
+
+case "$part" in
+  major) major=$((major + 1)); minor=0; patch=0 ;;
+  minor) minor=$((minor + 1)); patch=0 ;;
+  patch) patch=$((patch + 1)) ;;
+  *)
+    echo "Error: must be major, minor, or patch" >&2
+    exit 1
+    ;;
+esac
+
+new_version="${major}.${minor}.${patch}"
+sed -i "s/^VERSION=\"$current\"/VERSION=\"$new_version\"/" "$HATS"
+echo "$current -> $new_version"

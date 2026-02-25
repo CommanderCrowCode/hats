@@ -15,11 +15,11 @@ Plaintext credential files with flock-based swapping.
 
 ## v0.2 (Current)
 
-Identity-aware account switching and developer tooling.
+Identity-aware account switching.
 
 - [x] Profile identity swap — save/restore cached user identity (displayName, email) per account
 - [x] Save refreshed tokens back to account file after swap session
-- [x] `hats bump <major|minor|patch>` — semantic version bumping
+- [x] `./bump <major|minor|patch>` dev script for semantic versioning
 
 ## v0.3
 

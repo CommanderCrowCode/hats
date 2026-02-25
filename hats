@@ -553,36 +553,6 @@ cmd_version() {
   echo "hats $VERSION"
 }
 
-cmd_bump() {
-  local part="${1:-}"
-  if [ -z "$part" ]; then
-    echo "Usage: hats bump <major|minor|patch>" >&2
-    echo "" >&2
-    echo "Current version: $VERSION" >&2
-    exit 1
-  fi
-
-  local major minor patch
-  IFS='.' read -r major minor patch <<< "$VERSION"
-
-  case "$part" in
-    major) major=$((major + 1)); minor=0; patch=0 ;;
-    minor) minor=$((minor + 1)); patch=0 ;;
-    patch) patch=$((patch + 1)) ;;
-    *)
-      echo "Error: must be major, minor, or patch" >&2
-      exit 1
-      ;;
-  esac
-
-  local new_version="${major}.${minor}.${patch}"
-  local self
-  self=$(readlink -f "$0")
-
-  sed -i "s/^VERSION=\"$VERSION\"/VERSION=\"$new_version\"/" "$self"
-  echo "$VERSION -> $new_version"
-}
-
 # ── Main ─────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -598,7 +568,6 @@ case "${1:-}" in
   stash)            cmd_stash ;;
   unstash)          cmd_unstash ;;
   shell-init)       shift; cmd_shell_init "$@" ;;
-  bump)             cmd_bump "${2:-}" ;;
   version|-v|--version) cmd_version ;;
   help|-h|--help|"")
     cat <<EOF
@@ -628,8 +597,6 @@ Shell Integration:
                        Use: eval "\$(hats shell-init)"
                        Flags: --skip-permissions
 
-Development:
-  bump <part>          Bump version (major|minor|patch)
   version              Show version
 
 Environment Variables:
