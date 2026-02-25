@@ -2,7 +2,7 @@
 # hats — Switch between Claude Code accounts like changing hats
 # https://github.com/CommanderCrowCode/hats
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 set -euo pipefail
 
 CLAUDE_DIR="${HATS_CLAUDE_DIR:-$HOME/.claude}"
