@@ -2,8 +2,13 @@
 # hats — Switch between Claude Code accounts like changing hats
 # https://github.com/CommanderCrowCode/hats
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 set -euo pipefail
+
+# Guard: force bash to read the entire script into memory before executing,
+# so a mid-session install/upgrade can't corrupt a running instance.
+# shellcheck disable=SC2317
+{
 
 CLAUDE_DIR="${HATS_CLAUDE_DIR:-$HOME/.claude}"
 CREDS_FILE="$CLAUDE_DIR/.credentials.json"
@@ -257,6 +262,32 @@ cmd_add() {
     echo "Set as default account."
   fi
 
+  # Warn if this account's email matches an existing account — logging in
+  # as the same claude.ai user for two hats can invalidate the older session's
+  # refresh token on the OAuth server.
+  local new_pfile
+  new_pfile=$(_profile_file "$name")
+  if [ -f "$new_pfile" ]; then
+    local new_email
+    new_email=$(python3 -c "import json; print(json.load(open('$new_pfile')).get('emailAddress',''))" 2>/dev/null || true)
+    if [ -n "$new_email" ]; then
+      for existing in $(_accounts); do
+        [ "$existing" = "$name" ] && continue
+        local existing_pfile
+        existing_pfile=$(_profile_file "$existing")
+        [ -f "$existing_pfile" ] || continue
+        local existing_email
+        existing_email=$(python3 -c "import json; print(json.load(open('$existing_pfile')).get('emailAddress',''))" 2>/dev/null || true)
+        if [ "$new_email" = "$existing_email" ]; then
+          echo ""
+          echo "  Warning: '$name' uses the same login ($new_email) as '$existing'."
+          echo "  This new session may have invalidated '$existing's refresh token."
+          echo "  Run '$existing' to verify, or re-login for '$existing' if broken."
+        fi
+      done
+    fi
+  fi
+
   echo ""
   _show_account_status "$name"
 }
@@ -372,15 +403,27 @@ cmd_swap() {
   claude "$@"
   local rc=$?
 
-  # Save back any token refreshes and profile updates Claude Code made
+  # Save back any token refreshes Claude Code made
   if [ -f "$CREDS_FILE" ]; then
     flock -w 10 "$LOCK_FILE" cp "$CREDS_FILE" "$account_creds" 2>/dev/null || true
   fi
-  _save_profile "$name"
 
-  # Restore default account credentials and profile
-  flock -w 10 "$LOCK_FILE" cp "$default_creds" "$CREDS_FILE" 2>/dev/null || true
-  _restore_profile "$default"
+  # Only update cached profile on clean exit — a failed session (e.g. 401)
+  # may leave stale identity in .claude.json, which would contaminate the
+  # profile file for this account.
+  [ "$rc" -eq 0 ] && _save_profile "$name"
+
+  # Restore default account credentials and profile, but ONLY when swapping
+  # to a non-default account. When name == default, account_creds and
+  # default_creds point to the same file — the save-back above already wrote
+  # to it, so reading it back here is a no-op at best. If Claude modified the
+  # active file on auth failure, the save-back propagates that to default_creds,
+  # and this restore would re-copy the damage into the active file with no
+  # clean copy to fall back on.
+  if [ "$name" != "$default" ]; then
+    flock -w 10 "$LOCK_FILE" cp "$default_creds" "$CREDS_FILE" 2>/dev/null || true
+    _restore_profile "$default"
+  fi
 
   return $rc
 }
@@ -628,3 +671,5 @@ EOF
     exit 1
     ;;
 esac
+exit
+}

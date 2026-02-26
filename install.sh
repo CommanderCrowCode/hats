@@ -5,8 +5,12 @@ set -euo pipefail
 INSTALL_DIR="${1:-$HOME/.local/bin}"
 
 mkdir -p "$INSTALL_DIR"
-cp "$(dirname "$0")/hats" "$INSTALL_DIR/hats"
-chmod +x "$INSTALL_DIR/hats"
+
+# Atomic install: write to temp file then mv, so any running hats process
+# keeps reading the old inode instead of seeing partial new content.
+cp "$(dirname "$0")/hats" "$INSTALL_DIR/hats.tmp.$$"
+chmod +x "$INSTALL_DIR/hats.tmp.$$"
+mv -f "$INSTALL_DIR/hats.tmp.$$" "$INSTALL_DIR/hats"
 
 echo "Installed hats to $INSTALL_DIR/hats"
 
