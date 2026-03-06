@@ -2,7 +2,7 @@
 # hats — Switch between Claude Code accounts like changing hats
 # https://github.com/CommanderCrowCode/hats
 
-VERSION="0.2.2"
+VERSION="0.2.3"
 set -euo pipefail
 
 # Guard: force bash to read the entire script into memory before executing,
@@ -527,8 +527,6 @@ cmd_fix() {
       chmod 600 "$CREDS_FILE"
       echo "  Active credentials set to $default."
     fi
-    _restore_profile "$default"
-    echo "  Profile restored to $default."
   fi
 
   rm -f "$LOCK_FILE"
@@ -537,6 +535,113 @@ cmd_fix() {
   # Clean up stash if left behind
   if [ -f "$CREDS_FILE.stash" ]; then
     echo "  Found stale stash — leaving in place. Run 'hats unstash' if needed."
+  fi
+
+  # ── Detect and repair credential contamination ──
+  # Two accounts should never share the same refresh token.
+  local dup_creds
+  dup_creds=$(python3 -c "
+import json, os, sys
+claude_dir = os.environ.get('HATS_CLAUDE_DIR', os.path.expanduser('~/.claude'))
+tokens = {}
+for f in sorted(os.listdir(claude_dir)):
+    if not f.startswith('.credentials.') or not f.endswith('.json'):
+        continue
+    if f == '.credentials.json':
+        continue
+    name = f[len('.credentials.'):-len('.json')]
+    try:
+        d = json.load(open(os.path.join(claude_dir, f)))
+        rt = d.get('claudeAiOauth', {}).get('refreshToken', '')
+        if rt:
+            tokens.setdefault(rt, []).append(name)
+    except Exception:
+        pass
+dupes = {rt: names for rt, names in tokens.items() if len(names) > 1}
+if dupes:
+    for rt, names in dupes.items():
+        print(','.join(names))
+" 2>/dev/null || true)
+
+  if [ -n "$dup_creds" ]; then
+    echo ""
+    echo "  ⚠ Credential contamination detected!"
+    echo "    These accounts share identical tokens:"
+    while IFS= read -r group; do
+      echo "      ${group//,/ ↔ }"
+    done <<< "$dup_creds"
+    # Try to restore from vault
+    local restored_any=false
+    while IFS= read -r group; do
+      IFS=',' read -ra names <<< "$group"
+      for name in "${names[@]}"; do
+        local vault_file="$VAULT_DIR/.credentials.${name}.json"
+        local creds_file
+        creds_file=$(_creds_file "$name")
+        if [ -f "$vault_file" ]; then
+          local vault_rt current_rt
+          vault_rt=$(python3 -c "import json; print(json.load(open('$vault_file')).get('claudeAiOauth',{}).get('refreshToken',''))" 2>/dev/null || true)
+          current_rt=$(python3 -c "import json; print(json.load(open('$creds_file')).get('claudeAiOauth',{}).get('refreshToken',''))" 2>/dev/null || true)
+          if [ -n "$vault_rt" ] && [ "$vault_rt" != "$current_rt" ]; then
+            cp "$vault_file" "$creds_file"
+            chmod 600 "$creds_file"
+            echo "    Restored '$name' credentials from vault."
+            restored_any=true
+          fi
+        fi
+      done
+    done <<< "$dup_creds"
+    if [ "$restored_any" = false ]; then
+      echo "    No vault backups with different tokens found."
+      echo "    You may need to re-login: hats remove <name> && hats add <name>"
+    fi
+  fi
+
+  # ── Detect and repair profile contamination ──
+  # If multiple accounts have the same cached email, clear profiles to force re-fetch.
+  local dup_profiles
+  dup_profiles=$(python3 -c "
+import json, os, sys
+claude_dir = os.environ.get('HATS_CLAUDE_DIR', os.path.expanduser('~/.claude'))
+emails = {}
+for f in sorted(os.listdir(claude_dir)):
+    if not f.startswith('.profile.') or not f.endswith('.json'):
+        continue
+    name = f[len('.profile.'):-len('.json')]
+    try:
+        d = json.load(open(os.path.join(claude_dir, f)))
+        email = d.get('emailAddress', '')
+        if email:
+            emails.setdefault(email, []).append(name)
+    except Exception:
+        pass
+dupes = {email: names for email, names in emails.items() if len(names) > 1}
+if dupes:
+    for email, names in dupes.items():
+        print(f'{email}:{\"|\".join(names)}')
+" 2>/dev/null || true)
+
+  if [ -n "$dup_profiles" ]; then
+    echo ""
+    echo "  ⚠ Profile contamination detected!"
+    while IFS= read -r line; do
+      local email="${line%%:*}"
+      local name_list="${line#*:}"
+      echo "    Same identity ($email) cached for: ${name_list//|/, }"
+      IFS='|' read -ra names <<< "$name_list"
+      for name in "${names[@]}"; do
+        local pfile
+        pfile=$(_profile_file "$name")
+        rm -f "$pfile"
+      done
+    done <<< "$dup_profiles"
+    echo "    Cleared affected profiles — correct identity will be fetched on next swap."
+  fi
+
+  # Restore default profile (after contamination cleanup)
+  if [ -n "$default" ]; then
+    _restore_profile "$default"
+    echo "  Profile restored to $default."
   fi
 
   echo "Done. Run 'hats list' to verify."
@@ -648,7 +753,7 @@ Credential Safety:
   restore [name]       Restore from vault (all or one)
   stash                Temporarily set aside active credentials
   unstash              Restore stashed credentials
-  fix                  Repair corrupted state, clear stale locks
+  fix                  Repair state, detect contamination, restore vault
 
 Shell Integration:
   shell-init           Output shell functions for .zshrc/.bashrc
