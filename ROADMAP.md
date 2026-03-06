@@ -13,40 +13,56 @@ Plaintext credential files with flock-based swapping.
 - [x] Stash/unstash for adding new accounts
 - [x] Configurable via environment variables
 
-## v0.2 (Current)
+## v0.2
 
 Identity-aware account switching.
 
 - [x] Profile identity swap — save/restore cached user identity (displayName, email) per account
 - [x] Save refreshed tokens back to account file after swap session
 - [x] `./bump <major|minor|patch>` dev script for semantic versioning
+- [x] Credential & profile contamination detection in `hats fix`
 
-## v0.3
+## v1.0 (Current)
+
+Per-account `CLAUDE_CONFIG_DIR` isolation — complete architecture rewrite.
+
+- [x] Each account gets its own config directory (no more credential swapping)
+- [x] Concurrent sessions are inherently safe (no locking, no races)
+- [x] `base/` template directory with shared resources via symlinks
+- [x] `hats link` / `hats unlink` — selectively share or isolate any resource
+- [x] `hats status` — show linked vs isolated resources per account
+- [x] Automatic migration from v0.2.x via `hats init`
+- [x] `~/.claude` symlink to default account (bare `claude` still works)
+- [x] No `flock` dependency — works on macOS and Linux without extra packages
+- [x] Provider-scoped directory structure (`~/.hats/claude/`) for future expansion
+
+### Removed (no longer needed)
+
+- Credential file swapping and flock locking
+- Save-back logic (was root cause of credential corruption)
+- Profile save/restore (each account has own `.claude.json`)
+- Stash/unstash (accounts have isolated directories)
+- Vault backup/restore (account directories are self-contained)
+- Contamination detection (contamination is architecturally impossible)
+
+## v1.1
 
 Quality-of-life improvements.
 
-- [ ] `hats doctor` — comprehensive health check (flock available, python3 version, file permissions)
-- [ ] `hats refresh <name>` — guided re-login flow when refresh token expires
+- [ ] `hats doctor` — comprehensive health check (python3 version, file permissions, symlink integrity)
 - [ ] Colored output (with `--no-color` flag)
 - [ ] Tab completion for zsh and bash
 - [ ] `hats export` / `hats import` — portable credential transfer between machines
 
-## v1.0
+## v2.0
 
-Encrypted credential storage.
+Multi-provider support and encrypted storage.
 
-- [ ] Encrypted backends for credential files
-  - `age` (default) — simple, no daemon, works everywhere
-  - `gpg` — for users already using GPG
-  - OS keychain — macOS Keychain, GNOME Keyring, KWallet
-- [ ] `hats encrypt` — encrypt existing plaintext credentials in place
-- [ ] `hats decrypt` — temporary decrypt for debugging
-- [ ] Automatic backend detection (prefer encrypted if available, fall back to plaintext)
-- [ ] Migration path: `hats upgrade` converts v0.x plaintext to v1.0 encrypted
+- [ ] Provider abstraction (`~/.hats/cursor/`, `~/.hats/windsurf/`)
+- [ ] Encrypted credential backends (age, gpg, OS keychain)
+- [ ] `hats encrypt` / `hats decrypt` for credential files
 
 ## Future Ideas
 
-- Multiple CLI tools (not just Claude Code) — generic credential file swapper
 - Team credential sharing via encrypted git repos
 - Audit logging with timestamps
-- macOS native support (replace flock with advisory locks)

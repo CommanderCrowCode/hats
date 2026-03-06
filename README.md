@@ -4,18 +4,18 @@
 
 Switch between Claude Code accounts like changing hats.
 
-Run multiple Claude Code subscriptions on the same machine with safe credential swapping, `flock`-based concurrency, and built-in backup/restore.
+Run multiple Claude Code subscriptions on the same machine — including concurrently — with per-account config directory isolation and flexible resource sharing.
 
 ## Why
 
-Claude Code stores credentials at `~/.claude/.credentials.json` — one file, one account. If you have multiple subscriptions (personal, work, team), you need to swap credentials before starting each session.
+Claude Code stores credentials at `~/.claude/.credentials.json` — one file, one account. If you have multiple subscriptions (personal, work, team), switching accounts means swapping credentials. Running concurrent sessions is even harder.
 
-**hats** automates this with:
-- Named accounts discovered from credential files
-- `flock`-serialized swaps (safe for concurrent sessions)
-- Automatic restore of your default account on session exit
-- Vault backups for disaster recovery
-- Shell functions so each account is just a command
+**hats** solves this by giving each account its own `CLAUDE_CONFIG_DIR`:
+- Each account gets an isolated config directory with its own credentials
+- Concurrent sessions are inherently safe — no file swapping, no locking, no races
+- Shared resources (settings, hooks, MCP config, CLAUDE.md) are symlinked to a `base/` template
+- Any resource can be selectively isolated per account with `hats unlink`
+- Shell functions let you type the account name as a command
 
 ## Quick Start
 
@@ -24,29 +24,24 @@ Claude Code stores credentials at `~/.claude/.credentials.json` — one file, on
 git clone https://github.com/CommanderCrowCode/hats.git
 cd hats && ./install.sh
 
-# Initialize (detects existing credential files)
+# Initialize (migrates existing ~/.claude/ if present)
 hats init
 
-# Save your current credentials as a named account
+# Create accounts (opens claude for /login authentication)
 hats add work
-
-# Log in as a second account
-hats stash
-claude              # run /login in the browser as your other account
 hats add personal
-hats unstash
 
-# Set your default (restored after every session)
+# Set your default (bare `claude` runs as this account)
 hats default work
 
 # Use it
 hats swap personal              # starts claude as "personal"
-hats swap work remote-control   # starts remote-control as "work"
+hats swap work -- --model opus  # pass flags to claude
 
 # Or add shell functions to your .zshrc/.bashrc
 eval "$(hats shell-init)"
 personal                        # just type the account name
-work remote-control             # with arguments
+work --model opus               # with arguments
 ```
 
 ## Install
@@ -59,39 +54,64 @@ cd hats
 
 This copies `hats` to `~/.local/bin/`. Make sure `~/.local/bin` is in your `PATH`.
 
-Or manually:
-```bash
-cp hats ~/.local/bin/hats
-chmod +x ~/.local/bin/hats
-```
-
 ### Requirements
 
-- Linux (uses `flock` from `util-linux`)
+- Linux or macOS (no platform-specific dependencies)
 - `python3` (for token inspection)
 - Claude Code installed (`claude` on PATH)
 
-macOS: `flock` is not available by default. Install via `brew install util-linux` or use the [flock shim](https://github.com/discoteq/flock).
-
 ## How It Works
 
-### Credential Swap
+### Per-Account Config Directories
+
+Each account gets its own complete `CLAUDE_CONFIG_DIR`:
 
 ```
-1. flock acquires exclusive lock
-2. cp account's credentials → ~/.claude/.credentials.json
-3. flock releases lock
-4. claude starts, reads credentials into memory
-5. claude runs (credentials in memory, file on disk doesn't matter)
-6. claude exits
-7. flock acquires lock
-8. cp default account's credentials → ~/.claude/.credentials.json
-9. flock releases lock
+~/.hats/
+├── config.toml                      # default account, version
+├── claude/
+│   ├── base/                        # template (shared resources)
+│   │   ├── settings.json
+│   │   ├── hooks.json
+│   │   ├── .mcp.json
+│   │   ├── CLAUDE.md
+│   │   ├── projects/
+│   │   └── ...
+│   ├── work/                        # CLAUDE_CONFIG_DIR for "work"
+│   │   ├── .credentials.json        # isolated (own tokens)
+│   │   ├── .claude.json             # isolated (own state)
+│   │   ├── settings.json  →         ../base/settings.json
+│   │   ├── CLAUDE.md      →         ../base/CLAUDE.md
+│   │   └── ...            →         ../base/...
+│   └── personal/                    # CLAUDE_CONFIG_DIR for "personal"
+│       └── (same structure)
+
+~/.claude → ~/.hats/claude/work/     # symlink to default account
+```
+
+Running an account is simply:
+```bash
+CLAUDE_CONFIG_DIR=~/.hats/claude/work claude "$@"
+```
+
+No credential swapping. No locking. No save-back. Claude Code reads and writes directly to the account's own directory.
+
+### Resource Sharing
+
+By default, everything except credentials and state is symlinked to `base/`:
+- **Always isolated**: `.credentials.json`, `.claude.json` (per-account tokens and identity)
+- **Shared by default**: `settings.json`, `hooks.json`, `.mcp.json`, `CLAUDE.md`, `projects/`, etc.
+
+Selectively isolate any resource:
+```bash
+hats unlink personal CLAUDE.md    # personal gets its own CLAUDE.md
+hats link personal CLAUDE.md      # re-share with base
+hats status personal              # see what's linked vs isolated
 ```
 
 ### Concurrency
 
-The lock is held only for the duration of a `cp` (microseconds). Multiple sessions run simultaneously — once Claude starts, credentials are in memory. The only theoretical race is two sessions starting within microseconds of each other, which can't happen with manual starts.
+Concurrent sessions are inherently safe. Each account has its own directory — sessions never touch each other's files. Token refresh writes to the correct account's `.credentials.json` automatically.
 
 ### Token Lifecycle
 
@@ -100,15 +120,13 @@ The lock is held only for the duration of a `cp` (microseconds). Multiple sessio
 | Access token | ~8 hours | Auto-refreshed by Claude Code |
 | Refresh token | Months | Re-run `/login` when it expires |
 
-Claude Code handles access token refresh automatically. No manual intervention needed unless the refresh token expires (you'll see auth errors).
-
 ## Commands
 
 ### Account Management
 
 ```bash
-hats init              # Initialize, detect existing accounts
-hats add <name>        # Save current credentials as named account
+hats init              # Initialize, migrate from ~/.claude/ if exists
+hats add <name>        # Create account (opens claude for /login)
 hats remove <name>     # Remove an account
 hats default [name]    # Get or set default account
 hats list              # Show all accounts with token status
@@ -120,22 +138,20 @@ hats list              # Show all accounts with token status
 hats swap <name> [-- claude-args...]
 ```
 
-Swaps credentials, runs `claude` with any provided arguments, restores default on exit.
+Runs `claude` with the account's `CLAUDE_CONFIG_DIR`.
 
 ```bash
 hats swap work                        # interactive session
-hats swap work remote-control         # remote control session
 hats swap work -- --model opus        # pass flags to claude
+hats swap work -- -p "hello"          # print mode
 ```
 
-### Credential Safety
+### Resource Management
 
 ```bash
-hats backup            # Backup all credentials to vault
-hats restore [name]    # Restore from vault
-hats stash             # Temporarily set aside active credentials
-hats unstash           # Restore stashed credentials
-hats fix               # Repair corrupted state, clear locks
+hats link <acct> <file>     # Share a resource with base (symlink)
+hats unlink <acct> <file>   # Isolate a resource (copy from base)
+hats status [account]       # Show linked vs isolated resources
 ```
 
 ### Shell Integration
@@ -150,45 +166,29 @@ eval "$(hats shell-init --skip-permissions)"
 
 This generates a function for each account:
 ```bash
-work() { hats swap work -- "$@"; }
-personal() { hats swap personal -- "$@"; }
+work() { CLAUDE_CONFIG_DIR="$HOME/.hats/claude/work" claude "$@"; }
+personal() { CLAUDE_CONFIG_DIR="$HOME/.hats/claude/personal" claude "$@"; }
 ```
 
-So you can just type `work` or `personal remote-control`.
+### Maintenance
+
+```bash
+hats fix               # Repair broken symlinks, verify auth
+hats version           # Show version
+```
 
 ## Adding a New Account
 
 ```bash
-# 1. Stash current credentials
-hats stash
-
-# 2. Start claude with no credentials (triggers login)
-claude
-# Run /login in the prompt
-# Authenticate as the new account in your browser
-# Type /exit after login completes
-
-# 3. Save the new credentials
-hats add <name>
-
-# 4. Restore your previous credentials
-hats unstash
-
-# 5. Back up everything
-hats backup
+hats add myaccount
+# Claude Code opens — run /login, authenticate, then /exit
 ```
+
+That's it. The account directory is created with symlinks to base, and `/login` stores credentials in the isolated directory.
 
 ## Remote Control
 
-Claude Code's [Remote Control](https://docs.anthropic.com/en/docs/claude-code/remote-control) feature requires the `user:sessions:claude_code` OAuth scope. This scope is only granted by the full `/login` flow — NOT by `setup-token`.
-
-```
-# setup-token scopes (insufficient):
-['user:inference']
-
-# /login scopes (includes remote-control):
-['user:inference', 'user:mcp_servers', 'user:profile', 'user:sessions:claude_code']
-```
+Claude Code's [Remote Control](https://docs.anthropic.com/en/docs/claude-code/remote-control) feature requires the `user:sessions:claude_code` OAuth scope, which is only granted by the full `/login` flow.
 
 `hats list` shows `[rc]` for accounts with Remote Control support and `[no-rc]` for those without.
 
@@ -196,64 +196,64 @@ Claude Code's [Remote Control](https://docs.anthropic.com/en/docs/claude-code/re
 
 ```
 $ hats list
-Claude Code Accounts (hats 0.2.0)
-======================================
+hats v1.0.0 — Claude Code Accounts
+=======================================
 
-  * work         ok (expires 2026-02-26) [rc] [vault]
-    personal     ok (access expired, will auto-refresh) [rc] [vault]
-    team         ok (expires 2026-02-25) [no-rc]
+  * work         ok (expires 2026-03-07 14:30) [rc]
+    personal     ok (access expired, will auto-refresh) [rc]
+    team         ok (expires 2026-03-06 22:15) [no-rc]
 
-Lock: none
+  3 account(s)
 ```
 
 - `*` marks the default account
 - `[rc]` = Remote Control supported
-- `[vault]` = vault backup exists
 - Access tokens expire every ~8 hours but auto-refresh via the refresh token
 
 ## Configuration
 
-hats uses environment variables for configuration:
-
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `HATS_CLAUDE_DIR` | `~/.claude` | Claude Code config directory |
-| `HATS_CONFIG_DIR` | `~/.config/hats` | Hats config and vault directory |
+| `HATS_DIR` | `~/.hats` | Hats root directory |
 
 ### File Layout
 
 ```
-~/.claude.json                        # Claude Code state (contains cached identity)
+~/.hats/
+├── config.toml                       # Global config (default account)
+├── claude/
+│   ├── base/                         # Template (never run directly)
+│   │   ├── settings.json             # Shared settings
+│   │   ├── CLAUDE.md                 # Shared instructions
+│   │   ├── projects/                 # Shared project data
+│   │   └── ...
+│   ├── <account>/                    # Per-account config directory
+│   │   ├── .credentials.json         # Isolated credentials
+│   │   ├── .claude.json              # Isolated state
+│   │   └── (everything else)  →      ../base/...
 
-~/.claude/
-├── .credentials.json                 # Active credentials (always default when idle)
-├── .credentials.<account>.json       # Per-account permanent credentials
-├── .profile.<account>.json           # Per-account cached identity (name, email)
-└── .credentials.lock                 # flock lockfile (auto-created)
-
-~/.config/hats/
-├── default                           # Default account name
-└── vault/
-    ├── .credentials.<account>.json   # Credential backup
-    └── .profile.<account>.json       # Identity backup
+~/.claude → ~/.hats/claude/<default>/ # Symlink so bare `claude` works
 ```
+
+## Migrating from v0.2.x
+
+`hats init` automatically detects and migrates v0.2.x setups:
+
+1. Moves `~/.claude/` contents to `~/.hats/claude/base/`
+2. Creates per-account directories from existing `.credentials.<name>.json` files
+3. Symlinks `~/.claude` to the default account
+4. Preserves external symlinks (CLAUDE.md, agents, skills)
 
 ## Troubleshooting
 
-**"Lock timeout" error:**
-A previous session crashed during a swap. Run `hats fix` to clear the lock.
-
-**Wrong account in session:**
-Extremely rare — credentials were swapped between lock release and claude reading the file. Restart the session.
-
 **Auth errors after idle:**
-The refresh token may have expired. Re-run `/login` for that account.
+The refresh token may have expired. Run `/login` inside a session for that account.
 
-**"flock: command not found":**
-Install `util-linux` (Linux) or see macOS instructions above.
+**Wrong identity showing:**
+Each account has its own `.claude.json` state. Run `hats fix` to verify symlinks, or start a fresh session.
 
-**tmux quits when running account function:**
-Never use `exec N>file` fd syntax in zsh — it kills the shell. hats uses the safe `flock FILE COMMAND ARGS` form.
+**Broken symlinks after Claude Code update:**
+Run `hats fix` — it detects broken symlinks and repairs them, and adds symlinks for new resources added to base.
 
 ## License
 
