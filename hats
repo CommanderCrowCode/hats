@@ -3,6 +3,7 @@
 # https://github.com/CommanderCrowCode/hats
 
 VERSION="1.1.0"
+COMMIT="dev"
 set -euo pipefail
 
 # Guard: force bash to read the entire script into memory before executing,
@@ -978,9 +979,7 @@ cmd_providers() {
 }
 
 cmd_version() {
-  local commit
-  commit=$(git -C "$(dirname "$(readlink -f "$0")")" rev-parse --short HEAD 2>/dev/null || echo "unknown")
-  echo "hats $VERSION ($commit)"
+  echo "hats $VERSION ($COMMIT)"
 }
 
 cmd_help() {

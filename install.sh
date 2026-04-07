@@ -6,9 +6,14 @@ INSTALL_DIR="${1:-$HOME/.local/bin}"
 
 mkdir -p "$INSTALL_DIR"
 
+# Stamp the commit hash into the installed copy
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+COMMIT=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+
 # Atomic install: write to temp file then mv, so any running hats process
 # keeps reading the old inode instead of seeing partial new content.
-cp "$(dirname "$0")/hats" "$INSTALL_DIR/hats.tmp.$$"
+cp "$SCRIPT_DIR/hats" "$INSTALL_DIR/hats.tmp.$$"
+sed -i "s/^COMMIT=\"dev\"$/COMMIT=\"$COMMIT\"/" "$INSTALL_DIR/hats.tmp.$$"
 chmod +x "$INSTALL_DIR/hats.tmp.$$"
 mv -f "$INSTALL_DIR/hats.tmp.$$" "$INSTALL_DIR/hats"
 
