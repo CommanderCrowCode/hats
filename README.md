@@ -2,18 +2,18 @@
 
 ![hats — Switch between Claude Code accounts like changing hats](banner.png)
 
-Switch between Claude Code accounts like changing hats.
+Switch between coding-tool accounts like changing hats.
 
-Run multiple Claude Code subscriptions on the same machine — including concurrently — with per-account config directory isolation and flexible resource sharing.
+Run multiple Claude Code and Codex accounts on the same machine — including concurrently — with per-account home/config isolation and flexible resource sharing.
 
 ## Why
 
-Claude Code stores credentials at `~/.claude/.credentials.json` — one file, one account. If you have multiple subscriptions (personal, work, team), switching accounts means swapping credentials. Running concurrent sessions is even harder.
+Claude Code stores credentials at `~/.claude/.credentials.json` — one file, one account. Codex stores local auth and runtime state under `~/.codex/`. If you have multiple subscriptions or workspaces, switching accounts means swapping a shared home/config root. Running concurrent sessions is even harder.
 
-**hats** solves this by giving each account its own `CLAUDE_CONFIG_DIR`:
-- Each account gets an isolated config directory with its own credentials
+**hats** solves this by giving each account its own provider-specific root (`CLAUDE_CONFIG_DIR` for Claude, `CODEX_HOME` for Codex):
+- Each account gets an isolated home/config directory with its own credentials
 - Concurrent sessions are inherently safe — no file swapping, no locking, no races
-- Shared resources (settings, hooks, MCP config, CLAUDE.md) are symlinked to a `base/` template
+- Shared resources are symlinked to a provider-specific `base/` template
 - Any resource can be selectively isolated per account with `hats unlink`
 - Shell functions let you type the account name as a command
 
@@ -42,6 +42,13 @@ hats swap work -- --model opus  # pass flags to claude
 eval "$(hats shell-init)"
 personal                        # just type the account name
 work --model opus               # with arguments
+
+# Codex support
+hats codex init
+hats codex add work
+hats codex swap work
+eval "$(hats codex shell-init)"
+codex_work
 ```
 
 ## Install
@@ -59,6 +66,16 @@ This copies `hats` to `~/.local/bin/`. Make sure `~/.local/bin` is in your `PATH
 - Linux or macOS (no platform-specific dependencies)
 - `python3` (for token inspection)
 - Claude Code installed (`claude` on PATH)
+- Codex CLI installed (`codex` on PATH) for Codex accounts
+
+## Providers
+
+`hats` supports:
+
+- `claude` — default provider for backward compatibility
+- `codex` — uses isolated `CODEX_HOME` directories
+
+Use `hats codex ...` to manage Codex accounts.
 
 ## How It Works
 
@@ -96,11 +113,43 @@ CLAUDE_CONFIG_DIR=~/.hats/claude/work claude "$@"
 
 No credential swapping. No locking. No save-back. Claude Code reads and writes directly to the account's own directory.
 
+### Codex Account Homes
+
+Codex uses `CODEX_HOME`, so each account gets its own isolated Codex home:
+
+```
+~/.hats/
+├── codex/
+│   ├── base/
+│   │   ├── config.toml              # shared by default
+│   │   ├── plugins/
+│   │   ├── skills/
+│   │   ├── prompts/
+│   │   └── rules/
+│   ├── work/
+│   │   ├── auth.json                # isolated
+│   │   ├── history.jsonl            # isolated
+│   │   ├── sessions/                # isolated
+│   │   ├── cache/                   # isolated
+│   │   ├── log/                     # isolated
+│   │   ├── state_*.sqlite*          # isolated
+│   │   └── config.toml      →       ../base/config.toml
+│   └── personal/
+│       └── (same structure)
+```
+
+Running a Codex account is simply:
+```bash
+CODEX_HOME=~/.hats/codex/work codex "$@"
+```
+
 ### Resource Sharing
 
-By default, everything except credentials and state is symlinked to `base/`:
-- **Always isolated**: `.credentials.json`, `.claude.json` (per-account tokens and identity)
-- **Shared by default**: `settings.json`, `hooks.json`, `.mcp.json`, `CLAUDE.md`, `projects/`, etc.
+By default, shared vs isolated resources depend on the provider:
+- **Claude always isolated**: `.credentials.json`, `.claude.json` (per-account tokens and identity)
+- **Claude shared by default**: `settings.json`, `hooks.json`, `.mcp.json`, `CLAUDE.md`, `projects/`, etc.
+- **Codex always isolated**: `auth.json`, `history.jsonl`, `sessions/`, `cache/`, `log/`, `shell_snapshots/`, `state_*.sqlite*`, `logs_*.sqlite*`, etc.
+- **Codex shared by default**: `config.toml`, `plugins/`, `skills/`, `prompts/`, `rules/`
 
 Selectively isolate any resource:
 ```bash
@@ -125,20 +174,20 @@ Concurrent sessions are inherently safe. Each account has its own directory — 
 ### Account Management
 
 ```bash
-hats init              # Initialize, migrate from ~/.claude/ if exists
-hats add <name>        # Create account (opens claude for /login)
-hats remove <name>     # Remove an account
-hats default [name]    # Get or set default account
-hats list              # Show all accounts with token status
+hats <provider> init
+hats <provider> add <name>
+hats <provider> remove <name>
+hats <provider> default [name]
+hats <provider> list
 ```
 
 ### Session Management
 
 ```bash
-hats swap <name> [-- claude-args...]
+hats <provider> swap <name> [-- provider-args...]
 ```
 
-Runs `claude` with the account's `CLAUDE_CONFIG_DIR`.
+Runs the provider CLI with the account's isolated home/config root.
 
 ```bash
 hats swap work                        # interactive session
@@ -149,25 +198,29 @@ hats swap work -- -p "hello"          # print mode
 ### Resource Management
 
 ```bash
-hats link <acct> <file>     # Share a resource with base (symlink)
-hats unlink <acct> <file>   # Isolate a resource (copy from base)
-hats status [account]       # Show linked vs isolated resources
+hats <provider> link <acct> <file>
+hats <provider> unlink <acct> <file>
+hats <provider> status [account]
 ```
 
 ### Shell Integration
 
 ```bash
-# Add to .zshrc or .bashrc:
+# Claude functions:
 eval "$(hats shell-init)"
+
+# Codex functions:
+eval "$(hats codex shell-init)"
 
 # With auto-skip permissions:
 eval "$(hats shell-init --skip-permissions)"
 ```
 
-This generates a function for each account:
+This generates a function for each account. Claude keeps bare account names. Codex defaults to a `codex_` prefix to avoid name collisions:
 ```bash
 work() { CLAUDE_CONFIG_DIR="$HOME/.hats/claude/work" claude "$@"; }
 personal() { CLAUDE_CONFIG_DIR="$HOME/.hats/claude/personal" claude "$@"; }
+codex_work() { CODEX_HOME="$HOME/.hats/codex/work" codex -c 'cli_auth_credentials_store="file"' "$@"; }
 ```
 
 ### Maintenance
@@ -185,6 +238,26 @@ hats add myaccount
 ```
 
 That's it. The account directory is created with symlinks to base, and `/login` stores credentials in the isolated directory.
+
+For Codex:
+
+```bash
+hats codex add myaccount
+```
+
+This runs `codex login` with `CODEX_HOME` pointed at the new account directory.
+
+## Codex Authentication Notes
+
+Codex support assumes file-based credentials stored in `auth.json` under each account's `CODEX_HOME`.
+
+`hats codex init` creates a shared `config.toml` with:
+
+```toml
+cli_auth_credentials_store = "file"
+```
+
+If you override Codex to use `keyring` or `auto`, hats can no longer guarantee that account credentials stay isolated inside each account directory.
 
 ## Remote Control
 
@@ -231,6 +304,18 @@ hats v1.0.0 — Claude Code Accounts
 │   │   ├── .credentials.json         # Isolated credentials
 │   │   ├── .claude.json              # Isolated state
 │   │   └── (everything else)  →      ../base/...
+├── codex/
+│   ├── base/                         # Shared Codex resources
+│   │   ├── config.toml
+│   │   ├── plugins/
+│   │   ├── skills/
+│   │   ├── prompts/
+│   │   └── rules/
+│   ├── <account>/                    # Per-account CODEX_HOME
+│   │   ├── auth.json                 # Isolated credentials
+│   │   ├── history.jsonl             # Isolated history
+│   │   ├── sessions/                 # Isolated runtime state
+│   │   └── config.toml       →       ../base/config.toml
 
 ~/.claude → ~/.hats/claude/<default>/ # Symlink so bare `claude` works
 ```

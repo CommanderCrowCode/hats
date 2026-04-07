@@ -49,6 +49,10 @@ Per-account `CLAUDE_CONFIG_DIR` isolation — complete architecture rewrite.
 
 Quality-of-life improvements.
 
+- [x] Codex provider support via per-account `CODEX_HOME`
+- [x] Provider-aware `hats <provider> ...` command routing
+- [x] Codex-safe default sharing model (`config.toml`, `plugins/`, `skills/`, `prompts/`, `rules/`)
+- [x] Codex file-based auth bootstrap (`cli_auth_credentials_store = "file"`)
 - [ ] `hats doctor` — comprehensive health check (python3 version, file permissions, symlink integrity)
 - [ ] Colored output (with `--no-color` flag)
 - [ ] Tab completion for zsh and bash
@@ -58,7 +62,7 @@ Quality-of-life improvements.
 
 Multi-provider support and encrypted storage.
 
-- [ ] Provider abstraction (`~/.hats/cursor/`, `~/.hats/windsurf/`)
+- [ ] Broader provider abstraction (`~/.hats/cursor/`, `~/.hats/windsurf/`)
 - [ ] Encrypted credential backends (age, gpg, OS keychain)
 - [ ] `hats encrypt` / `hats decrypt` for credential files
 

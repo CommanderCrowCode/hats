@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# hats — Switch between Claude Code accounts like changing hats
+# hats — Switch between Claude Code and Codex accounts like changing hats
 # https://github.com/CommanderCrowCode/hats
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 set -euo pipefail
 
 # Guard: force bash to read the entire script into memory before executing,
@@ -11,23 +11,150 @@ set -euo pipefail
 {
 
 HATS_DIR="${HATS_DIR:-$HOME/.hats}"
-HATS_CLAUDE_DIR="$HATS_DIR/claude"
-HATS_BASE_DIR="$HATS_CLAUDE_DIR/base"
 HATS_CONFIG="$HATS_DIR/config.toml"
 
-# These files are ALWAYS per-account, never symlinked to base
-ALWAYS_ISOLATED=(".credentials.json" ".claude.json")
+CURRENT_PROVIDER="claude"
+PROVIDER_TITLE=""
+PROVIDER_DIR=""
+BASE_DIR=""
+RUNTIME_DIR=""
+RUNTIME_COMMAND=""
+RUNTIME_ENV_VAR=""
+DEFAULT_KEY=""
+PRIMARY_AUTH_FILE=""
+ISOLATED_PATTERNS=()
+SHARED_ALLOWLIST=()
 
 # ── Helpers ──────────────────────────────────────────────────────
 
 die() { echo "Error: $*" >&2; exit 1; }
 
-_is_isolated() {
-  local resource="$1"
-  for f in "${ALWAYS_ISOLATED[@]}"; do
-    [ "$f" = "$resource" ] && return 0
+_is_supported_provider() {
+  case "$1" in
+    claude|codex) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_hats_cmd_prefix() {
+  if [ "$CURRENT_PROVIDER" = "claude" ]; then
+    echo "hats"
+  else
+    echo "hats $CURRENT_PROVIDER"
+  fi
+}
+
+_configure_provider() {
+  local provider="${1:-claude}"
+  _is_supported_provider "$provider" || die "Unsupported provider '$provider'. Supported: claude, codex"
+
+  CURRENT_PROVIDER="$provider"
+  PROVIDER_DIR="$HATS_DIR/$CURRENT_PROVIDER"
+  BASE_DIR="$PROVIDER_DIR/base"
+
+  case "$CURRENT_PROVIDER" in
+    claude)
+      PROVIDER_TITLE="Claude Code"
+      RUNTIME_DIR="$HOME/.claude"
+      RUNTIME_COMMAND="claude"
+      RUNTIME_ENV_VAR="CLAUDE_CONFIG_DIR"
+      DEFAULT_KEY="default_claude"
+      PRIMARY_AUTH_FILE=".credentials.json"
+      ISOLATED_PATTERNS=(".credentials.json" ".claude.json")
+      SHARED_ALLOWLIST=()
+      ;;
+    codex)
+      PROVIDER_TITLE="Codex"
+      RUNTIME_DIR="$HOME/.codex"
+      RUNTIME_COMMAND="codex"
+      RUNTIME_ENV_VAR="CODEX_HOME"
+      DEFAULT_KEY="default_codex"
+      PRIMARY_AUTH_FILE="auth.json"
+      ISOLATED_PATTERNS=(
+        "auth.json"
+        "history.jsonl"
+        "memories"
+        "cache"
+        "sessions"
+        "shell_snapshots"
+        "log"
+        ".tmp"
+        "tmp"
+        "models_cache.json"
+        "state_*.sqlite*"
+        "logs_*.sqlite*"
+      )
+      SHARED_ALLOWLIST=(
+        "config.toml"
+        "plugins"
+        "prompts"
+        "rules"
+        "skills"
+        "version.json"
+        ".personality_migration"
+      )
+      ;;
+  esac
+}
+
+_config_get() {
+  local key="$1"
+  if [ -f "$HATS_CONFIG" ]; then
+    grep -A20 '^\[hats\]' "$HATS_CONFIG" 2>/dev/null | grep "^$key" | head -1 | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | tr -d '[:space:]'
+  fi
+}
+
+_ensure_config() {
+  mkdir -p "$HATS_DIR"
+  if [ ! -f "$HATS_CONFIG" ]; then
+    cat > "$HATS_CONFIG" <<EOF
+[hats]
+version = "$VERSION"
+default_provider = "claude"
+EOF
+  fi
+}
+
+_config_set() {
+  local key="$1" value="$2"
+  _ensure_config
+
+  if grep -q "^$key" "$HATS_CONFIG" 2>/dev/null; then
+    sed -i "s#^$key.*#$key = \"$value\"#" "$HATS_CONFIG"
+  else
+    sed -i "/^\[hats\]/a $key = \"$value\"" "$HATS_CONFIG"
+  fi
+}
+
+_default_provider() {
+  local val
+  val=$(_config_get "default_provider")
+  [ -n "$val" ] && echo "$val" || echo "claude"
+}
+
+_matches_any_pattern() {
+  local value="$1"
+  shift || true
+  local pattern
+  for pattern in "$@"; do
+    [[ "$value" == $pattern ]] && return 0
   done
   return 1
+}
+
+_is_isolated() {
+  _matches_any_pattern "$1" "${ISOLATED_PATTERNS[@]}"
+}
+
+_is_shared_by_default() {
+  local resource="$1"
+
+  if [ "$CURRENT_PROVIDER" = "claude" ]; then
+    _is_isolated "$resource" && return 1
+    return 0
+  fi
+
+  _matches_any_pattern "$resource" "${SHARED_ALLOWLIST[@]}"
 }
 
 _validate_name() {
@@ -37,8 +164,8 @@ _validate_name() {
 }
 
 _accounts() {
-  [ -d "$HATS_CLAUDE_DIR" ] || return 0
-  for d in "$HATS_CLAUDE_DIR"/*/; do
+  [ -d "$PROVIDER_DIR" ] || return 0
+  for d in "$PROVIDER_DIR"/*/; do
     [ -d "$d" ] || continue
     local name
     name=$(basename "$d")
@@ -47,41 +174,143 @@ _accounts() {
   done | sort
 }
 
-_account_dir() { echo "$HATS_CLAUDE_DIR/$1"; }
+_account_dir() { echo "$PROVIDER_DIR/$1"; }
 
 _account_exists() { [ -d "$(_account_dir "$1")" ]; }
 
 _default_account() {
-  if [ -f "$HATS_CONFIG" ]; then
-    local val
-    val=$(grep -A5 '^\[hats\]' "$HATS_CONFIG" 2>/dev/null | grep '^default' | head -1 | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | tr -d '[:space:]')
-    [ -n "$val" ] && echo "$val" && return
-  fi
+  local val
+  val=$(_config_get "$DEFAULT_KEY")
+  [ -n "$val" ] && echo "$val" && return
   _accounts | head -1
+}
+
+_sync_runtime_symlink() {
+  local name="$1"
+  ln -sfn "$PROVIDER_DIR/$name" "$RUNTIME_DIR"
 }
 
 _set_default() {
   local name="$1"
-  if [ -f "$HATS_CONFIG" ]; then
-    # Update existing default line
-    if grep -q '^default' "$HATS_CONFIG" 2>/dev/null; then
-      sed -i "s/^default.*/default = \"$name\"/" "$HATS_CONFIG"
-    else
-      sed -i "/^\[hats\]/a default = \"$name\"" "$HATS_CONFIG"
-    fi
-  else
-    mkdir -p "$HATS_DIR"
-    cat > "$HATS_CONFIG" <<EOF
-[hats]
-version = "$VERSION"
-default = "$name"
-EOF
-  fi
-  # Update ~/.claude symlink
-  ln -sfn "$HATS_CLAUDE_DIR/$name" "$HOME/.claude"
+  _config_set "version" "$VERSION"
+  _config_set "default_provider" "$CURRENT_PROVIDER"
+  _config_set "$DEFAULT_KEY" "$name"
+  _sync_runtime_symlink "$name"
 }
 
-_token_info() {
+_ensure_codex_base_config() {
+  [ "$CURRENT_PROVIDER" = "codex" ] || return 0
+
+  mkdir -p "$BASE_DIR"
+  if [ ! -f "$BASE_DIR/config.toml" ]; then
+    cat > "$BASE_DIR/config.toml" <<EOF
+# Shared Codex config managed by hats.
+cli_auth_credentials_store = "file"
+EOF
+    return 0
+  fi
+
+  if grep -q '^cli_auth_credentials_store' "$BASE_DIR/config.toml" 2>/dev/null; then
+    sed -i 's#^cli_auth_credentials_store.*#cli_auth_credentials_store = "file"#' "$BASE_DIR/config.toml"
+  else
+    printf '\ncli_auth_credentials_store = "file"\n' >> "$BASE_DIR/config.toml"
+  fi
+}
+
+_ensure_provider_defaults() {
+  [ "$CURRENT_PROVIDER" = "codex" ] && _ensure_codex_base_config
+}
+
+_ensure_account_defaults() {
+  local acct_dir="$1"
+  case "$CURRENT_PROVIDER" in
+    claude)
+      [ -f "$acct_dir/.claude.json" ] || echo '{}' > "$acct_dir/.claude.json"
+      ;;
+  esac
+}
+
+_provider_login_hint() {
+  case "$CURRENT_PROVIDER" in
+    claude) echo "Run /login inside the session to authenticate, then /exit when done." ;;
+    codex) echo "Codex login will run with file-based credentials stored in the account directory." ;;
+  esac
+}
+
+_provider_add_failure_hint() {
+  case "$CURRENT_PROVIDER" in
+    claude) echo "Run: hats add $1" ;;
+    codex) echo "Run: hats codex add $1" ;;
+  esac
+}
+
+_credential_file() {
+  echo "$(_account_dir "$1")/$PRIMARY_AUTH_FILE"
+}
+
+_setup_account_dir() {
+  local name="$1"
+  local acct_dir
+  acct_dir=$(_account_dir "$name")
+
+  mkdir -p "$acct_dir"
+  _ensure_provider_defaults
+
+  for item in "$BASE_DIR"/* "$BASE_DIR"/.*; do
+    [ -e "$item" ] || [ -L "$item" ] || continue
+    local basename
+    basename=$(basename "$item")
+
+    [[ "$basename" == "." || "$basename" == ".." ]] && continue
+    _is_isolated "$basename" && continue
+    _is_shared_by_default "$basename" || continue
+
+    if [ -e "$acct_dir/$basename" ] || [ -L "$acct_dir/$basename" ]; then
+      continue
+    fi
+
+    ln -s "../base/$basename" "$acct_dir/$basename"
+  done
+
+  _ensure_account_defaults "$acct_dir"
+}
+
+_link_resource() {
+  local name="$1" resource="$2"
+  local acct_dir
+  acct_dir=$(_account_dir "$name")
+
+  _is_isolated "$resource" && die "'$resource' is always isolated and cannot be linked."
+  [ -e "$BASE_DIR/$resource" ] || [ -L "$BASE_DIR/$resource" ] || die "Resource '$resource' not found in base."
+
+  if [ -L "$acct_dir/$resource" ]; then
+    local target
+    target=$(readlink "$acct_dir/$resource")
+    [[ "$target" == *"base/$resource"* ]] && die "'$resource' is already linked to base."
+  fi
+
+  rm -rf "$acct_dir/$resource"
+  ln -s "../base/$resource" "$acct_dir/$resource"
+  echo "Linked $CURRENT_PROVIDER/$name/$resource -> base/$resource"
+}
+
+_unlink_resource() {
+  local name="$1" resource="$2"
+  local acct_dir
+  acct_dir=$(_account_dir "$name")
+
+  _is_isolated "$resource" && die "'$resource' is always isolated."
+  [ -L "$acct_dir/$resource" ] || die "'$resource' is already isolated for '$name'."
+
+  local real_path
+  real_path=$(realpath "$acct_dir/$resource")
+
+  rm "$acct_dir/$resource"
+  cp -a "$real_path" "$acct_dir/$resource"
+  echo "Unlinked $CURRENT_PROVIDER/$name/$resource (now isolated)"
+}
+
+_token_info_claude() {
   local file="$1"
   python3 -c "
 import json, datetime, sys
@@ -106,10 +335,41 @@ except Exception as e:
 " 2>/dev/null
 }
 
+_token_info_codex() {
+  local file="$1"
+  local acct_dir
+  acct_dir=$(dirname "$file")
+  local store="unknown"
+  if [ -f "$acct_dir/config.toml" ]; then
+    store=$(grep '^cli_auth_credentials_store' "$acct_dir/config.toml" 2>/dev/null | head -1 | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | tr -d '[:space:]')
+  fi
+  [ -n "$store" ] || store="unset"
+
+  python3 -c "
+import json, sys
+try:
+    d = json.load(open('$file'))
+    tokens = d.get('tokens') or {}
+    print('present=True')
+    print(f\"account_id={tokens.get('account_id', 'unknown')}\")
+except Exception as e:
+    print(f'error={e}')
+" 2>/dev/null
+  echo "store=$store"
+}
+
+_token_info() {
+  case "$CURRENT_PROVIDER" in
+    claude) _token_info_claude "$1" ;;
+    codex) _token_info_codex "$1" ;;
+  esac
+}
+
 _show_account_status() {
   local name="$1"
   local default="${2:-}"
-  local cfile="$(_account_dir "$name")/.credentials.json"
+  local cfile
+  cfile=$(_credential_file "$name")
 
   local marker=" "
   [ "$name" = "$default" ] && marker="*"
@@ -129,125 +389,217 @@ _show_account_status() {
     return
   fi
 
-  local expired has_refresh has_rc exp_date
-  expired=$(echo "$info" | grep -oP 'expired=\K\w+')
-  has_refresh=$(echo "$info" | grep -oP 'refresh=\K\w+')
-  has_rc=$(echo "$info" | grep -oP 'remote_control=\K\w+')
-  exp_date=$(echo "$info" | grep -oP 'expires=\K[^ ]+')
+  case "$CURRENT_PROVIDER" in
+    claude)
+      local expired has_refresh has_rc exp_date
+      expired=$(echo "$info" | grep -oP 'expired=\K\w+')
+      has_refresh=$(echo "$info" | grep -oP 'refresh=\K\w+')
+      has_rc=$(echo "$info" | grep -oP 'remote_control=\K\w+')
+      exp_date=$(echo "$info" | grep -oP 'expires=\K[^ ]+')
 
-  local status=""
-  if [ "$expired" = "True" ]; then
-    if [ "$has_refresh" = "True" ]; then
-      status="ok (access expired, will auto-refresh)"
-    else
-      status="EXPIRED (needs /login)"
-    fi
-  else
-    status="ok (expires $exp_date)"
-  fi
+      local status=""
+      if [ "$expired" = "True" ]; then
+        if [ "$has_refresh" = "True" ]; then
+          status="ok (access expired, will auto-refresh)"
+        else
+          status="EXPIRED (needs /login)"
+        fi
+      else
+        status="ok (expires $exp_date)"
+      fi
 
-  [ "$has_rc" = "True" ] && status="$status [rc]" || status="$status [no-rc]"
-
-  echo "$status"
+      [ "$has_rc" = "True" ] && status="$status [rc]" || status="$status [no-rc]"
+      echo "$status"
+      ;;
+    codex)
+      local store account_id
+      store=$(echo "$info" | grep -oP 'store=\K.*')
+      account_id=$(echo "$info" | grep -oP 'account_id=\K.*')
+      if [ "$store" = "file" ]; then
+        echo "ok (auth.json present; store=file; account $account_id)"
+      else
+        echo "ok (auth.json present; store=$store, expected file; account $account_id)"
+      fi
+      ;;
+  esac
 }
 
-# ── Symlink Engine ───────────────────────────────────────────────
+_run_provider_login() {
+  local acct_dir="$1"
+  case "$CURRENT_PROVIDER" in
+    claude)
+      CLAUDE_CONFIG_DIR="$acct_dir" claude || true
+      ;;
+    codex)
+      CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' login || true
+      ;;
+  esac
+}
 
-_setup_account_dir() {
+_run_provider_command() {
+  local acct_dir="$1"
+  shift
+  case "$CURRENT_PROVIDER" in
+    claude)
+      CLAUDE_CONFIG_DIR="$acct_dir" claude "$@"
+      ;;
+    codex)
+      CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' "$@"
+      ;;
+  esac
+}
+
+_sync_new_account_defaults() {
   local name="$1"
-  local acct_dir
-  acct_dir=$(_account_dir "$name")
-
-  mkdir -p "$acct_dir"
-
-  # Create symlinks for everything in base except always-isolated files
-  for item in "$HATS_BASE_DIR"/*  "$HATS_BASE_DIR"/.*; do
-    [ -e "$item" ] || [ -L "$item" ] || continue
-    local basename
-    basename=$(basename "$item")
-
-    # Skip . and ..
-    [[ "$basename" == "." || "$basename" == ".." ]] && continue
-
-    # Skip always-isolated files
-    _is_isolated "$basename" && continue
-
-    # Skip if already exists in account dir
-    [ -e "$acct_dir/$basename" ] || [ -L "$acct_dir/$basename" ] && continue
-
-    ln -s "../base/$basename" "$acct_dir/$basename"
-  done
-
-  # Create isolated files
-  [ -f "$acct_dir/.claude.json" ] || echo '{}' > "$acct_dir/.claude.json"
-}
-
-_link_resource() {
-  local name="$1" resource="$2"
-  local acct_dir
-  acct_dir=$(_account_dir "$name")
-
-  _is_isolated "$resource" && die "'$resource' is always isolated and cannot be linked."
-
-  # Check resource exists in base
-  [ -e "$HATS_BASE_DIR/$resource" ] || [ -L "$HATS_BASE_DIR/$resource" ] || \
-    die "Resource '$resource' not found in base."
-
-  # Check not already linked
-  if [ -L "$acct_dir/$resource" ]; then
-    local target
-    target=$(readlink "$acct_dir/$resource")
-    [[ "$target" == *"base/$resource"* ]] && die "'$resource' is already linked to base."
+  if [ "$(_accounts | wc -l)" -eq 1 ]; then
+    _set_default "$name"
+    echo "Set as default account."
   fi
-
-  # Remove local copy and create symlink
-  rm -rf "$acct_dir/$resource"
-  ln -s "../base/$resource" "$acct_dir/$resource"
-  echo "Linked $name/$resource -> base/$resource"
 }
 
-_unlink_resource() {
-  local name="$1" resource="$2"
-  local acct_dir
-  acct_dir=$(_account_dir "$name")
+_init_claude_provider() {
+  local claude_dir="$RUNTIME_DIR"
 
-  _is_isolated "$resource" && die "'$resource' is always isolated."
+  if [ -d "$claude_dir" ]; then
+    echo "  Found existing $claude_dir/ directory"
+    echo "  Migrating to $PROVIDER_DIR..."
+    echo ""
 
-  # Check resource is currently a symlink
-  [ -L "$acct_dir/$resource" ] || die "'$resource' is already isolated for '$name'."
+    local found_accounts=()
+    for f in "$claude_dir"/.credentials.*.json; do
+      [ -f "$f" ] || continue
+      local n="${f##*/.credentials.}"
+      n="${n%.json}"
+      found_accounts+=("$n")
+      echo "  Found account: $n"
+    done
 
-  # Resolve and copy
-  local real_path
-  real_path=$(realpath "$acct_dir/$resource")
+    mkdir -p "$BASE_DIR"
 
-  rm "$acct_dir/$resource"
-  if [ -d "$real_path" ]; then
-    cp -a "$real_path" "$acct_dir/$resource"
+    for item in "$claude_dir"/* "$claude_dir"/.*; do
+      [ -e "$item" ] || [ -L "$item" ] || continue
+      local bn
+      bn=$(basename "$item")
+
+      [[ "$bn" == "." || "$bn" == ".." ]] && continue
+      [[ "$bn" == .credentials.*.json ]] && continue
+      [[ "$bn" == .profile.*.json ]] && continue
+      [ "$bn" = ".credentials.json" ] && continue
+      [ "$bn" = ".credentials.lock" ] && continue
+      [[ "$bn" == *.stash ]] && continue
+
+      mv "$item" "$BASE_DIR/$bn"
+    done
+
+    echo "  Moved shared resources to base/"
+
+    local first_account=""
+    local name
+    for name in "${found_accounts[@]}"; do
+      local acct_dir
+      acct_dir=$(_account_dir "$name")
+      mkdir -p "$acct_dir"
+      mv "$claude_dir/.credentials.${name}.json" "$acct_dir/.credentials.json"
+      chmod 600 "$acct_dir/.credentials.json"
+      echo '{}' > "$acct_dir/.claude.json"
+      _setup_account_dir "$name"
+      [ -z "$first_account" ] && first_account="$name"
+      echo "  Created account: $name"
+    done
+
+    local default_name=""
+    if [ -f "$HOME/.config/hats/default" ]; then
+      default_name=$(tr -d '[:space:]' < "$HOME/.config/hats/default" 2>/dev/null)
+    fi
+    [ -z "$default_name" ] && default_name="$first_account"
+
+    if [ -f "$HOME/.claude.json" ] && [ -n "$default_name" ]; then
+      cp "$HOME/.claude.json" "$(_account_dir "$default_name")/.claude.json"
+    fi
+
+    rm -rf "$claude_dir"
+
+    if [ -n "$default_name" ]; then
+      _set_default "$default_name"
+      echo ""
+      echo "  Default account: $default_name"
+      echo "  $RUNTIME_DIR -> $PROVIDER_DIR/$default_name/"
+    fi
+
+    if [ -f "$HOME/.claude.json" ]; then
+      mv "$HOME/.claude.json" "$HOME/.claude.json.bak.hats-v1-migration"
+      echo "  Backed up ~/.claude.json to ~/.claude.json.bak.hats-v1-migration"
+    fi
+
+    echo ""
+    echo "  ${#found_accounts[@]} account(s) migrated."
   else
-    cp -a "$real_path" "$acct_dir/$resource"
+    echo "  No existing $claude_dir/ directory found."
+    echo "  Creating fresh hats structure..."
+    mkdir -p "$BASE_DIR"
+    echo ""
+    echo "  Run 'hats add <name>' to create your first account."
   fi
-
-  echo "Unlinked $name/$resource (now isolated)"
 }
 
-_is_linked() {
-  local name="$1" resource="$2"
-  local acct_dir
-  acct_dir=$(_account_dir "$name")
+_init_codex_provider() {
+  local codex_dir="$RUNTIME_DIR"
+  mkdir -p "$BASE_DIR"
+  _ensure_codex_base_config
 
-  if [ -L "$acct_dir/$resource" ]; then
-    local target
-    target=$(readlink "$acct_dir/$resource")
-    [[ "$target" == *"base/"* ]] && return 0
+  if [ -d "$codex_dir" ]; then
+    echo "  Found existing $codex_dir/ directory"
+    echo "  Migrating current Codex state into hats account 'default'..."
+    echo ""
+
+    local default_name="default"
+    local acct_dir
+    acct_dir=$(_account_dir "$default_name")
+    mkdir -p "$acct_dir"
+
+    for item in "$codex_dir"/* "$codex_dir"/.*; do
+      [ -e "$item" ] || [ -L "$item" ] || continue
+      local bn
+      bn=$(basename "$item")
+      [[ "$bn" == "." || "$bn" == ".." ]] && continue
+
+      if _is_shared_by_default "$bn"; then
+        mv "$item" "$BASE_DIR/$bn"
+      else
+        mv "$item" "$acct_dir/$bn"
+      fi
+    done
+
+    _ensure_codex_base_config
+    _setup_account_dir "$default_name"
+
+    if [ -f "$acct_dir/auth.json" ]; then
+      chmod 600 "$acct_dir/auth.json"
+    fi
+
+    rm -rf "$codex_dir"
+    _set_default "$default_name"
+
+    echo "  Created account: $default_name"
+    echo "  Default account: $default_name"
+    echo "  $RUNTIME_DIR -> $PROVIDER_DIR/$default_name/"
+    echo ""
+    echo "  1 account(s) migrated."
+  else
+    echo "  No existing $codex_dir/ directory found."
+    echo "  Creating fresh hats structure..."
+    mkdir -p "$BASE_DIR"
+    _ensure_codex_base_config
+    echo ""
+    echo "  Run 'hats codex add <name>' to create your first Codex account."
   fi
-  return 1
 }
 
 # ── Commands ─────────────────────────────────────────────────────
 
 cmd_init() {
-  if [ -d "$HATS_DIR" ] && [ -f "$HATS_CONFIG" ]; then
-    echo "hats is already initialized at $HATS_DIR"
+  if [ -d "$PROVIDER_DIR" ] && [ -d "$BASE_DIR" ]; then
+    echo "hats is already initialized for $CURRENT_PROVIDER at $PROVIDER_DIR"
     echo ""
     echo "Accounts:"
     for name in $(_accounts); do
@@ -258,175 +610,52 @@ cmd_init() {
     return
   fi
 
-  echo "Initializing hats v$VERSION..."
+  echo "Initializing hats v$VERSION for $PROVIDER_TITLE..."
   echo ""
 
-  # Detect existing ~/.claude/ setup
-  local claude_dir="$HOME/.claude"
-
-  # If ~/.claude is already a symlink, detect previous hats setup
-  if [ -L "$claude_dir" ]; then
-    die "~/.claude is already a symlink ($(readlink "$claude_dir")). Remove it first or check if hats is already set up."
+  if [ -L "$RUNTIME_DIR" ]; then
+    die "$RUNTIME_DIR is already a symlink ($(readlink "$RUNTIME_DIR")). Remove it first or check if hats is already set up."
   fi
 
-  mkdir -p "$HATS_CLAUDE_DIR"
+  mkdir -p "$PROVIDER_DIR"
 
-  if [ -d "$claude_dir" ]; then
-    echo "  Found existing ~/.claude/ directory"
-    echo "  Migrating to $HATS_DIR..."
-    echo ""
+  case "$CURRENT_PROVIDER" in
+    claude) _init_claude_provider ;;
+    codex) _init_codex_provider ;;
+  esac
 
-    # Discover existing accounts from v0.2.x credential files
-    local found_accounts=()
-    for f in "$claude_dir"/.credentials.*.json; do
-      [ -f "$f" ] || continue
-      local n="${f##*/.credentials.}"
-      n="${n%.json}"
-      found_accounts+=("$n")
-      echo "  Found account: $n"
-    done
-
-    # Move everything to base (except per-account files)
-    mkdir -p "$HATS_BASE_DIR"
-
-    for item in "$claude_dir"/* "$claude_dir"/.*; do
-      [ -e "$item" ] || [ -L "$item" ] || continue
-      local bn
-      bn=$(basename "$item")
-
-      # Skip . and ..
-      [[ "$bn" == "." || "$bn" == ".." ]] && continue
-
-      # Skip per-account credential files
-      [[ "$bn" == .credentials.*.json ]] && continue
-
-      # Skip per-account profile files (v0.2.x artifact, will be discarded)
-      [[ "$bn" == .profile.*.json ]] && continue
-
-      # Skip active credentials file (will be discarded)
-      [ "$bn" = ".credentials.json" ] && continue
-
-      # Skip lock files
-      [ "$bn" = ".credentials.lock" ] && continue
-
-      # Skip stash files
-      [[ "$bn" == *.stash ]] && continue
-
-      # Move to base (preserving symlinks)
-      mv "$item" "$HATS_BASE_DIR/$bn"
-    done
-
-    echo "  Moved shared resources to base/"
-
-    # Create account directories
-    local first_account=""
-    for name in "${found_accounts[@]}"; do
-      local acct_dir
-      acct_dir=$(_account_dir "$name")
-      mkdir -p "$acct_dir"
-
-      # Move credentials
-      mv "$claude_dir/.credentials.${name}.json" "$acct_dir/.credentials.json"
-      chmod 600 "$acct_dir/.credentials.json"
-
-      # Create isolated .claude.json
-      echo '{}' > "$acct_dir/.claude.json"
-
-      # Symlink everything else to base
-      _setup_account_dir "$name"
-
-      [ -z "$first_account" ] && first_account="$name"
-      echo "  Created account: $name"
-    done
-
-    # Determine default
-    local default_name=""
-    if [ -f "$HOME/.config/hats/default" ]; then
-      default_name=$(cat "$HOME/.config/hats/default" 2>/dev/null | tr -d '[:space:]')
-    fi
-    [ -z "$default_name" ] && default_name="$first_account"
-
-    # Handle the old ~/.claude.json state file
-    if [ -f "$HOME/.claude.json" ] && [ -n "$default_name" ]; then
-      cp "$HOME/.claude.json" "$(_account_dir "$default_name")/.claude.json"
-      # Don't delete the original yet — only after symlink is in place
-    fi
-
-    # Remove the now-empty ~/.claude/ directory
-    rm -rf "$claude_dir"
-
-    # Set default and create symlink
-    if [ -n "$default_name" ]; then
-      _set_default "$default_name"
-      echo ""
-      echo "  Default account: $default_name"
-      echo "  ~/.claude -> ~/.hats/claude/$default_name/"
-    fi
-
-    # Clean up old ~/.claude.json (now that ~/.claude symlink exists,
-    # Claude Code will use $CLAUDE_CONFIG_DIR/.claude.json instead)
-    if [ -f "$HOME/.claude.json" ]; then
-      mv "$HOME/.claude.json" "$HOME/.claude.json.bak.hats-v1-migration"
-      echo "  Backed up ~/.claude.json to ~/.claude.json.bak.hats-v1-migration"
-    fi
-
-    echo ""
-    echo "  ${#found_accounts[@]} account(s) migrated."
-  else
-    echo "  No existing ~/.claude/ directory found."
-    echo "  Creating fresh hats structure..."
-    mkdir -p "$HATS_BASE_DIR"
-    echo ""
-    echo "  Run 'hats add <name>' to create your first account."
-  fi
-
-  # Write config
-  mkdir -p "$HATS_DIR"
-  [ -f "$HATS_CONFIG" ] || cat > "$HATS_CONFIG" <<EOF
-[hats]
-version = "$VERSION"
-default = "$(_default_account)"
-EOF
+  _config_set "version" "$VERSION"
 
   echo ""
-  echo "Done. Structure: $HATS_DIR"
-  echo "Run 'hats list' to see your accounts."
+  echo "Done. Structure: $PROVIDER_DIR"
+  echo "Run '$(_hats_cmd_prefix) list' to see your accounts."
 }
 
 cmd_add() {
   local name="${1:-}"
-  [ -z "$name" ] && die "Usage: hats add <name>"
+  [ -z "$name" ] && die "Usage: $(_hats_cmd_prefix) add <name>"
 
   _validate_name "$name"
-  [ -d "$HATS_CLAUDE_DIR" ] || die "hats not initialized. Run 'hats init' first."
+  [ -d "$PROVIDER_DIR" ] || die "hats not initialized for $CURRENT_PROVIDER. Run '$(_hats_cmd_prefix) init'."
   _account_exists "$name" && die "Account '$name' already exists."
 
   local acct_dir
   acct_dir=$(_account_dir "$name")
 
-  echo "Creating account '$name'..."
+  echo "Creating $CURRENT_PROVIDER account '$name'..."
 
-  # Set up directory with symlinks to base
   _setup_account_dir "$name"
 
-  # Run claude interactively so the user can /login (works on headless machines)
-  echo "Starting Claude Code for authentication..."
-  echo "Run /login inside the session to authenticate, then /exit when done."
+  echo "Starting $PROVIDER_TITLE for authentication..."
+  echo "$(_provider_login_hint)"
   echo ""
-  CLAUDE_CONFIG_DIR="$acct_dir" claude || true
+  _run_provider_login "$acct_dir"
 
-  # Verify credentials were created
-  if [ -f "$acct_dir/.credentials.json" ]; then
-    chmod 600 "$acct_dir/.credentials.json"
+  if [ -f "$(_credential_file "$name")" ]; then
+    chmod 600 "$(_credential_file "$name")" 2>/dev/null || true
     echo ""
     echo "Account '$name' added."
-
-    # Set as default if first account
-    if [ "$(_accounts | wc -l)" -eq 1 ]; then
-      _set_default "$name"
-      echo "Set as default account."
-    fi
-
+    _sync_new_account_defaults "$name"
     _show_account_status "$name" "$(_default_account)"
   else
     rm -rf "$acct_dir"
@@ -436,7 +665,7 @@ cmd_add() {
 
 cmd_remove() {
   local name="${1:-}"
-  [ -z "$name" ] && die "Usage: hats remove <name>"
+  [ -z "$name" ] && die "Usage: $(_hats_cmd_prefix) remove <name>"
 
   _account_exists "$name" || die "Account '$name' not found."
 
@@ -445,15 +674,14 @@ cmd_remove() {
 
   if [ "$name" = "$default" ]; then
     echo "Warning: '$name' is the default account." >&2
-    echo "Set a new default with 'hats default <name>' after removal." >&2
+    echo "Set a new default with '$(_hats_cmd_prefix) default <name>' after removal." >&2
   fi
 
   rm -rf "$(_account_dir "$name")"
   echo "Account '$name' removed."
 
-  # If was default, clear the symlink
   if [ "$name" = "$default" ]; then
-    rm -f "$HOME/.claude"
+    rm -f "$RUNTIME_DIR"
     local new_default
     new_default=$(_accounts | head -1)
     if [ -n "$new_default" ]; then
@@ -464,7 +692,7 @@ cmd_remove() {
 }
 
 cmd_list() {
-  echo "hats v$VERSION — Claude Code Accounts"
+  echo "hats v$VERSION — $PROVIDER_TITLE Accounts"
   echo "======================================="
   echo ""
 
@@ -479,7 +707,7 @@ cmd_list() {
 
   if [ "$count" -eq 0 ]; then
     echo "  No accounts found."
-    echo "  Run 'hats add <name>' to create one."
+    echo "  Run '$(_hats_cmd_prefix) add <name>' to create one."
   fi
 
   echo ""
@@ -497,12 +725,12 @@ cmd_default() {
   _account_exists "$name" || die "Account '$name' not found."
   _set_default "$name"
   echo "Default account set to '$name'."
-  echo "~/.claude -> ~/.hats/claude/$name/"
+  echo "$RUNTIME_DIR -> $PROVIDER_DIR/$name/"
 }
 
 cmd_swap() {
   local name="${1:-}"
-  [ -z "$name" ] && die "Usage: hats swap <name> [-- claude-args...]"
+  [ -z "$name" ] && die "Usage: $(_hats_cmd_prefix) swap <name> [-- args...]"
   shift
 
   [ "${1:-}" = "--" ] && shift
@@ -512,14 +740,13 @@ cmd_swap() {
   local acct_dir
   acct_dir=$(_account_dir "$name")
 
-  [ -f "$acct_dir/.credentials.json" ] || die "Account '$name' has no credentials. Run: hats add $name"
-
-  CLAUDE_CONFIG_DIR="$acct_dir" claude "$@"
+  [ -f "$(_credential_file "$name")" ] || die "Account '$name' has no credentials. $(_provider_add_failure_hint "$name")"
+  _run_provider_command "$acct_dir" "$@"
 }
 
 cmd_link() {
   local name="${1:-}" resource="${2:-}"
-  [ -z "$name" ] || [ -z "$resource" ] && die "Usage: hats link <account> <resource>"
+  [ -z "$name" ] || [ -z "$resource" ] && die "Usage: $(_hats_cmd_prefix) link <account> <resource>"
 
   _account_exists "$name" || die "Account '$name' not found."
   _link_resource "$name" "$resource"
@@ -527,7 +754,7 @@ cmd_link() {
 
 cmd_unlink() {
   local name="${1:-}" resource="${2:-}"
-  [ -z "$name" ] || [ -z "$resource" ] && die "Usage: hats unlink <account> <resource>"
+  [ -z "$name" ] || [ -z "$resource" ] && die "Usage: $(_hats_cmd_prefix) unlink <account> <resource>"
 
   _account_exists "$name" || die "Account '$name' not found."
   _unlink_resource "$name" "$resource"
@@ -537,7 +764,6 @@ cmd_status() {
   local name="${1:-}"
 
   if [ -z "$name" ]; then
-    # Show status for all accounts
     for acct in $(_accounts); do
       cmd_status "$acct"
       echo ""
@@ -554,20 +780,26 @@ cmd_status() {
   local label="$name"
   [ "$name" = "$default" ] && label="$name (default)"
 
+  echo "Provider: $CURRENT_PROVIDER"
   echo "Account: $label"
   echo "Directory: $acct_dir/"
   echo ""
 
   echo "  ISOLATED (account-specific):"
-  for f in "${ALWAYS_ISOLATED[@]}"; do
-    if [ -f "$acct_dir/$f" ]; then
-      echo "    $f"
-    else
-      echo "    $f  (missing)"
+  local shown=false
+  local item
+  for item in "$acct_dir"/* "$acct_dir"/.*; do
+    [ -e "$item" ] || [ -L "$item" ] || continue
+    local bn
+    bn=$(basename "$item")
+    [[ "$bn" == "." || "$bn" == ".." ]] && continue
+    if _is_isolated "$bn"; then
+      echo "    $bn"
+      shown=true
     fi
   done
+  [ "$shown" = false ] && echo "    (none)"
 
-  # Find non-isolated files that are NOT symlinks to base
   local has_diverged=false
   for item in "$acct_dir"/* "$acct_dir"/.*; do
     [ -e "$item" ] || [ -L "$item" ] || continue
@@ -588,6 +820,7 @@ cmd_status() {
 
   echo ""
   echo "  LINKED (shared with base):"
+  local linked_any=false
   for item in "$acct_dir"/* "$acct_dir"/.*; do
     [ -e "$item" ] || [ -L "$item" ] || continue
     local bn
@@ -596,11 +829,8 @@ cmd_status() {
     _is_isolated "$bn" && continue
 
     if [ -L "$item" ]; then
-      local target
-      target=$(readlink "$item")
-
-      # If the base resource is itself a symlink, show the chain
-      local base_item="$HATS_BASE_DIR/$bn"
+      linked_any=true
+      local base_item="$BASE_DIR/$bn"
       if [ -L "$base_item" ]; then
         local final_target
         final_target=$(readlink "$base_item")
@@ -610,50 +840,67 @@ cmd_status() {
       fi
     fi
   done
+  [ "$linked_any" = false ] && echo "    (none)"
 }
 
 cmd_shell_init() {
   local extra_args=""
+  local arg
   for arg in "$@"; do
     case "$arg" in
-      --skip-permissions) extra_args=" --dangerously-skip-permissions" ;;
+      --skip-permissions)
+        if [ "$CURRENT_PROVIDER" = "claude" ]; then
+          extra_args=" --dangerously-skip-permissions"
+        else
+          die "--skip-permissions is only supported for Claude Code shell shims."
+        fi
+        ;;
     esac
   done
 
-  cat <<'HEADER'
-# Generated by hats shell-init
+  cat <<HEADER
+# Generated by hats shell-init for $CURRENT_PROVIDER
 # Add to your shell config:
-#   eval "$(hats shell-init)"
-#   eval "$(hats shell-init --skip-permissions)"  # to auto-skip permission prompts
-
+#   eval "\$($(_hats_cmd_prefix) shell-init)"
 HEADER
+
+  if [ "$CURRENT_PROVIDER" = "claude" ]; then
+    echo "#   eval \"\$(hats shell-init)\""
+    echo "#   eval \"\$(hats shell-init --skip-permissions)\"  # to auto-skip permission prompts"
+  fi
+  echo ""
 
   for name in $(_accounts); do
     local acct_dir
     acct_dir=$(_account_dir "$name")
-    echo "${name}() { CLAUDE_CONFIG_DIR=\"$acct_dir\" claude${extra_args} \"\$@\"; }"
+    local fn_name="$name"
+    [ "$CURRENT_PROVIDER" = "codex" ] && fn_name="codex_$name"
+    if [ "$CURRENT_PROVIDER" = "codex" ]; then
+      echo "${fn_name}() { $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND -c 'cli_auth_credentials_store=\"file\"' \"\$@\"; }"
+    else
+      echo "${fn_name}() { $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND${extra_args} \"\$@\"; }"
+    fi
   done
 }
 
 cmd_fix() {
-  echo "Repairing hats state..."
+  echo "Repairing hats state for $CURRENT_PROVIDER..."
 
-  [ -d "$HATS_DIR" ] || die "hats not initialized. Run 'hats init' first."
-  [ -d "$HATS_BASE_DIR" ] || die "Base directory missing at $HATS_BASE_DIR"
+  [ -d "$PROVIDER_DIR" ] || die "hats not initialized for $CURRENT_PROVIDER. Run '$(_hats_cmd_prefix) init'."
+  [ -d "$BASE_DIR" ] || die "Base directory missing at $BASE_DIR"
 
   local issues=0
+  _ensure_provider_defaults
 
   for name in $(_accounts); do
     local acct_dir
     acct_dir=$(_account_dir "$name")
 
-    # Check credentials
-    if [ ! -f "$acct_dir/.credentials.json" ]; then
+    if [ ! -f "$acct_dir/$PRIMARY_AUTH_FILE" ]; then
       echo "  $name: MISSING credentials"
       issues=$((issues + 1))
     fi
 
-    # Check and repair broken symlinks
     for item in "$acct_dir"/* "$acct_dir"/.*; do
       [ -L "$item" ] || continue
       local bn
@@ -661,9 +908,8 @@ cmd_fix() {
       [[ "$bn" == "." || "$bn" == ".." ]] && continue
 
       if [ ! -e "$item" ]; then
-        # Broken symlink
         local expected_target="../base/$bn"
-        if [ -e "$HATS_BASE_DIR/$bn" ] || [ -L "$HATS_BASE_DIR/$bn" ]; then
+        if [ -e "$BASE_DIR/$bn" ] || [ -L "$BASE_DIR/$bn" ]; then
           rm "$item"
           ln -s "$expected_target" "$item"
           echo "  $name: repaired broken symlink $bn"
@@ -675,40 +921,41 @@ cmd_fix() {
       fi
     done
 
-    # Check for resources in base that are missing from account
-    for base_item in "$HATS_BASE_DIR"/* "$HATS_BASE_DIR"/.*; do
+    for base_item in "$BASE_DIR"/* "$BASE_DIR"/.*; do
       [ -e "$base_item" ] || [ -L "$base_item" ] || continue
       local bn
       bn=$(basename "$base_item")
       [[ "$bn" == "." || "$bn" == ".." ]] && continue
       _is_isolated "$bn" && continue
+      _is_shared_by_default "$bn" || continue
 
       if [ ! -e "$acct_dir/$bn" ] && [ ! -L "$acct_dir/$bn" ]; then
         ln -s "../base/$bn" "$acct_dir/$bn"
         echo "  $name: added missing symlink $bn"
       fi
     done
+
+    _ensure_account_defaults "$acct_dir"
   done
 
-  # Verify ~/.claude symlink
   local default
   default=$(_default_account)
   if [ -n "$default" ]; then
-    local expected_target="$HATS_CLAUDE_DIR/$default"
-    if [ -L "$HOME/.claude" ]; then
+    local expected_target="$PROVIDER_DIR/$default"
+    if [ -L "$RUNTIME_DIR" ]; then
       local current_target
-      current_target=$(readlink -f "$HOME/.claude")
+      current_target=$(readlink -f "$RUNTIME_DIR")
       local expected_resolved
       expected_resolved=$(readlink -f "$expected_target")
       if [ "$current_target" != "$expected_resolved" ]; then
-        ln -sfn "$expected_target" "$HOME/.claude"
-        echo "  Fixed ~/.claude symlink -> $expected_target"
+        ln -sfn "$expected_target" "$RUNTIME_DIR"
+        echo "  Fixed $RUNTIME_DIR symlink -> $expected_target"
       fi
-    elif [ ! -e "$HOME/.claude" ]; then
-      ln -sfn "$expected_target" "$HOME/.claude"
-      echo "  Created ~/.claude symlink -> $expected_target"
+    elif [ ! -e "$RUNTIME_DIR" ]; then
+      ln -sfn "$expected_target" "$RUNTIME_DIR"
+      echo "  Created $RUNTIME_DIR symlink -> $expected_target"
     else
-      echo "  WARNING: ~/.claude exists but is not a symlink"
+      echo "  WARNING: $RUNTIME_DIR exists but is not a symlink"
       issues=$((issues + 1))
     fi
   fi
@@ -722,11 +969,85 @@ cmd_fix() {
   echo "Done."
 }
 
+cmd_providers() {
+  echo "Supported providers:"
+  echo "  claude"
+  echo "  codex"
+  echo ""
+  echo "Default provider: $(_default_provider)"
+}
+
 cmd_version() {
   echo "hats $VERSION"
 }
 
+cmd_help() {
+  cat <<EOF
+hats $VERSION — Switch between Claude Code and Codex accounts
+
+Usage:
+  hats <command> [args]              # Claude Code (backward compatible default)
+  hats <provider> <command> [args]   # Provider-specific mode
+
+Providers:
+  claude
+  codex
+
+Account Management:
+  init                 Initialize hats for the active provider
+  add <name>           Create a new account and authenticate
+  remove <name>        Remove an account
+  default [name]       Get or set the default account
+  list                 Show all accounts and auth status
+
+Session Management:
+  swap <name> [args]   Run the provider CLI with the account's isolated home
+
+Resource Management:
+  link <acct> <file>   Share a resource with base (symlink to base)
+  unlink <acct> <file> Isolate a resource (copy from base, break symlink)
+  status [account]     Show which resources are linked vs isolated
+
+Shell Integration:
+  shell-init           Output shell functions for your shell config
+
+Maintenance:
+  fix                  Repair symlinks, verify auth, detect issues
+  providers            Show supported providers
+  version              Show version
+
+Examples:
+  hats init
+  hats add work
+  hats swap work -- --model opus
+  hats codex init
+  hats codex add personal
+  hats codex swap personal -- exec "summarize this repo"
+
+Directory Structure:
+  ~/.hats/claude/base/     Shared Claude resources
+  ~/.hats/claude/<name>/   Per-account Claude config directory
+  ~/.hats/codex/base/      Shared Codex resources
+  ~/.hats/codex/<name>/    Per-account Codex home directory
+  ~/.claude                Symlink to default Claude account
+  ~/.codex                 Symlink to default Codex account
+
+Environment Variables:
+  HATS_DIR             Hats root directory (default: ~/.hats)
+
+Config: $HATS_CONFIG
+EOF
+}
+
 # ── Main ─────────────────────────────────────────────────────────
+
+provider_candidate="${1:-}"
+if _is_supported_provider "$provider_candidate"; then
+  _configure_provider "$provider_candidate"
+  shift
+else
+  _configure_provider "claude"
+fi
 
 case "${1:-}" in
   init)             cmd_init ;;
@@ -740,48 +1061,9 @@ case "${1:-}" in
   status)           cmd_status "${2:-}" ;;
   shell-init)       shift; cmd_shell_init "$@" ;;
   fix)              cmd_fix ;;
+  providers)        cmd_providers ;;
   version|-v|--version) cmd_version ;;
-  help|-h|--help|"")
-    cat <<EOF
-hats $VERSION — Switch between Claude Code accounts
-
-Usage: hats <command> [args]
-
-Account Management:
-  init                 Initialize hats (migrate from ~/.claude/ if exists)
-  add <name>           Create a new account and authenticate
-  remove <name>        Remove an account
-  default [name]       Get or set the default account
-  list                 Show all accounts and auth status
-
-Session Management:
-  swap <name> [args]   Run claude with account's config directory
-
-Resource Management:
-  link <acct> <file>   Share a resource with base (symlink to base)
-  unlink <acct> <file> Isolate a resource (copy from base, break symlink)
-  status [account]     Show which resources are linked vs isolated
-
-Shell Integration:
-  shell-init           Output shell functions for .zshrc/.bashrc
-                       Use: eval "\$(hats shell-init)"
-                       Flags: --skip-permissions
-
-Maintenance:
-  fix                  Repair symlinks, verify auth, detect issues
-  version              Show version
-
-Directory Structure:
-  ~/.hats/claude/base/     Template (shared resources)
-  ~/.hats/claude/<name>/   Per-account config directory
-  ~/.claude                Symlink to default account
-
-Environment Variables:
-  HATS_DIR             Hats root directory (default: ~/.hats)
-
-Config: $HATS_CONFIG
-EOF
-    ;;
+  help|-h|--help|"") cmd_help ;;
   *)
     echo "Unknown command: $1" >&2
     echo "Run 'hats help' for usage." >&2
