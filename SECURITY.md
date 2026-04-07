@@ -16,7 +16,7 @@ hats manages local Claude Code and Codex authentication state on a machine. The 
 
 **File permissions:** Account credential files are created with `chmod 600` (owner read/write only). No group or world access.
 
-**No credential swapping:** Unlike v0.2.x, credentials are never copied between files. Each account's auth file is written to directly by the provider CLI (`.credentials.json` for Claude, `auth.json` for Codex when file-backed auth is enabled). This eliminates the entire class of save-back corruption bugs.
+**No credential swapping:** Unlike v0.2.x, credentials are never copied between files. Each account's auth file is written to directly by the provider CLI (`.credentials.json` for Claude, file-backed Codex credentials under `CODEX_HOME`). This eliminates the entire class of save-back corruption bugs.
 
 **No shared mutable state:** Runtime state is isolated per account. For Claude that includes `.claude.json`; for Codex it includes auth, history, sessions, caches, and sqlite state files.
 
@@ -30,7 +30,7 @@ hats manages local Claude Code and Codex authentication state on a machine. The 
 
 **Symlinked shared resources:** Some resources are shared across accounts via symlinks by default. A compromised account's session could modify shared settings or config. Use `hats unlink` to isolate sensitive config per account.
 
-**Codex keyring mode:** Codex support assumes `cli_auth_credentials_store = "file"`. If a user changes Codex to use OS keyring storage, hats can no longer guarantee that each account's credentials live entirely inside its account directory.
+**Codex keyring mode:** Codex support assumes `cli_auth_credentials_store = "file"`. This remains true whether the account authenticates via ChatGPT login, API key login, or device auth. If a user changes Codex to use OS keyring storage, hats can no longer guarantee that each account's credentials live entirely inside its account directory.
 
 **No audit logging:** hats doesn't log which account was used when. This is a feature gap for shared machines.
 

@@ -177,6 +177,7 @@ Concurrent sessions are inherently safe. Each account has its own directory — 
 hats <provider> init
 hats <provider> add <name>
 hats <provider> remove <name>
+hats <provider> rename <old> <new>
 hats <provider> default [name]
 hats <provider> list
 ```
@@ -243,18 +244,39 @@ For Codex:
 
 ```bash
 hats codex add myaccount
+hats codex add headless --api-key
+hats codex add remote --device-auth
 ```
 
-This runs `codex login` with `CODEX_HOME` pointed at the new account directory.
+`hats codex add` now lets you choose the Codex auth path per account:
+
+- ChatGPT login: browser-based local sign-in
+- API key: reads `OPENAI_API_KEY` and runs `codex login --with-api-key`
+- Device auth: runs `codex login --device-auth` for headless/browserless setups
+
+All three modes still use the account's isolated `CODEX_HOME`.
 
 ## Codex Authentication Notes
 
-Codex support assumes file-based credentials stored in `auth.json` under each account's `CODEX_HOME`.
+Codex support assumes file-based credentials stored under each account's `CODEX_HOME`.
 
 `hats codex init` creates a shared `config.toml` with:
 
 ```toml
 cli_auth_credentials_store = "file"
+```
+
+When you run `hats codex add <name>` without a Codex auth flag in an interactive terminal, hats prompts you to choose:
+
+- `ChatGPT login` for local browser sign-in
+- `API key` for `OPENAI_API_KEY`-driven login
+- `Device auth` for headless machines
+
+For non-interactive environments, use one of these explicitly:
+
+```bash
+OPENAI_API_KEY=... hats codex add ci --api-key
+hats codex add remote --device-auth
 ```
 
 If you override Codex to use `keyring` or `auto`, hats can no longer guarantee that account credentials stay isolated inside each account directory.

@@ -162,6 +162,7 @@ _validate_name() {
   local name="$1"
   [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || die "Invalid account name '$name'. Use alphanumeric, dots, hyphens, underscores."
   [ "$name" = "base" ] && die "'base' is reserved for the template directory."
+  return 0
 }
 
 _accounts() {
@@ -232,9 +233,17 @@ _ensure_account_defaults() {
 }
 
 _provider_login_hint() {
+  local auth_mode="${1:-}"
   case "$CURRENT_PROVIDER" in
     claude) echo "Run /login inside the session to authenticate, then /exit when done." ;;
-    codex) echo "Codex login will run with file-based credentials stored in the account directory." ;;
+    codex)
+      case "$auth_mode" in
+        api-key) echo "Codex login will read OPENAI_API_KEY and store file-backed credentials in the account directory." ;;
+        device-auth) echo "Codex device auth will run with file-backed credentials stored in the account directory." ;;
+        chatgpt|"") echo "Codex ChatGPT login will run with file-backed credentials stored in the account directory." ;;
+        *) echo "Codex login will run with file-backed credentials stored in the account directory." ;;
+      esac
+      ;;
   esac
 }
 
@@ -425,14 +434,79 @@ _show_account_status() {
   esac
 }
 
+_normalize_codex_auth_mode() {
+  local mode="${1:-}"
+  case "$mode" in
+    chatgpt|browser|oauth) echo "chatgpt" ;;
+    api-key|apikey|key) echo "api-key" ;;
+    device|device-auth) echo "device-auth" ;;
+    "") echo "" ;;
+    *) return 1 ;;
+  esac
+}
+
+_choose_codex_auth_mode() {
+  local requested="${1:-}"
+  local normalized=""
+
+  if [ -n "$requested" ]; then
+    normalized=$(_normalize_codex_auth_mode "$requested") || die "Unsupported Codex auth mode '$requested'. Use chatgpt, api-key, or device-auth."
+    echo "$normalized"
+    return 0
+  fi
+
+  if [ ! -t 0 ] || [ ! -t 1 ]; then
+    if [ -n "${OPENAI_API_KEY:-}" ]; then
+      echo "api-key"
+      return 0
+    fi
+    die "Non-interactive Codex account creation requires --api-key with OPENAI_API_KEY set, or --device-auth."
+  fi
+
+  echo "Choose Codex authentication for this account:" >&2
+  echo "  1) ChatGPT login (opens browser on this machine)" >&2
+  echo "  2) API key (reads OPENAI_API_KEY; suitable for headless/CI)" >&2
+  echo "  3) Device auth (headless-friendly ChatGPT/device flow)" >&2
+
+  while true; do
+    printf "Selection [1]: " >&2
+    IFS= read -r choice
+    case "${choice:-1}" in
+      1) echo "chatgpt"; return 0 ;;
+      2)
+        [ -n "${OPENAI_API_KEY:-}" ] || die "OPENAI_API_KEY is required for --api-key."
+        echo "api-key"
+        return 0
+        ;;
+      3) echo "device-auth"; return 0 ;;
+      *) echo "Invalid selection. Enter 1, 2, or 3." >&2 ;;
+    esac
+  done
+}
+
 _run_provider_login() {
   local acct_dir="$1"
+  local auth_mode="${2:-}"
   case "$CURRENT_PROVIDER" in
     claude)
       CLAUDE_CONFIG_DIR="$acct_dir" claude || true
       ;;
     codex)
-      CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' login || true
+      case "$auth_mode" in
+        api-key)
+          [ -n "${OPENAI_API_KEY:-}" ] || die "OPENAI_API_KEY is required for Codex API key login."
+          printf '%s\n' "$OPENAI_API_KEY" | CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' login --with-api-key || true
+          ;;
+        device-auth)
+          CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' login --device-auth || true
+          ;;
+        chatgpt|"")
+          CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' login || true
+          ;;
+        *)
+          die "Unsupported Codex auth mode '$auth_mode'."
+          ;;
+      esac
       ;;
   esac
 }
@@ -636,6 +710,40 @@ cmd_add() {
   local name="${1:-}"
   [ -z "$name" ] && die "Usage: $(_hats_cmd_prefix) add <name>"
 
+  local auth_mode=""
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --chatgpt)
+        auth_mode="chatgpt"
+        ;;
+      --api-key)
+        auth_mode="api-key"
+        ;;
+      --device-auth)
+        auth_mode="device-auth"
+        ;;
+      --auth)
+        shift || die "Usage: $(_hats_cmd_prefix) add <name> [--chatgpt|--api-key|--device-auth|--auth <mode>]"
+        [ $# -gt 0 ] || die "Usage: $(_hats_cmd_prefix) add <name> [--chatgpt|--api-key|--device-auth|--auth <mode>]"
+        auth_mode="$1"
+        ;;
+      --auth=*)
+        auth_mode="${1#--auth=}"
+        ;;
+      *)
+        die "Usage: $(_hats_cmd_prefix) add <name> [--chatgpt|--api-key|--device-auth|--auth <mode>]"
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ "$CURRENT_PROVIDER" = "codex" ]; then
+    auth_mode=$(_choose_codex_auth_mode "$auth_mode")
+  elif [ -n "$auth_mode" ]; then
+    die "Auth mode flags are only supported for hats codex add."
+  fi
+
   _validate_name "$name"
   [ -d "$PROVIDER_DIR" ] || die "hats not initialized for $CURRENT_PROVIDER. Run '$(_hats_cmd_prefix) init'."
   _account_exists "$name" && die "Account '$name' already exists."
@@ -648,9 +756,9 @@ cmd_add() {
   _setup_account_dir "$name"
 
   echo "Starting $PROVIDER_TITLE for authentication..."
-  echo "$(_provider_login_hint)"
+  echo "$(_provider_login_hint "$auth_mode")"
   echo ""
-  _run_provider_login "$acct_dir"
+  _run_provider_login "$acct_dir" "$auth_mode"
 
   if [ -f "$(_credential_file "$name")" ]; then
     chmod 600 "$(_credential_file "$name")" 2>/dev/null || true
@@ -689,6 +797,25 @@ cmd_remove() {
       _set_default "$new_default"
       echo "New default: $new_default"
     fi
+  fi
+}
+
+cmd_rename() {
+  local old_name="${1:-}" new_name="${2:-}"
+  [ -z "$old_name" ] || [ -z "$new_name" ] && die "Usage: $(_hats_cmd_prefix) rename <old-name> <new-name>"
+
+  _account_exists "$old_name" || die "Account '$old_name' not found."
+  _validate_name "$new_name"
+  _account_exists "$new_name" && die "Account '$new_name' already exists."
+  [ "$old_name" = "$new_name" ] && die "Old and new account names must differ."
+
+  mv "$(_account_dir "$old_name")" "$(_account_dir "$new_name")"
+  echo "Account '$old_name' renamed to '$new_name'."
+
+  if [ "$old_name" = "$(_default_account)" ]; then
+    _set_default "$new_name"
+    echo "Default account set to '$new_name'."
+    echo "$RUNTIME_DIR -> $PROVIDER_DIR/$new_name/"
   fi
 }
 
@@ -998,6 +1125,7 @@ Account Management:
   init                 Initialize hats for the active provider
   add <name>           Create a new account and authenticate
   remove <name>        Remove an account
+  rename <old> <new>   Rename an account
   default [name]       Get or set the default account
   list                 Show all accounts and auth status
 
@@ -1020,9 +1148,12 @@ Maintenance:
 Examples:
   hats init
   hats add work
+  hats rename work personal
   hats swap work -- --model opus
   hats codex init
   hats codex add personal
+  hats codex add headless --api-key
+  hats codex add remote --device-auth
   hats codex swap personal -- exec "summarize this repo"
 
 Directory Structure:
@@ -1052,8 +1183,9 @@ fi
 
 case "${1:-}" in
   init)             cmd_init ;;
-  add)              cmd_add "${2:-}" ;;
+  add)              shift; cmd_add "$@" ;;
   remove|rm)        cmd_remove "${2:-}" ;;
+  rename|mv)        cmd_rename "${2:-}" "${3:-}" ;;
   list|ls)          cmd_list ;;
   swap)             shift; cmd_swap "$@" ;;
   default)          cmd_default "${2:-}" ;;
