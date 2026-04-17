@@ -116,14 +116,24 @@ EOF
   fi
 }
 
+_sed_i() {
+  # Portable sed -i across GNU (Linux) and BSD (macOS) sed.
+  # GNU: `sed -i '<expr>' file`; BSD: `sed -i '' '<expr>' file`.
+  # Both accept `-i.bak` with an extension — use that + remove the backup.
+  local expr="$1" file="$2"
+  sed -i.bak "$expr" "$file"
+  rm -f "$file.bak"
+}
+
 _config_set() {
   local key="$1" value="$2"
   _ensure_config
 
   if grep -q "^$key" "$HATS_CONFIG" 2>/dev/null; then
-    sed -i "s#^$key.*#$key = \"$value\"#" "$HATS_CONFIG"
+    _sed_i "s#^$key.*#$key = \"$value\"#" "$HATS_CONFIG"
   else
-    sed -i "/^\[hats\]/a $key = \"$value\"" "$HATS_CONFIG"
+    _sed_i "/^\[hats\]/a\\
+$key = \"$value\"" "$HATS_CONFIG"
   fi
 }
 
@@ -145,7 +155,7 @@ _migrate_legacy_default() {
     [ -z "$cur_claude" ] && _config_set "default_claude" "$legacy"
   fi
 
-  sed -i '/^default[[:space:]]*=/d' "$HATS_CONFIG"
+  _sed_i '/^default[[:space:]]*=/d' "$HATS_CONFIG"
 }
 
 _default_provider() {
@@ -234,7 +244,7 @@ EOF
   fi
 
   if grep -q '^cli_auth_credentials_store' "$BASE_DIR/config.toml" 2>/dev/null; then
-    sed -i 's#^cli_auth_credentials_store.*#cli_auth_credentials_store = "file"#' "$BASE_DIR/config.toml"
+    _sed_i 's#^cli_auth_credentials_store.*#cli_auth_credentials_store = "file"#' "$BASE_DIR/config.toml"
   else
     printf '\ncli_auth_credentials_store = "file"\n' >> "$BASE_DIR/config.toml"
   fi

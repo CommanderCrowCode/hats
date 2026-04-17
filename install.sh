@@ -49,7 +49,9 @@ COMMIT=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknow
 # Atomic install: write to temp file then mv, so any running hats process
 # keeps reading the old inode instead of seeing partial new content.
 cp "$SCRIPT_DIR/hats" "$INSTALL_DIR/hats.tmp.$$"
-sed -i "s/^COMMIT=\"dev\"$/COMMIT=\"$COMMIT\"/" "$INSTALL_DIR/hats.tmp.$$"
+# Portable sed -i — BSD (macOS) sed requires explicit extension arg; GNU accepts it too.
+sed -i.bak "s/^COMMIT=\"dev\"$/COMMIT=\"$COMMIT\"/" "$INSTALL_DIR/hats.tmp.$$"
+rm -f "$INSTALL_DIR/hats.tmp.$$.bak"
 chmod +x "$INSTALL_DIR/hats.tmp.$$"
 mv -f "$INSTALL_DIR/hats.tmp.$$" "$INSTALL_DIR/hats"
 

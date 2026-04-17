@@ -22,7 +22,7 @@ HATS_SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/hats"
 # dynamically (via `$HOME/.claude` in `_configure_provider`), so overriding HOME
 # is the cleanest way to isolate. The real shell env is unaffected — these are
 # only exported in this subshell.
-SANDBOX_ROOT="$(mktemp -d -t hats-smoke-XXXXXX)"
+SANDBOX_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/hats-smoke-XXXXXX")"
 export HOME="$SANDBOX_ROOT"
 export HATS_DIR="$SANDBOX_ROOT/.hats"
 
