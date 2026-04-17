@@ -160,18 +160,43 @@ _colorize_stream() {
 _config_set() {
   local key="$1" value="$2"
   _ensure_config
-
-  if grep -q "^$key" "$HATS_CONFIG" 2>/dev/null; then
-    _sed_i "s#^$key.*#$key = \"$value\"#" "$HATS_CONFIG"
-  else
-    # Portable insert-after-`[hats]`: BSD sed's `a\<newline>text` form is
-    # fragile across shells, so use awk instead.
-    local tmp="$HATS_CONFIG.tmp.$$"
-    awk -v key="$key" -v val="$value" '
-      { print }
-      /^\[hats\]/ && !added { print key " = \"" val "\""; added=1 }
-    ' "$HATS_CONFIG" > "$tmp" && mv -f "$tmp" "$HATS_CONFIG"
-  fi
+  # Python handles read/modify/write with proper string escaping so that
+  # `value` can contain sed/awk metacharacters (`#`, `&`, `\`, `\n`) without
+  # corrupting the config file. Closes audit finding #2 / issue #5.
+  python3 - "$HATS_CONFIG" "$key" "$value" <<'PYEOF'
+import sys, re, json, os, tempfile
+path, key, val = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    lines = f.readlines()
+pat = re.compile(r"^" + re.escape(key) + r"\s*=")
+new_line = f"{key} = {json.dumps(val)}\n"
+out = []
+found = False
+for ln in lines:
+    if pat.match(ln):
+        out.append(new_line)
+        found = True
+    else:
+        out.append(ln)
+if not found:
+    final = []
+    inserted = False
+    for ln in out:
+        final.append(ln)
+        if not inserted and ln.strip() == "[hats]":
+            final.append(new_line)
+            inserted = True
+    out = final
+dirn = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(prefix=".hatscfg.", dir=dirn)
+try:
+    with os.fdopen(fd, "w") as f:
+        f.writelines(out)
+    os.replace(tmp, path)
+except Exception:
+    os.unlink(tmp)
+    raise
+PYEOF
 }
 
 _migrate_legacy_default() {
