@@ -1178,6 +1178,24 @@ cmd_doctor() {
     done
   fi
 
+  # 2c. Orphan isolated resources in base — anything matching ISOLATED_PATTERNS
+  # should only exist per-account, never in base. A stray `.credentials.json`
+  # or `auth.json` in base/ is a migration artifact and a potential credential-leak
+  # risk (every account would silently inherit these tokens on next `hats fix`).
+  local orphans=0
+  for item in "$BASE_DIR"/* "$BASE_DIR"/.*; do
+    [ -e "$item" ] || [ -L "$item" ] || continue
+    local bn
+    bn=$(basename "$item")
+    [[ "$bn" == "." || "$bn" == ".." ]] && continue
+    if _is_isolated "$bn"; then
+      echo "  WARN orphan isolated resource in base: $bn (should only exist per-account)"
+      orphans=$((orphans + 1))
+      warnings=$((warnings + 1))
+    fi
+  done
+  [ "$orphans" -eq 0 ] && echo "  OK   no orphan isolated resources in base"
+
   # 3. Default-account runtime symlink (~/.claude or ~/.codex).
   local default
   default=$(_default_account)
