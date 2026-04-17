@@ -2,6 +2,12 @@
 .credentials*
 *.json
 
+# Exceptions — rollback backups for documented config mitigations
+!docs/backups/*.json
+
+# Claude Code session scratch — per-workdir, not source
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db

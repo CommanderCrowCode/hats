@@ -1,0 +1,57 @@
+{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "disabledMcpjsonServers": [
+    "claude-in-chrome"
+  ],
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "relay-mesh__register_agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/tanwa/.claude/hooks/relay-post-tool-use.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "relay-mesh__register_agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/tanwa/.claude/hooks/relay-pre-tool-use.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/tanwa/.claude/hooks/relay-stop.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "printf \"\\033[01;32m%s@%s\\033[00m:\\033[01;34m%s\\033[00m\" \"$(whoami)\" \"$(hostname -s)\" \"$(pwd)\""
+  },
+  "enabledPlugins": {
+    "document-skills@anthropic-agent-skills": true,
+    "feature-dev@claude-code-plugins": true,
+    "frontend-design@claude-code-plugins": true,
+    "rust-analyzer-lsp@claude-plugins-official": true,
+    "security-guidance@claude-code-plugins": true
+  },
+  "alwaysThinkingEnabled": true,
+  "skipDangerousModePermissionPrompt": true,
+  "mcpServers": {},
+  "teammateMode": "in-process"
+}

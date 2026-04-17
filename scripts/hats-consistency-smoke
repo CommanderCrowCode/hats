@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# hats-consistency-smoke — verify cross-credential consistency of the hats layout.
+#
+# Runs a battery of readlink/stat/cmp checks against ~/.hats/claude/<cred>/ and
+# reports pass/fail per check class. Idempotent and cron-friendly: no side effects,
+# exits 0 on all-pass / 1 on any-fail / 2 on argv error.
+#
+# Usage:
+#   hats-consistency-smoke                 # check every credential
+#   hats-consistency-smoke shannon         # check one credential
+#   hats-consistency-smoke --verbose       # print per-check lines (default)
+#   hats-consistency-smoke --quiet         # print only the summary line
+#   hats-consistency-smoke --json          # emit machine-readable JSON
+#
+# Exit codes:
+#   0  all pass on all checked credentials
+#   1  at least one FAIL on at least one credential
+#   2  invalid arguments / layout missing
+#
+# Author: hats-lead (ag-0370a83a51af838c), 2026-04-17.
+# Owner: /home/tanwa/hats — commit + push via git, not modified in place on
+# deployed hosts.
+
+set -u
+
+ROOT="${HATS_DIR:-$HOME/.hats}/claude"
+BASE="$ROOT/base"
+MODE="verbose"
+ONLY=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --verbose) MODE="verbose" ;;
+    --quiet)   MODE="quiet" ;;
+    --json)    MODE="json" ;;
+    -h|--help)
+      sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    -*) echo "unknown flag: $arg" >&2; exit 2 ;;
+    *)
+      [ -n "$ONLY" ] && { echo "at most one credential name" >&2; exit 2; }
+      ONLY="$arg"
+      ;;
+  esac
+done
+
+[ -d "$ROOT" ] || { echo "layout missing: $ROOT" >&2; exit 2; }
+[ -d "$BASE" ] || { echo "base missing: $BASE" >&2; exit 2; }
+
+# Shared — should resolve identically on every credential.
+SHARED_PATHS=(
+  projects
+  CLAUDE.md
+  CONSTITUTION.md
+  skills
+  agents
+  plugins
+  hooks
+  hooks.json
+  .mcp.json
+  settings.json
+  tasks
+  teams
+  todos
+  plans
+  session-env
+)
+
+# Isolated — must exist and NOT be a symlink (per-credential).
+ISOLATED_PATHS=(
+  .credentials.json
+  .claude.json
+)
+
+# Isolated directories — per-credential; missing is tolerated for brand-new creds.
+ISOLATED_DIRS_OPTIONAL=(
+  sessions
+)
+
+discover_creds() {
+  if [ -n "$ONLY" ]; then
+    echo "$ONLY"
+    return
+  fi
+  for d in "$ROOT"/*/; do
+    local name; name=$(basename "$d")
+    [ "$name" = "base" ] && continue
+    [ -d "$d" ] && echo "$name"
+  done
+}
+
+creds_list=$(discover_creds)
+[ -z "$creds_list" ] && { echo "no credentials found under $ROOT" >&2; exit 2; }
+
+total_pass=0
+total_fail=0
+declare -a FAIL_LINES=()
+declare -a JSON_RESULTS=()
+
+emit() { [ "$MODE" = "verbose" ] && printf '%s\n' "$*"; }
+
+check_one_cred() {
+  local cred="$1"
+  local cdir="$ROOT/$cred"
+  local cred_pass=0
+  local cred_fail=0
+  local cred_status=()
+
+  if [ ! -d "$cdir" ]; then
+    FAIL_LINES+=("$cred: directory $cdir missing")
+    cred_fail=$((cred_fail+1))
+    total_fail=$((total_fail+1))
+    return
+  fi
+
+  emit "[$cred]"
+
+  # 1. shared paths: resolve under credential vs base should match.
+  for p in "${SHARED_PATHS[@]}"; do
+    local c_resolved b_resolved
+    c_resolved=$(readlink -f "$cdir/$p" 2>/dev/null || true)
+    b_resolved=$(readlink -f "$BASE/$p" 2>/dev/null || true)
+    if [ -z "$b_resolved" ]; then
+      emit "  SKIP shared    $p (missing in base — not managed)"
+      continue
+    fi
+    if [ "$c_resolved" = "$b_resolved" ] && [ -n "$c_resolved" ]; then
+      emit "  PASS shared    $p"
+      cred_pass=$((cred_pass+1))
+      cred_status+=("{\"check\":\"shared\",\"path\":\"$p\",\"status\":\"pass\"}")
+    else
+      emit "  FAIL shared    $p (cred=$c_resolved base=$b_resolved)"
+      FAIL_LINES+=("$cred shared/$p cred=$c_resolved base=$b_resolved")
+      cred_fail=$((cred_fail+1))
+      cred_status+=("{\"check\":\"shared\",\"path\":\"$p\",\"status\":\"fail\",\"cred_resolve\":\"$c_resolved\",\"base_resolve\":\"$b_resolved\"}")
+    fi
+  done
+
+  # 2. isolated mandatory paths: exist and not symlinks.
+  for p in "${ISOLATED_PATHS[@]}"; do
+    if [ -e "$cdir/$p" ] && [ ! -L "$cdir/$p" ]; then
+      emit "  PASS isolated  $p"
+      cred_pass=$((cred_pass+1))
+      cred_status+=("{\"check\":\"isolated\",\"path\":\"$p\",\"status\":\"pass\"}")
+    else
+      emit "  FAIL isolated  $p (missing or unexpectedly symlinked)"
+      FAIL_LINES+=("$cred isolated/$p missing or symlinked")
+      cred_fail=$((cred_fail+1))
+      cred_status+=("{\"check\":\"isolated\",\"path\":\"$p\",\"status\":\"fail\"}")
+    fi
+  done
+
+  # 3. isolated optional dirs: if present, must not be symlinked.
+  for p in "${ISOLATED_DIRS_OPTIONAL[@]}"; do
+    if [ ! -e "$cdir/$p" ]; then
+      emit "  SKIP isolated  $p (absent — OK on fresh cred)"
+      continue
+    fi
+    if [ -L "$cdir/$p" ]; then
+      emit "  FAIL isolated  $p (unexpectedly symlinked)"
+      FAIL_LINES+=("$cred isolated-opt/$p symlinked")
+      cred_fail=$((cred_fail+1))
+      cred_status+=("{\"check\":\"isolated\",\"path\":\"$p\",\"status\":\"fail\"}")
+    else
+      emit "  PASS isolated  $p"
+      cred_pass=$((cred_pass+1))
+      cred_status+=("{\"check\":\"isolated\",\"path\":\"$p\",\"status\":\"pass\"}")
+    fi
+  done
+
+  # 4. memory namespace sanity: a canonical project memory must read identically
+  #    from the credential vs base.
+  local pmem="$cdir/projects/-home-tanwa-praetor/memory/MEMORY.md"
+  local bmem="$BASE/projects/-home-tanwa-praetor/memory/MEMORY.md"
+  if [ -r "$bmem" ]; then
+    if [ -r "$pmem" ] && cmp -s "$pmem" "$bmem"; then
+      emit "  PASS memory    praetor MEMORY.md (shared + identical)"
+      cred_pass=$((cred_pass+1))
+      cred_status+=("{\"check\":\"memory_probe\",\"path\":\"praetor/MEMORY.md\",\"status\":\"pass\"}")
+    else
+      emit "  FAIL memory    praetor MEMORY.md mismatch or unreadable"
+      FAIL_LINES+=("$cred memory praetor MEMORY.md mismatch")
+      cred_fail=$((cred_fail+1))
+      cred_status+=("{\"check\":\"memory_probe\",\"path\":\"praetor/MEMORY.md\",\"status\":\"fail\"}")
+    fi
+  else
+    emit "  SKIP memory    praetor MEMORY.md absent in base — nothing to probe"
+  fi
+
+  total_pass=$((total_pass+cred_pass))
+  total_fail=$((total_fail+cred_fail))
+
+  if [ "$MODE" = "json" ]; then
+    local joined
+    joined=$(IFS=,; echo "${cred_status[*]}")
+    JSON_RESULTS+=("{\"cred\":\"$cred\",\"pass\":$cred_pass,\"fail\":$cred_fail,\"checks\":[$joined]}")
+  fi
+}
+
+while IFS= read -r cred; do
+  [ -z "$cred" ] && continue
+  check_one_cred "$cred"
+done <<< "$creds_list"
+
+if [ "$MODE" = "json" ]; then
+  IFS=,; echo "{\"summary\":{\"pass\":$total_pass,\"fail\":$total_fail},\"credentials\":[${JSON_RESULTS[*]}]}"
+else
+  printf '\n=== summary: %d pass, %d fail ===\n' "$total_pass" "$total_fail"
+  if [ "$total_fail" -gt 0 ] && [ "$MODE" = "quiet" ]; then
+    printf '%s\n' "${FAIL_LINES[@]}"
+  fi
+fi
+
+[ "$total_fail" -eq 0 ]
