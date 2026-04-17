@@ -101,7 +101,7 @@ _configure_provider() {
 _config_get() {
   local key="$1"
   if [ -f "$HATS_CONFIG" ]; then
-    grep -A20 '^\[hats\]' "$HATS_CONFIG" 2>/dev/null | grep "^$key" | head -1 | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | tr -d '[:space:]' || true
+    grep -A20 '^\[hats\]' "$HATS_CONFIG" 2>/dev/null | grep "^$key" | head -1 | sed -E 's/^[^=]*=[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' | tr -d '[:space:]' || true
   fi
 }
 
@@ -159,7 +159,9 @@ _migrate_legacy_default() {
   grep -qE '^default[[:space:]]*=' "$HATS_CONFIG" 2>/dev/null || return 0
 
   local legacy
-  legacy=$(grep -E '^default[[:space:]]*=' "$HATS_CONFIG" | head -1 | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | tr -d '[:space:]')
+  # POSIX-portable sed regex: BSD sed doesn't recognize `\s` or BRE `\?`.
+  # Use `[[:space:]]*` and ERE via `-E` for the optional quote.
+  legacy=$(grep -E '^default[[:space:]]*=' "$HATS_CONFIG" | head -1 | sed -E 's/^[^=]*=[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' | tr -d '[:space:]')
   if [ -n "$legacy" ]; then
     local cur_claude
     cur_claude=$(_config_get "default_claude")
@@ -399,7 +401,7 @@ _token_info_codex() {
   acct_dir=$(dirname "$file")
   local store="unknown"
   if [ -f "$acct_dir/config.toml" ]; then
-    store=$(grep '^cli_auth_credentials_store' "$acct_dir/config.toml" 2>/dev/null | head -1 | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | tr -d '[:space:]')
+    store=$(grep '^cli_auth_credentials_store' "$acct_dir/config.toml" 2>/dev/null | head -1 | sed -E 's/^[^=]*=[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' | tr -d '[:space:]')
   fi
   [ -n "$store" ] || store="unset"
 
