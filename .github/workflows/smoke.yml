@@ -41,3 +41,17 @@ jobs:
           ./hats version
           ./hats completion bash | head -3
           ./hats completion zsh  | head -3
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck (error severity)
+        run: |
+          # Only error-level issues block CI initially — style/info lints
+          # would require a one-time cleanup pass before becoming
+          # mandatory. Follow-up to tighten to -S warning once the codebase
+          # is clean at that level.
+          shellcheck --version
+          shellcheck -S error hats install.sh tests/smoke.sh
