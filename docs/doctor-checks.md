@@ -96,6 +96,24 @@ loops per account.
 
 ---
 
+## 2f. Symlink-target validation
+
+### `OK/WARN base/<name> symlink resolves outside $HOME: <target>`
+
+- **What.** Resolves every symlink under `base/` via `_realpath` and
+  flags targets that fall outside `$HOME`.
+- **Why.** A mistaken or malicious symlink at, e.g., `base/settings.json
+  -> /etc/shadow` would be propagated into every account via `hats fix`
+  and read by claude-code. Targets inside `$HOME` are assumed user-owned
+  and pass silently.
+- **Remediate WARN.** Inspect the symlink. If the target is legitimate
+  (e.g. a shared scripts dir you maintain in `/opt`), ignore — or move
+  the target under `$HOME` to suppress the warning. If the target is
+  unexpected, remove the symlink (`rm base/<name>`) and restore it from
+  a known-good source.
+
+---
+
 ## 2c. Orphan isolated resources in base
 
 ### `OK/WARN orphan isolated resource in base: <name>`

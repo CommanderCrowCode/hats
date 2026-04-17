@@ -279,6 +279,28 @@ test_completion_scripts() {
   ok "completion scripts emit expected content for bash + zsh"
 }
 
+test_doctor_flags_suspicious_symlink() {
+  # Plant a symlink in base/ pointing outside $HOME — doctor must WARN.
+  local base="$HATS_DIR/claude/base"
+  mkdir -p "$base"
+
+  # Create a target outside HOME in a directory we can read.
+  local outside
+  outside=$(mktemp "${TMPDIR:-/tmp}/hats-outside-XXXXXX")
+  ln -sfn "$outside" "$base/sneaky_link"
+
+  local out rc=0
+  out=$("$HATS_SCRIPT" doctor 2>&1 || rc=$?)
+
+  rm -f "$base/sneaky_link" "$outside"
+
+  if echo "$out" | grep -q 'WARN base/sneaky_link symlink resolves outside'; then
+    ok "doctor flags base symlinks pointing outside \$HOME"
+  else
+    die "doctor did not warn on out-of-HOME symlink (rc=$rc out=$out)"
+  fi
+}
+
 test_no_color_flag() {
   # --no-color must suppress ANSI escapes even if a future default flips on.
   # When stdout is a pipe (as here), colors are already auto-disabled — but
@@ -360,6 +382,7 @@ test_doctor_catches_invalid_json
 test_doctor_catches_missing_hook_command
 test_doctor_catches_duplicate_hooks
 test_completion_scripts
+test_doctor_flags_suspicious_symlink
 test_no_color_flag
 test_link_unlink_resource_validation
 test_config_migration_is_idempotent

@@ -1360,6 +1360,33 @@ for event_name, event_items in (d.get("hooks") or {}).items():
     fi
   fi
 
+  # 2f. Symlink-target validation — any symlink in base/ that resolves
+  # outside $HOME is flagged. Threat model: a malicious or mistaken symlink
+  # at base/settings.json pointing to /etc/shadow (or similar) would be
+  # propagated into every account via `hats fix` and inadvertently read by
+  # claude-code. This surfaces such cases for human audit. Targets already
+  # inside $HOME pass silently — many legitimate setups symlink base/agents
+  # / base/skills to a user-owned scripts directory outside $HATS_DIR.
+  local suspicious_links=0
+  for item in "$BASE_DIR"/* "$BASE_DIR"/.*; do
+    [ -L "$item" ] || continue
+    local bn resolved
+    bn=$(basename "$item")
+    if [[ "$bn" == "." || "$bn" == ".." ]]; then continue; fi
+    resolved=$(_realpath "$item" || true)
+    [ -n "$resolved" ] || continue
+    case "$resolved" in
+      "$HOME"|"$HOME"/*)
+        ;;  # inside $HOME — assumed user-owned, pass
+      *)
+        echo "  WARN base/$bn symlink resolves outside \$HOME: $resolved"
+        suspicious_links=$((suspicious_links + 1))
+        warnings=$((warnings + 1))
+        ;;
+    esac
+  done
+  [ "$suspicious_links" -eq 0 ] && echo "  OK   all base symlinks resolve inside \$HOME"
+
   # 2c. Orphan isolated resources in base — anything matching ISOLATED_PATTERNS
   # should only exist per-account, never in base. A stray `.credentials.json`
   # or `auth.json` in base/ is a migration artifact and a potential credential-leak

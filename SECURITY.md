@@ -90,9 +90,14 @@ symlink-target validation.
 **Not yet addressed:**
 - Plaintext-on-disk for credentials (see "What's NOT Protected" above) —
   matches upstream claude-code behavior, not hats-specific
-- Symlink-target validation for non-isolated shared resources — `hats
-  doctor` section 2c flags orphan isolated resources in `base/` as WARN but
-  does not verify that shared symlinks resolve inside `$HATS_DIR`
+
+**Closed in follow-up:**
+- Symlink-target validation — `hats doctor` section 2f now resolves every
+  symlink in `base/` and WARNs if the target falls outside `$HOME`. The
+  threat it catches: a malicious or mistaken `base/settings.json ->
+  /etc/shadow` would silently propagate into every account via `hats fix`
+  and get read by claude-code. Targets inside `$HOME` (including legitimate
+  user-owned paths like `~/opt/scripts/claude-skills`) pass silently.
 
 ## Reporting Vulnerabilities
 
