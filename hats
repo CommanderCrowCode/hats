@@ -132,8 +132,13 @@ _config_set() {
   if grep -q "^$key" "$HATS_CONFIG" 2>/dev/null; then
     _sed_i "s#^$key.*#$key = \"$value\"#" "$HATS_CONFIG"
   else
-    _sed_i "/^\[hats\]/a\\
-$key = \"$value\"" "$HATS_CONFIG"
+    # Portable insert-after-`[hats]`: BSD sed's `a\<newline>text` form is
+    # fragile across shells, so use awk instead.
+    local tmp="$HATS_CONFIG.tmp.$$"
+    awk -v key="$key" -v val="$value" '
+      { print }
+      /^\[hats\]/ && !added { print key " = \"" val "\""; added=1 }
+    ' "$HATS_CONFIG" > "$tmp" && mv -f "$tmp" "$HATS_CONFIG"
   fi
 }
 
@@ -1070,7 +1075,7 @@ cmd_fix() {
       [ -L "$item" ] || continue
       local bn
       bn=$(basename "$item")
-      [[ "$bn" == "." || "$bn" == ".." ]] && continue
+      if [[ "$bn" == "." || "$bn" == ".." ]]; then continue; fi
 
       if [ ! -e "$item" ]; then
         local expected_target="../base/$bn"
@@ -1087,12 +1092,12 @@ cmd_fix() {
     done
 
     for base_item in "$BASE_DIR"/* "$BASE_DIR"/.*; do
-      [ -e "$base_item" ] || [ -L "$base_item" ] || continue
+      if [ ! -e "$base_item" ] && [ ! -L "$base_item" ]; then continue; fi
       local bn
       bn=$(basename "$base_item")
-      [[ "$bn" == "." || "$bn" == ".." ]] && continue
-      _is_isolated "$bn" && continue
-      _is_shared_by_default "$bn" || continue
+      if [[ "$bn" == "." || "$bn" == ".." ]]; then continue; fi
+      if _is_isolated "$bn"; then continue; fi
+      if ! _is_shared_by_default "$bn"; then continue; fi
 
       if [ ! -e "$acct_dir/$bn" ] && [ ! -L "$acct_dir/$bn" ]; then
         ln -s "../base/$bn" "$acct_dir/$bn"
