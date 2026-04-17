@@ -152,6 +152,63 @@ test_doctor_catches_invalid_json() {
   fi
 }
 
+test_doctor_catches_missing_hook_command() {
+  local base="$HATS_DIR/claude/base"
+  local cfg="$base/settings.json"
+  mkdir -p "$base"
+
+  # Reference a hook command that definitely does not exist.
+  cat > "$cfg" <<'EOF'
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "/tmp/hats-smoke-nonexistent-hook.sh"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+  local out_bad
+  out_bad=$("$HATS_SCRIPT" doctor 2>/dev/null || true)
+
+  # Now point it at a real executable (/bin/sh).
+  cat > "$cfg" <<'EOF'
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "/bin/sh"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+  local out_good
+  out_good=$("$HATS_SCRIPT" doctor 2>/dev/null || true)
+
+  # Restore baseline (empty hooks block so no other tests are affected).
+  echo '{}' > "$cfg"
+
+  local rc_bad=1 rc_good=1
+  echo "$out_bad"  | grep -q "FAIL hook command missing: /tmp/hats-smoke-nonexistent-hook.sh" && rc_bad=0
+  echo "$out_good" | grep -q "OK   hook commands in base/settings.json all resolve" && rc_good=0
+
+  if [ "$rc_bad" -eq 0 ] && [ "$rc_good" -eq 0 ]; then
+    ok "doctor validates hook command paths"
+  else
+    die "hook-command check broken (bad_rc=$rc_bad good_rc=$rc_good)"
+  fi
+}
+
 test_config_migration_is_idempotent() {
   # Plant a legacy `default` key, run hats, verify it migrates to default_claude.
   cat > "$HATS_DIR/config.toml" <<'EOF'
@@ -195,6 +252,7 @@ test_fixture_account_and_default
 test_fix_on_fresh_sandbox
 test_doctor_runs_after_fixture
 test_doctor_catches_invalid_json
+test_doctor_catches_missing_hook_command
 test_config_migration_is_idempotent
 
 say "summary: $pass pass, $fail fail"

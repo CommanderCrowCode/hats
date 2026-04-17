@@ -1178,6 +1178,50 @@ cmd_doctor() {
     done
   fi
 
+  # 2d. Hook command paths in base/settings.json — claude-code silently fails
+  # at tool-call time if a referenced hook command path doesn't exist or
+  # isn't executable. Walk the hooks.* tree and check each unique command.
+  if [ "$CURRENT_PROVIDER" = "claude" ] \
+      && [ -f "$BASE_DIR/settings.json" ] \
+      && command -v python3 >/dev/null 2>&1; then
+    local missing_hooks=0 hook_path expanded
+    while IFS= read -r hook_path; do
+      [ -n "$hook_path" ] || continue
+      # Expand a leading ~ so we can stat the path. Other shell-level
+      # expansions (env vars, etc.) are left to claude-code at runtime.
+      expanded="${hook_path/#\~/$HOME}"
+      if [ ! -e "$expanded" ]; then
+        echo "  FAIL hook command missing: $hook_path (referenced in base/settings.json)"
+        missing_hooks=$((missing_hooks + 1))
+        issues=$((issues + 1))
+      elif [ ! -x "$expanded" ]; then
+        echo "  FAIL hook command not executable: $hook_path (chmod +x it)"
+        missing_hooks=$((missing_hooks + 1))
+        issues=$((issues + 1))
+      fi
+    done < <(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+seen = set()
+for event_items in (d.get("hooks") or {}).values():
+    if not isinstance(event_items, list):
+        continue
+    for item in event_items:
+        for hook in (item.get("hooks") or []):
+            cmd = hook.get("command")
+            if cmd:
+                seen.add(cmd)
+for c in sorted(seen):
+    print(c)
+' "$BASE_DIR/settings.json" 2>/dev/null)
+    if [ "$missing_hooks" -eq 0 ]; then
+      echo "  OK   hook commands in base/settings.json all resolve + executable"
+    fi
+  fi
+
   # 2c. Orphan isolated resources in base — anything matching ISOLATED_PATTERNS
   # should only exist per-account, never in base. A stray `.credentials.json`
   # or `auth.json` in base/ is a migration artifact and a potential credential-leak
