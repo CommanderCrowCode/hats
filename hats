@@ -1097,6 +1097,153 @@ cmd_fix() {
   echo "Done."
 }
 
+cmd_doctor() {
+  echo "Running hats doctor for $CURRENT_PROVIDER..."
+
+  local issues=0
+  local warnings=0
+
+  # 1. Tooling — python3 used by list for token inspection; provider CLI must exist.
+  if command -v python3 >/dev/null 2>&1; then
+    echo "  OK   python3 found ($(python3 --version 2>&1))"
+  else
+    echo "  FAIL python3 not on PATH"
+    issues=$((issues + 1))
+  fi
+
+  if command -v "$RUNTIME_COMMAND" >/dev/null 2>&1; then
+    echo "  OK   $RUNTIME_COMMAND found"
+  else
+    echo "  FAIL $RUNTIME_COMMAND not on PATH"
+    issues=$((issues + 1))
+  fi
+
+  # 2. Layout — provider + base dirs.
+  if [ -d "$PROVIDER_DIR" ]; then
+    echo "  OK   provider dir $PROVIDER_DIR"
+  else
+    echo "  FAIL provider dir missing: $PROVIDER_DIR (run '$(_hats_cmd_prefix) init')"
+    issues=$((issues + 1))
+    echo "Done. $issues issue(s), $warnings warning(s)."
+    return 1
+  fi
+
+  if [ -d "$BASE_DIR" ]; then
+    echo "  OK   base dir $BASE_DIR"
+  else
+    echo "  FAIL base dir missing: $BASE_DIR"
+    issues=$((issues + 1))
+  fi
+
+  # 3. Default-account runtime symlink (~/.claude or ~/.codex).
+  local default
+  default=$(_default_account)
+  if [ -z "$default" ]; then
+    echo "  WARN no default account configured (bare '$RUNTIME_COMMAND' won't resolve)"
+    warnings=$((warnings + 1))
+  elif [ -L "$RUNTIME_DIR" ]; then
+    local current_target expected_resolved
+    current_target=$(readlink -f "$RUNTIME_DIR" 2>/dev/null || true)
+    expected_resolved=$(readlink -f "$PROVIDER_DIR/$default" 2>/dev/null || true)
+    if [ -n "$current_target" ] && [ "$current_target" = "$expected_resolved" ]; then
+      echo "  OK   $RUNTIME_DIR -> default account '$default'"
+    else
+      echo "  FAIL $RUNTIME_DIR -> $current_target (expected $expected_resolved). Run '$(_hats_cmd_prefix) fix'."
+      issues=$((issues + 1))
+    fi
+  elif [ -e "$RUNTIME_DIR" ]; then
+    echo "  FAIL $RUNTIME_DIR exists but is not a symlink"
+    issues=$((issues + 1))
+  else
+    echo "  WARN $RUNTIME_DIR missing (bare '$RUNTIME_COMMAND' won't resolve)"
+    warnings=$((warnings + 1))
+  fi
+
+  # 4. Per-account checks.
+  for name in $(_accounts); do
+    local acct_dir
+    acct_dir=$(_account_dir "$name")
+    echo "  [$name]"
+
+    # 4a. Primary auth file presence + permissions.
+    local auth_file="$acct_dir/$PRIMARY_AUTH_FILE"
+    if [ ! -f "$auth_file" ]; then
+      echo "    FAIL $PRIMARY_AUTH_FILE missing (run '$(_hats_cmd_prefix) add $name' or '/login')"
+      issues=$((issues + 1))
+    else
+      local mode
+      mode=$(stat -c '%a' "$auth_file" 2>/dev/null || stat -f '%Lp' "$auth_file" 2>/dev/null || echo "?")
+      case "$mode" in
+        600|400)
+          echo "    OK   $PRIMARY_AUTH_FILE mode=$mode"
+          ;;
+        ?)
+          echo "    WARN $PRIMARY_AUTH_FILE mode unknown (stat failed)"
+          warnings=$((warnings + 1))
+          ;;
+        *)
+          echo "    WARN $PRIMARY_AUTH_FILE mode=$mode (expected 600 or 400 — credentials should not be group/other readable)"
+          warnings=$((warnings + 1))
+          ;;
+      esac
+    fi
+
+    # 4b. Broken symlinks.
+    local broken=0
+    for item in "$acct_dir"/* "$acct_dir"/.*; do
+      [ -L "$item" ] || continue
+      local bn
+      bn=$(basename "$item")
+      [[ "$bn" == "." || "$bn" == ".." ]] && continue
+      if [ ! -e "$item" ]; then
+        echo "    FAIL broken symlink: $bn"
+        broken=$((broken + 1))
+        issues=$((issues + 1))
+      fi
+    done
+    [ "$broken" -eq 0 ] && echo "    OK   no broken symlinks"
+
+    # 4c. Missing expected shared resources.
+    local missing=0
+    for base_item in "$BASE_DIR"/* "$BASE_DIR"/.*; do
+      [ -e "$base_item" ] || [ -L "$base_item" ] || continue
+      local bn
+      bn=$(basename "$base_item")
+      [[ "$bn" == "." || "$bn" == ".." ]] && continue
+      _is_isolated "$bn" && continue
+      _is_shared_by_default "$bn" || continue
+      if [ ! -e "$acct_dir/$bn" ] && [ ! -L "$acct_dir/$bn" ]; then
+        echo "    WARN missing shared resource: $bn (run '$(_hats_cmd_prefix) fix')"
+        missing=$((missing + 1))
+        warnings=$((warnings + 1))
+      fi
+    done
+    [ "$missing" -eq 0 ] && echo "    OK   all shared resources present"
+
+    # 4d. Locally-modified shared resources — present but NOT a symlink, when
+    # a shared-by-default file of the same name exists in base. This catches the
+    # shannon/settings.json class of drift.
+    local unlinked=0
+    for item in "$acct_dir"/* "$acct_dir"/.*; do
+      [ -e "$item" ] || continue
+      [ -L "$item" ] && continue
+      local bn
+      bn=$(basename "$item")
+      [[ "$bn" == "." || "$bn" == ".." ]] && continue
+      _is_isolated "$bn" && continue
+      _is_shared_by_default "$bn" || continue
+      [ -e "$BASE_DIR/$bn" ] || [ -L "$BASE_DIR/$bn" ] || continue
+      echo "    WARN locally-overridden shared resource: $bn (diverges from base)"
+      unlinked=$((unlinked + 1))
+      warnings=$((warnings + 1))
+    done
+    [ "$unlinked" -eq 0 ] && echo "    OK   no unintended shared-resource overrides"
+  done
+
+  echo "Done. $issues issue(s), $warnings warning(s)."
+  [ "$issues" -eq 0 ]
+}
+
 cmd_providers() {
   echo "Supported providers:"
   echo "  claude"
@@ -1142,6 +1289,7 @@ Shell Integration:
 
 Maintenance:
   fix                  Repair symlinks, verify auth, detect issues
+  doctor               Read-only health check (tooling, layout, symlinks, permissions)
   providers            Show supported providers
   version              Show version
 
@@ -1194,6 +1342,7 @@ case "${1:-}" in
   status)           cmd_status "${2:-}" ;;
   shell-init)       shift; cmd_shell_init "$@" ;;
   fix)              cmd_fix ;;
+  doctor)           cmd_doctor ;;
   providers)        cmd_providers ;;
   version|-v|--version) cmd_version ;;
   help|-h|--help|"") cmd_help ;;

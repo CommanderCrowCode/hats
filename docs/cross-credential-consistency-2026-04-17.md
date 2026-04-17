@@ -363,6 +363,26 @@ isolated-path per-credential presence, and a praetor-memory probe. Modes:
 `--verbose` (default), `--quiet`, `--json`. Idempotent, no side effects, cron-friendly.
 Returns 0 on all-pass. First run on this host: 57 pass / 0 fail.
 
+## `hats doctor` subcommand — shipped
+
+The roadmap-tracked `hats doctor` command (v1.1 item, previously unchecked) now ships as a
+proper subcommand of the `hats` CLI. Read-only, per-provider health check covering:
+
+- Tooling presence (python3, provider CLI)
+- Layout integrity (provider dir, base dir)
+- Default-account runtime symlink (`~/.claude` or `~/.codex`) matches configured default
+- Per-account: primary auth file presence + mode 600 permissions check
+- Per-account: broken symlinks
+- Per-account: missing shared resources (run `hats fix` to repair)
+- Per-account: locally-overridden shared resources (diverges from base — the class of
+  drift this whole audit was about)
+
+Exit 0 on clean, 1 on any issue. Works for both claude and codex providers
+(`hats doctor` and `hats codex doctor`). First run on this host:
+- claude: 1 issue (config migration gap — `default` key not `default_claude`, filed as
+  follow-up), 6 warnings (pre-existing shannon legacy state).
+- codex: 0 issues, 1 warning (scb10x config.toml locally overridden — intentional).
+
 ## Open questions for praetor
 
 1. **Approval to execute M1 + M2** (promote shannon's settings.json and CONSTITUTION.md to
