@@ -47,11 +47,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: shellcheck (error severity)
+      - name: shellcheck (error severity — blocking)
         run: |
-          # Only error-level issues block CI initially — style/info lints
-          # would require a one-time cleanup pass before becoming
-          # mandatory. Follow-up to tighten to -S warning once the codebase
-          # is clean at that level.
           shellcheck --version
           shellcheck -S error hats install.sh tests/smoke.sh
+
+      - name: shellcheck (warning severity — advisory)
+        # Warning-level lints are advisory for now — captured here so
+        # contributors see the output and can pick at them, but not
+        # blocking CI until the codebase is clean at that level.
+        continue-on-error: true
+        run: |
+          shellcheck -S warning hats install.sh tests/smoke.sh || true
