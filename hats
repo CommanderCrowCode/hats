@@ -1222,6 +1222,47 @@ for c in sorted(seen):
     fi
   fi
 
+  # 2e. Duplicate hook entries in base/settings.json — claude-code will run
+  # an identical (matcher, command-set) hook multiple times if registered
+  # multiple times under the same event. Usually benign but wastes cycles and
+  # is almost always a misconfiguration from repeated appends.
+  if [ "$CURRENT_PROVIDER" = "claude" ] \
+      && [ -f "$BASE_DIR/settings.json" ] \
+      && command -v python3 >/dev/null 2>&1; then
+    local dup_out
+    dup_out=$(python3 -c '
+import json, sys
+from collections import Counter
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for event_name, event_items in (d.get("hooks") or {}).items():
+    if not isinstance(event_items, list):
+        continue
+    fingerprints = []
+    for item in event_items:
+        matcher = item.get("matcher", "") or ""
+        cmds = tuple(sorted(
+            (h.get("command") or "") for h in (item.get("hooks") or [])
+        ))
+        fingerprints.append((matcher, cmds))
+    for (matcher, cmds), n in Counter(fingerprints).items():
+        if n > 1:
+            m = matcher if matcher else "(no-matcher)"
+            print(f"{event_name}\t{m}\t{n}")
+' "$BASE_DIR/settings.json" 2>/dev/null)
+    if [ -n "$dup_out" ]; then
+      while IFS=$'\t' read -r event_name matcher count; do
+        [ -n "$event_name" ] || continue
+        echo "  WARN duplicate hook registration: event=$event_name matcher=$matcher count=$count"
+        warnings=$((warnings + 1))
+      done <<< "$dup_out"
+    else
+      echo "  OK   no duplicate hook registrations in base/settings.json"
+    fi
+  fi
+
   # 2c. Orphan isolated resources in base — anything matching ISOLATED_PATTERNS
   # should only exist per-account, never in base. A stray `.credentials.json`
   # or `auth.json` in base/ is a migration artifact and a potential credential-leak

@@ -209,6 +209,52 @@ EOF
   fi
 }
 
+test_doctor_catches_duplicate_hooks() {
+  local base="$HATS_DIR/claude/base"
+  local cfg="$base/settings.json"
+  mkdir -p "$base"
+
+  # settings.json with one matcher duplicated 3 times under PostToolUse.
+  cat > "$cfg" <<'EOF'
+{
+  "hooks": {
+    "PostToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/bin/sh"}]},
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/bin/sh"}]},
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/bin/sh"}]}
+    ]
+  }
+}
+EOF
+  local out_dup
+  out_dup=$("$HATS_SCRIPT" doctor 2>/dev/null || true)
+
+  # Unique matchers → no dup warning.
+  cat > "$cfg" <<'EOF'
+{
+  "hooks": {
+    "PostToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/bin/sh"}]}
+    ]
+  }
+}
+EOF
+  local out_unique
+  out_unique=$("$HATS_SCRIPT" doctor 2>/dev/null || true)
+
+  echo '{}' > "$cfg"
+
+  local rc_dup=1 rc_unique=1
+  echo "$out_dup"    | grep -q "WARN duplicate hook registration: event=PostToolUse matcher=Bash count=3" && rc_dup=0
+  echo "$out_unique" | grep -q "OK   no duplicate hook registrations" && rc_unique=0
+
+  if [ "$rc_dup" -eq 0 ] && [ "$rc_unique" -eq 0 ]; then
+    ok "doctor detects duplicate hook registrations"
+  else
+    die "hook-duplicate check broken (dup_rc=$rc_dup unique_rc=$rc_unique)"
+  fi
+}
+
 test_config_migration_is_idempotent() {
   # Plant a legacy `default` key, run hats, verify it migrates to default_claude.
   cat > "$HATS_DIR/config.toml" <<'EOF'
@@ -253,6 +299,7 @@ test_fix_on_fresh_sandbox
 test_doctor_runs_after_fixture
 test_doctor_catches_invalid_json
 test_doctor_catches_missing_hook_command
+test_doctor_catches_duplicate_hooks
 test_config_migration_is_idempotent
 
 say "summary: $pass pass, $fail fail"
