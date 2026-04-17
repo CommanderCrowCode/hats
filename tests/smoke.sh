@@ -95,6 +95,22 @@ test_fixture_account_and_default() {
   fi
 }
 
+test_fix_on_fresh_sandbox() {
+  # Regression test for issue #3: `hats fix` silently aborting after the
+  # header line on a fresh sandbox. After the _ensure_provider_defaults fix,
+  # it must complete and reach the "Done." tail.
+  local out rc=0
+  out=$("$HATS_SCRIPT" fix 2>&1) || rc=$?
+  case "$out" in
+    *Done.*)
+      ok "fix reaches 'Done.' on fresh sandbox (rc=$rc)"
+      ;;
+    *)
+      die "fix aborted early (rc=$rc output=$out)"
+      ;;
+  esac
+}
+
 test_doctor_runs_after_fixture() {
   local rc=0
   "$HATS_SCRIPT" doctor >/dev/null 2>&1 || rc=$?
@@ -176,6 +192,7 @@ test_help
 test_init_creates_layout
 test_list_empty_does_not_crash
 test_fixture_account_and_default
+test_fix_on_fresh_sandbox
 test_doctor_runs_after_fixture
 test_doctor_catches_invalid_json
 test_config_migration_is_idempotent

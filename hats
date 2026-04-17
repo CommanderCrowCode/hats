@@ -242,6 +242,12 @@ EOF
 
 _ensure_provider_defaults() {
   [ "$CURRENT_PROVIDER" = "codex" ] && _ensure_codex_base_config
+  # Always return 0. Under `set -euo pipefail` the trailing short-circuited
+  # `[ ... ] && ...` returns the test's exit code (1) for provider=claude, and
+  # bash errexit would terminate any caller that doesn't wrap the call in a
+  # conditional — in particular `cmd_fix`, which was silently aborting after
+  # the header line on fresh sandboxes before any base symlinks existed.
+  return 0
 }
 
 _ensure_account_defaults() {
