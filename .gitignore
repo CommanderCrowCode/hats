@@ -7,6 +7,7 @@
 
 # Claude Code session scratch — per-workdir, not source
 .claude/
+.cycle/
 
 # OS
 .DS_Store

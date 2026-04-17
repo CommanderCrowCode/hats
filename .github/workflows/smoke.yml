@@ -1,0 +1,43 @@
+name: smoke
+
+# Safe-by-construction: this workflow does not consume any user-controlled
+# GitHub context inputs (no github.event.* references, no issue/PR body text
+# interpolated into run: commands). Only `${{ matrix.os }}` is used, which is
+# a fixed enum defined below — not user-reachable.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shell syntax check
+        run: |
+          bash -n hats
+          bash -n install.sh
+          bash -n tests/smoke.sh
+
+      - name: run smoke tests
+        run: ./tests/smoke.sh
+
+      - name: surface commands (basic smoke)
+        run: |
+          chmod +x hats
+          ./hats help >/dev/null
+          ./hats version
+          ./hats completion bash | head -3
+          ./hats completion zsh  | head -3
