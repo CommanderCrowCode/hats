@@ -101,7 +101,7 @@ _configure_provider() {
 _config_get() {
   local key="$1"
   if [ -f "$HATS_CONFIG" ]; then
-    grep -A20 '^\[hats\]' "$HATS_CONFIG" 2>/dev/null | grep "^$key" | head -1 | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | tr -d '[:space:]'
+    grep -A20 '^\[hats\]' "$HATS_CONFIG" 2>/dev/null | grep "^$key" | head -1 | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | tr -d '[:space:]' || true
   fi
 }
 
@@ -125,6 +125,27 @@ _config_set() {
   else
     sed -i "/^\[hats\]/a $key = \"$value\"" "$HATS_CONFIG"
   fi
+}
+
+_migrate_legacy_default() {
+  # v0.x used a bare `default = "..."` key for the Claude account; v1.1 switched
+  # to provider-scoped `default_claude` / `default_codex`. On upgraded configs the
+  # legacy key is dead state — read it once, promote to `default_claude` when no
+  # provider-specific default is set, then drop the legacy line.
+  [ -f "$HATS_CONFIG" ] || return 0
+
+  # Match `^default` followed by whitespace or `=`, NOT `default_claude` / `default_codex` / `default_provider`.
+  grep -qE '^default[[:space:]]*=' "$HATS_CONFIG" 2>/dev/null || return 0
+
+  local legacy
+  legacy=$(grep -E '^default[[:space:]]*=' "$HATS_CONFIG" | head -1 | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | tr -d '[:space:]')
+  if [ -n "$legacy" ]; then
+    local cur_claude
+    cur_claude=$(_config_get "default_claude")
+    [ -z "$cur_claude" ] && _config_set "default_claude" "$legacy"
+  fi
+
+  sed -i '/^default[[:space:]]*=/d' "$HATS_CONFIG"
 }
 
 _default_provider() {
@@ -1320,6 +1341,8 @@ EOF
 }
 
 # ── Main ─────────────────────────────────────────────────────────
+
+_migrate_legacy_default
 
 provider_candidate="${1:-}"
 if _is_supported_provider "$provider_candidate"; then
