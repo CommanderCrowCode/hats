@@ -1156,6 +1156,22 @@ cmd_doctor() {
     issues=$((issues + 1))
   fi
 
+  # 2b. Base config JSON validity — claude-code silently fails to load an invalid
+  # settings.json / hooks.json / .mcp.json; surface parse errors loudly.
+  if [ "$CURRENT_PROVIDER" = "claude" ] && command -v python3 >/dev/null 2>&1; then
+    local cfg_bn
+    for cfg_bn in settings.json hooks.json .mcp.json; do
+      local cfg_path="$BASE_DIR/$cfg_bn"
+      [ -f "$cfg_path" ] || continue
+      if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$cfg_path" 2>/dev/null; then
+        echo "  OK   base/$cfg_bn parses as JSON"
+      else
+        echo "  FAIL base/$cfg_bn is not valid JSON (claude-code will reject it)"
+        issues=$((issues + 1))
+      fi
+    done
+  fi
+
   # 3. Default-account runtime symlink (~/.claude or ~/.codex).
   local default
   default=$(_default_account)
