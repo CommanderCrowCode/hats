@@ -55,7 +55,7 @@ Quality-of-life improvements.
 - [x] Codex file-based auth bootstrap (`cli_auth_credentials_store = "file"`)
 - [x] `hats doctor` — comprehensive health check (python3 version, file permissions, symlink integrity)
 - [ ] Colored output (with `--no-color` flag)
-- [ ] Tab completion for zsh and bash
+- [x] Tab completion for zsh and bash
 - [ ] `hats export` / `hats import` — portable credential transfer between machines
 
 ## v2.0

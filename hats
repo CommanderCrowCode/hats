@@ -1390,6 +1390,181 @@ for event_name, event_items in (d.get("hooks") or {}).items():
   [ "$issues" -eq 0 ]
 }
 
+cmd_completion() {
+  local shell="${1:-}"
+  case "$shell" in
+    bash) _print_bash_completion ;;
+    zsh)  _print_zsh_completion ;;
+    ''|-h|--help)
+      cat <<EOF
+Usage: $(_hats_cmd_prefix) completion <bash|zsh>
+
+Emits a shell-completion script to stdout. Source or eval the output to
+enable tab completion for the 'hats' command.
+
+  # bash (add to ~/.bashrc):
+  eval "\$(hats completion bash)"
+
+  # zsh (add to ~/.zshrc):
+  eval "\$(hats completion zsh)"
+EOF
+      [ -z "$shell" ] && exit 0 || return 0
+      ;;
+    *) die "Usage: $(_hats_cmd_prefix) completion <bash|zsh>" ;;
+  esac
+}
+
+_print_bash_completion() {
+  cat <<'BASH_COMPLETION'
+# hats — bash tab completion
+# Emitted by `hats completion bash`. Source via `eval "$(hats completion bash)"`.
+_hats_completion() {
+  local cur prev words cword
+  _init_completion 2>/dev/null || {
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    words=("${COMP_WORDS[@]}")
+    cword=$COMP_CWORD
+  }
+
+  local providers="claude codex"
+  local cmds="init add remove rm rename mv list ls swap default link unlink status shell-init fix doctor completion providers version help"
+  local first="${words[1]:-}"
+  local second="${words[2]:-}"
+
+  local provider="claude"
+  local cmd_idx=1
+  if [[ " $providers " == *" $first "* ]]; then
+    provider="$first"
+    cmd_idx=2
+  fi
+  local cmd="${words[$cmd_idx]:-}"
+
+  # Position 1: providers + commands (commands repeated for backward-compat).
+  if [ "$cword" -eq 1 ]; then
+    COMPREPLY=( $(compgen -W "$providers $cmds" -- "$cur") )
+    return
+  fi
+
+  # Position 2: if position 1 was a provider, offer commands; else offer
+  # arguments for the command at position 1.
+  if [ "$cword" -eq 2 ] && [[ " $providers " == *" $first "* ]]; then
+    COMPREPLY=( $(compgen -W "$cmds" -- "$cur") )
+    return
+  fi
+
+  # Commands that take an account name as their first arg.
+  case "$cmd" in
+    add|remove|rm|rename|mv|swap|default|link|unlink|status)
+      local root="${HATS_DIR:-$HOME/.hats}/$provider"
+      local accts=""
+      if [ -d "$root" ]; then
+        for d in "$root"/*/; do
+          [ -d "$d" ] || continue
+          local n; n=$(basename "$d")
+          [ "$n" = "base" ] && continue
+          accts="$accts $n"
+        done
+      fi
+      COMPREPLY=( $(compgen -W "$accts" -- "$cur") )
+      ;;
+    completion)
+      COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") )
+      ;;
+    *) COMPREPLY=() ;;
+  esac
+}
+complete -F _hats_completion hats
+BASH_COMPLETION
+}
+
+_print_zsh_completion() {
+  cat <<'ZSH_COMPLETION'
+# hats — zsh tab completion
+# Emitted by `hats completion zsh`. Source via `eval "$(hats completion zsh)"`.
+_hats() {
+  local -a cmds providers
+  providers=(claude codex)
+  cmds=(
+    'init:Initialize hats for the active provider'
+    'add:Create a new account'
+    'remove:Remove an account'
+    'rm:Alias for remove'
+    'rename:Rename an account'
+    'mv:Alias for rename'
+    'list:Show all accounts'
+    'ls:Alias for list'
+    'swap:Run provider CLI with account home'
+    'default:Get or set the default account'
+    'link:Share a resource with base'
+    'unlink:Isolate a resource'
+    'status:Show linked vs isolated resources'
+    'shell-init:Emit shell functions for your config'
+    'fix:Repair symlinks + verify auth'
+    'doctor:Read-only health check'
+    'completion:Emit shell-completion script (bash|zsh)'
+    'providers:Show supported providers'
+    'version:Show version'
+    'help:Show help'
+  )
+
+  _arguments -C \
+    '1: :->first' \
+    '2: :->second' \
+    '*: :->rest'
+
+  local provider=claude
+  local cmd_idx=1
+  if (( ${providers[(Ie)$words[2]]} )); then
+    provider=$words[2]
+    cmd_idx=2
+  fi
+  local cmd=$words[cmd_idx+1]
+
+  case $state in
+    first)
+      _describe 'hats commands' cmds
+      _values 'provider' ${providers[@]}
+      ;;
+    second)
+      if (( ${providers[(Ie)$words[2]]} )); then
+        _describe 'hats commands' cmds
+      else
+        _hats_complete_arg $words[2] $provider
+      fi
+      ;;
+    rest)
+      _hats_complete_arg $cmd $provider
+      ;;
+  esac
+}
+
+_hats_complete_arg() {
+  local cmd="$1" provider="$2"
+  local root="${HATS_DIR:-$HOME/.hats}/$provider"
+  case "$cmd" in
+    add|remove|rm|rename|mv|swap|default|link|unlink|status)
+      local -a accts
+      [[ -d "$root" ]] || return
+      for d in "$root"/*/; do
+        [[ -d "$d" ]] || continue
+        local n="${d:h:t}"
+        [[ "$n" == "base" ]] && continue
+        accts+=("$n")
+      done
+      _describe 'account' accts
+      ;;
+    completion)
+      local -a shells; shells=(bash zsh)
+      _describe 'shell' shells
+      ;;
+  esac
+}
+
+compdef _hats hats
+ZSH_COMPLETION
+}
+
 cmd_providers() {
   echo "Supported providers:"
   echo "  claude"
@@ -1436,6 +1611,7 @@ Shell Integration:
 Maintenance:
   fix                  Repair symlinks, verify auth, detect issues
   doctor               Read-only health check (tooling, layout, symlinks, permissions)
+  completion <shell>   Emit tab-completion script for bash or zsh
   providers            Show supported providers
   version              Show version
 
@@ -1491,6 +1667,7 @@ case "${1:-}" in
   shell-init)       shift; cmd_shell_init "$@" ;;
   fix)              cmd_fix ;;
   doctor)           cmd_doctor ;;
+  completion)       cmd_completion "${2:-}" ;;
   providers)        cmd_providers ;;
   version|-v|--version) cmd_version ;;
   help|-h|--help|"") cmd_help ;;

@@ -255,6 +255,44 @@ EOF
   fi
 }
 
+test_completion_scripts() {
+  local bash_out zsh_out
+  bash_out=$("$HATS_SCRIPT" completion bash)
+  zsh_out=$("$HATS_SCRIPT" completion zsh)
+
+  # Bash script must register _hats_completion via complete -F.
+  echo "$bash_out" | grep -q 'complete -F _hats_completion hats' \
+    || { die "bash completion missing 'complete -F' registration"; return; }
+  # And include subcommands list.
+  echo "$bash_out" | grep -q 'init add remove' \
+    || { die "bash completion missing subcommand list"; return; }
+
+  # Zsh script must register via compdef.
+  echo "$zsh_out" | grep -q 'compdef _hats hats' \
+    || { die "zsh completion missing 'compdef' registration"; return; }
+  echo "$zsh_out" | grep -q "'doctor:Read-only health check'" \
+    || { die "zsh completion missing subcommand descriptions"; return; }
+
+  # Sourcing + simulating a bash completion should produce expected matches.
+  local result
+  result=$(bash -c '
+    set +euo pipefail
+    source <('"$HATS_SCRIPT"' completion bash)
+    COMP_WORDS=(hats d)
+    COMP_CWORD=1
+    _hats_completion >/dev/null 2>&1 || true
+    echo "${COMPREPLY[@]}"
+  ')
+  case "$result" in
+    *default*doctor*|*doctor*default*)
+      ok "tab completion for 'hats d' includes default + doctor"
+      ;;
+    *)
+      die "tab completion did not match expected subcommands (got: $result)"
+      ;;
+  esac
+}
+
 test_config_migration_is_idempotent() {
   # Plant a legacy `default` key, run hats, verify it migrates to default_claude.
   cat > "$HATS_DIR/config.toml" <<'EOF'
@@ -300,6 +338,7 @@ test_doctor_runs_after_fixture
 test_doctor_catches_invalid_json
 test_doctor_catches_missing_hook_command
 test_doctor_catches_duplicate_hooks
+test_completion_scripts
 test_config_migration_is_idempotent
 
 say "summary: $pass pass, $fail fail"
