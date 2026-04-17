@@ -58,6 +58,42 @@ Additional precautions:
 - If you suspect a token is compromised, revoke it at [console.anthropic.com](https://console.anthropic.com) and re-run `/login`
 - Back up account directories periodically (`cp -a ~/.hats/claude/<name> /backup/`)
 
+## Audit History
+
+### 2026-04-17 — full-script audit
+
+An automated code-reviewer agent audited the entire `hats` script + companion
+`install.sh` / `tests/smoke.sh` for shell injection, path traversal, command
+injection, credential leakage, permission handling, race conditions, and
+symlink-target validation.
+
+**Findings + resolutions:**
+
+| # | Severity | Finding | Resolution | Commit |
+|---|----------|---------|------------|--------|
+| 1 | Critical | `_token_info_claude` / `_token_info_codex` interpolated `$file` into a python heredoc (`python3 -c "…open('$file')…"`), so a `HATS_DIR` containing a single quote could break out into Python code execution | Switched to argv-based invocation: `python3 - "$file" <<'PYEOF' … sys.argv[1]`; the heredoc is single-quoted so no shell substitution inside | a89d741 |
+| 2 | High | `_config_set` interpolated `$value` into `sed` replacement + `awk -v val=$value`. `#`, `&`, `\`, `\n` could corrupt config or affect expression parsing | Rewrote `_config_set` as a python3 read/modify/write using `json.dumps()` for TOML-safe escaping + atomic `os.replace` | 0f73b1d |
+| 3 | High | `install.sh` interpolated `$COMMIT` (from `git rev-parse`) into a `sed` replacement. Under a tampered `.git`, a ref containing `/`, `&`, or `\n` could corrupt the stamping expression | Constrained `$COMMIT` to `^[0-9a-f]+$|^unknown$` before use | a89d741 |
+| 4 | Medium | `hats link` / `hats unlink` accepted unvalidated resource names (`../foo`, `*`, `.`, `..`) | Added `_validate_resource` that enforces `^\.?[a-zA-Z0-9][a-zA-Z0-9._-]*$` — same constraint as account names | a89d741 |
+
+**Informational (no action):**
+- Credentials never written to stdout or command lines — `OPENAI_API_KEY` is
+  piped via stdin, not argv
+- `chmod 600` consistently applied across credential-file creation paths
+- Smoke-test sandbox override of `$HOME` + `$HATS_DIR` correctly isolates
+  tests from the host's real config
+
+**Regression coverage:** `tests/smoke.sh` includes assertions for the
+`_validate_resource` and `--no-color` paths; CI runs the suite on
+`ubuntu-latest` + `macos-latest` on every push.
+
+**Not yet addressed:**
+- Plaintext-on-disk for credentials (see "What's NOT Protected" above) —
+  matches upstream claude-code behavior, not hats-specific
+- Symlink-target validation for non-isolated shared resources — `hats
+  doctor` section 2c flags orphan isolated resources in `base/` as WARN but
+  does not verify that shared symlinks resolve inside `$HATS_DIR`
+
 ## Reporting Vulnerabilities
 
 If you discover a security issue in hats, please open a GitHub issue or contact the maintainer directly. hats is a simple shell script — the attack surface is small and all code is auditable in a single file.
