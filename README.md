@@ -228,8 +228,25 @@ codex_work() { CODEX_HOME="$HOME/.hats/codex/work" codex -c 'cli_auth_credential
 
 ```bash
 hats fix               # Repair broken symlinks, verify auth
+hats doctor            # Read-only health check (tooling, layout, symlinks, permissions)
+hats completion bash   # Emit bash completion script; eval "$(...)" in .bashrc
+hats completion zsh    # Emit zsh completion script; eval "$(...)" in .zshrc
 hats version           # Show version
 ```
+
+**`hats doctor`** is a read-only companion to `hats fix` — it verifies layout
+integrity without changing anything, then exits non-zero on hard issues. See
+[`docs/doctor-checks.md`](docs/doctor-checks.md) for the full check catalog and
+remediation guide. Works for both providers: `hats doctor` (claude) and
+`hats codex doctor`.
+
+**`install.sh --check`** runs the smoke-test suite (`tests/smoke.sh`) before
+installing, aborting if any test fails — handy for CI/CD or anyone who wants
+a gate on source changes.
+
+**Tab completion** covers subcommand names, provider names, and account names
+(dynamically read from `~/.hats/<provider>/` at completion time, so new
+accounts are immediately completable without re-sourcing).
 
 ## Adding a New Account
 
