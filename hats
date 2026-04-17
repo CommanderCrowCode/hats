@@ -125,6 +125,12 @@ _sed_i() {
   rm -f "$file.bak"
 }
 
+_realpath() {
+  # Portable equivalent of GNU `readlink -f`: BSD (macOS) readlink lacks -f.
+  # python3 is already a hats dependency.
+  python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null
+}
+
 _config_set() {
   local key="$1" value="$2"
   _ensure_config
@@ -1114,9 +1120,9 @@ cmd_fix() {
     local expected_target="$PROVIDER_DIR/$default"
     if [ -L "$RUNTIME_DIR" ]; then
       local current_target
-      current_target=$(readlink -f "$RUNTIME_DIR")
+      current_target=$(_realpath "$RUNTIME_DIR")
       local expected_resolved
-      expected_resolved=$(readlink -f "$expected_target")
+      expected_resolved=$(_realpath "$expected_target")
       if [ "$current_target" != "$expected_resolved" ]; then
         ln -sfn "$expected_target" "$RUNTIME_DIR"
         echo "  Fixed $RUNTIME_DIR symlink -> $expected_target"
@@ -1304,8 +1310,8 @@ for event_name, event_items in (d.get("hooks") or {}).items():
     warnings=$((warnings + 1))
   elif [ -L "$RUNTIME_DIR" ]; then
     local current_target expected_resolved
-    current_target=$(readlink -f "$RUNTIME_DIR" 2>/dev/null || true)
-    expected_resolved=$(readlink -f "$PROVIDER_DIR/$default" 2>/dev/null || true)
+    current_target=$(_realpath "$RUNTIME_DIR" || true)
+    expected_resolved=$(_realpath "$PROVIDER_DIR/$default" || true)
     if [ -n "$current_target" ] && [ "$current_target" = "$expected_resolved" ]; then
       echo "  OK   $RUNTIME_DIR -> default account '$default'"
     else

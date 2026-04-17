@@ -300,9 +300,9 @@ EOF
   fi
 
   # Run again; must be no-op.
-  local before_sha; before_sha=$(sha1sum "$HATS_DIR/config.toml" | awk '{print $1}')
+  local before_sha; before_sha=$(shasum -a 1 "$HATS_DIR/config.toml" | awk '{print $1}')
   "$HATS_SCRIPT" version >/dev/null 2>&1
-  local after_sha;  after_sha=$(sha1sum "$HATS_DIR/config.toml" | awk '{print $1}')
+  local after_sha;  after_sha=$(shasum -a 1 "$HATS_DIR/config.toml" | awk '{print $1}')
   if [ "$before_sha" = "$after_sha" ]; then
     ok "migration is idempotent on second invocation"
   else
