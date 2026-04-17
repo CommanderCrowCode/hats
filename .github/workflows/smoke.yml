@@ -51,3 +51,11 @@ jobs:
         run: |
           shellcheck --version
           shellcheck -S warning hats install.sh tests/smoke.sh
+
+      - name: shellcheck (info severity — advisory)
+        # Style / minor lints: informational only — contributors see the
+        # output but CI stays green. Promote to blocking after a cleanup
+        # pass if the set is small.
+        continue-on-error: true
+        run: |
+          shellcheck -S info hats install.sh tests/smoke.sh || true
