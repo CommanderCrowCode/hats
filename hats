@@ -233,6 +233,9 @@ _matches_any_pattern() {
   shift || true
   local pattern
   for pattern in "$@"; do
+    # shellcheck disable=SC2053
+    # Intentional glob match: `$pattern` is a glob like `.credentials*.json`,
+    # not a literal — unquoted RHS is required for `[[ == ]]` to glob-match.
     [[ "$value" == $pattern ]] && return 0
   done
   return 1
@@ -412,7 +415,10 @@ _link_resource() {
     [[ "$target" == *"base/$resource"* ]] && die "'$resource' is already linked to base."
   fi
 
-  rm -rf "$acct_dir/$resource"
+  # `:?` guards ensure rm -rf never expands to / even if vars are ever empty.
+  # `_validate_resource` + `_account_dir` should make that impossible, but
+  # defensive.
+  rm -rf "${acct_dir:?}/${resource:?}"
   ln -s "../base/$resource" "$acct_dir/$resource"
   echo "Linked $CURRENT_PROVIDER/$name/$resource -> base/$resource"
 }
