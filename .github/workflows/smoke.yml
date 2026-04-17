@@ -47,15 +47,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: shellcheck (warning severity — blocking)
+      - name: shellcheck (info severity — blocking)
+        # info covers warning + error severities too, so this is the
+        # tightest blocking gate we run. Style-level (-S style) stays
+        # unreached for now.
         run: |
           shellcheck --version
-          shellcheck -S warning hats install.sh tests/smoke.sh
-
-      - name: shellcheck (info severity — advisory)
-        # Style / minor lints: informational only — contributors see the
-        # output but CI stays green. Promote to blocking after a cleanup
-        # pass if the set is small.
-        continue-on-error: true
-        run: |
-          shellcheck -S info hats install.sh tests/smoke.sh || true
+          shellcheck -S info hats install.sh tests/smoke.sh

@@ -290,7 +290,9 @@ test_doctor_flags_suspicious_symlink() {
   ln -sfn "$outside" "$base/sneaky_link"
 
   local out rc=0
-  out=$("$HATS_SCRIPT" doctor 2>&1 || rc=$?)
+  # Capture rc in the current shell — `rc=$?` inside `$()` is a subshell
+  # modification and is lost (SC2030/SC2031).
+  out=$("$HATS_SCRIPT" doctor 2>&1) || rc=$?
 
   rm -f "$base/sneaky_link" "$outside"
 
