@@ -131,6 +131,32 @@ _realpath() {
   python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null
 }
 
+_should_color() {
+  # Color is on when: stdout is a TTY, NO_COLOR env var is unset, and --no-color
+  # flag wasn't passed. Honors the NO_COLOR standard (https://no-color.org).
+  [ "${HATS_NO_COLOR:-0}" = "0" ] || return 1
+  [ -z "${NO_COLOR:-}" ] || return 1
+  [ -t 1 ] || return 1
+  return 0
+}
+
+_colorize_stream() {
+  # Read stdin and color the leading OK/WARN/FAIL tokens on each line.
+  # Matches only the token at the start of the line (after indent), so prose
+  # that happens to contain these words downstream isn't affected.
+  if ! _should_color; then
+    cat
+    return 0
+  fi
+  local esc
+  esc=$'\033'
+  sed -E "
+    s/^([[:space:]]*)OK([[:space:]])/\\1${esc}[32mOK${esc}[0m\\2/
+    s/^([[:space:]]*)WARN([[:space:]])/\\1${esc}[33mWARN${esc}[0m\\2/
+    s/^([[:space:]]*)FAIL([[:space:]])/\\1${esc}[31mFAIL${esc}[0m\\2/
+  "
+}
+
 _config_set() {
   local key="$1" value="$2"
   _ensure_config
@@ -1676,6 +1702,11 @@ Directory Structure:
 
 Environment Variables:
   HATS_DIR             Hats root directory (default: ~/.hats)
+  NO_COLOR             Disable colored output (https://no-color.org)
+  HATS_NO_COLOR        Same as NO_COLOR, hats-scoped alias
+
+Global flags:
+  --no-color           Disable colored output for this invocation
 
 Config: $HATS_CONFIG
 EOF
@@ -1684,6 +1715,19 @@ EOF
 # ── Main ─────────────────────────────────────────────────────────
 
 _migrate_legacy_default
+
+# Parse global --no-color flag before provider/command dispatch so every
+# subcommand can opt into colorized output via _should_color.
+HATS_NO_COLOR="${HATS_NO_COLOR:-0}"
+args=()
+for a in "$@"; do
+  case "$a" in
+    --no-color) HATS_NO_COLOR=1 ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]+"${args[@]}"}"
+export HATS_NO_COLOR
 
 provider_candidate="${1:-}"
 if _is_supported_provider "$provider_candidate"; then
@@ -1705,8 +1749,8 @@ case "${1:-}" in
   unlink)           cmd_unlink "${2:-}" "${3:-}" ;;
   status)           cmd_status "${2:-}" ;;
   shell-init)       shift; cmd_shell_init "$@" ;;
-  fix)              cmd_fix ;;
-  doctor)           cmd_doctor ;;
+  fix)              cmd_fix | _colorize_stream; exit "${PIPESTATUS[0]}" ;;
+  doctor)           cmd_doctor | _colorize_stream; exit "${PIPESTATUS[0]}" ;;
   completion)       cmd_completion "${2:-}" ;;
   providers)        cmd_providers ;;
   version|-v|--version) cmd_version ;;

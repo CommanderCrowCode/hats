@@ -54,7 +54,7 @@ Quality-of-life improvements.
 - [x] Codex-safe default sharing model (`config.toml`, `plugins/`, `skills/`, `prompts/`, `rules/`)
 - [x] Codex file-based auth bootstrap (`cli_auth_credentials_store = "file"`)
 - [x] `hats doctor` — comprehensive health check (python3 version, file permissions, symlink integrity)
-- [ ] Colored output (with `--no-color` flag)
+- [x] Colored output (with `--no-color` flag)
 - [x] Tab completion for zsh and bash
 - [ ] `hats export` / `hats import` — portable credential transfer between machines
 

@@ -279,6 +279,19 @@ test_completion_scripts() {
   ok "completion scripts emit expected content for bash + zsh"
 }
 
+test_no_color_flag() {
+  # --no-color must suppress ANSI escapes even if a future default flips on.
+  # When stdout is a pipe (as here), colors are already auto-disabled — but
+  # --no-color must ALSO disable them if TTY detection is ever overridden.
+  local out
+  out=$("$HATS_SCRIPT" --no-color doctor 2>&1 || true)
+  if printf '%s' "$out" | grep -q $'\033\[[0-9]*m'; then
+    die "ANSI escape codes leaked through --no-color"
+  else
+    ok "--no-color suppresses ANSI escapes"
+  fi
+}
+
 test_link_unlink_resource_validation() {
   # Regression for the security audit medium #4 finding: `hats link/unlink`
   # must reject path-traversal, globs, and dot entries.
@@ -347,6 +360,7 @@ test_doctor_catches_invalid_json
 test_doctor_catches_missing_hook_command
 test_doctor_catches_duplicate_hooks
 test_completion_scripts
+test_no_color_flag
 test_link_unlink_resource_validation
 test_config_migration_is_idempotent
 
