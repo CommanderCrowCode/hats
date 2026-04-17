@@ -279,6 +279,28 @@ test_completion_scripts() {
   ok "completion scripts emit expected content for bash + zsh"
 }
 
+test_link_unlink_resource_validation() {
+  # Regression for the security audit medium #4 finding: `hats link/unlink`
+  # must reject path-traversal, globs, and dot entries.
+  local acct="$HATS_DIR/claude/foo"
+  [ -d "$acct" ] || { mkdir -p "$acct"; : > "$acct/.credentials.json"; chmod 600 "$acct/.credentials.json"; echo '{}' > "$acct/.claude.json"; }
+
+  # Capture output separately — hats exits non-zero on die, and `set -o
+  # pipefail` would mask the grep success if we piped directly.
+  local rejects=0 out
+  for bad in '../etc/shadow' '*' '..' '.' 'foo/bar' '?x'; do
+    out=$("$HATS_SCRIPT" link foo "$bad" 2>&1 || true)
+    if echo "$out" | grep -q 'Invalid resource name'; then
+      rejects=$((rejects + 1))
+    fi
+  done
+  if [ "$rejects" -eq 6 ]; then
+    ok "link/unlink rejects path-traversal, globs, and dot entries"
+  else
+    die "resource-name validator let something through ($rejects/6 rejections)"
+  fi
+}
+
 test_config_migration_is_idempotent() {
   # Plant a legacy `default` key, run hats, verify it migrates to default_claude.
   cat > "$HATS_DIR/config.toml" <<'EOF'
@@ -325,6 +347,7 @@ test_doctor_catches_invalid_json
 test_doctor_catches_missing_hook_command
 test_doctor_catches_duplicate_hooks
 test_completion_scripts
+test_link_unlink_resource_validation
 test_config_migration_is_idempotent
 
 say "summary: $pass pass, $fail fail"

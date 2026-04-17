@@ -335,11 +335,23 @@ _setup_account_dir() {
   _ensure_account_defaults "$acct_dir"
 }
 
+_validate_resource() {
+  local resource="$1"
+  # Accept dot-prefixed names (e.g. .mcp.json, .credentials.json) but disallow
+  # path separators, globs, and `..` traversal so that `hats link/unlink` can
+  # only target files directly under $BASE_DIR.
+  case "$resource" in
+    ''|*/*|*\**|*\?*|..|.) die "Invalid resource name '$resource'." ;;
+  esac
+  [[ "$resource" =~ ^\.?[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || die "Invalid resource name '$resource'."
+}
+
 _link_resource() {
   local name="$1" resource="$2"
   local acct_dir
   acct_dir=$(_account_dir "$name")
 
+  _validate_resource "$resource"
   _is_isolated "$resource" && die "'$resource' is always isolated and cannot be linked."
   [ -e "$BASE_DIR/$resource" ] || [ -L "$BASE_DIR/$resource" ] || die "Resource '$resource' not found in base."
 
@@ -359,6 +371,7 @@ _unlink_resource() {
   local acct_dir
   acct_dir=$(_account_dir "$name")
 
+  _validate_resource "$resource"
   _is_isolated "$resource" && die "'$resource' is always isolated."
   [ -L "$acct_dir/$resource" ] || die "'$resource' is already isolated for '$name'."
 
@@ -372,10 +385,13 @@ _unlink_resource() {
 
 _token_info_claude() {
   local file="$1"
-  python3 -c "
+  # File path passed via argv, not string-interpolated into the python source,
+  # so a path containing quotes / shell metacharacters cannot break out into
+  # Python code execution.
+  python3 - "$file" <<'PYEOF' 2>/dev/null
 import json, datetime, sys
 try:
-    d = json.load(open('$file'))
+    d = json.load(open(sys.argv[1]))
     auth = d.get('claudeAiOauth', {})
     if not auth:
         print('error=no claudeAiOauth key')
@@ -392,7 +408,7 @@ try:
     print(f'expired={expired}')
 except Exception as e:
     print(f'error={e}')
-" 2>/dev/null
+PYEOF
 }
 
 _token_info_codex() {
@@ -405,16 +421,17 @@ _token_info_codex() {
   fi
   [ -n "$store" ] || store="unset"
 
-  python3 -c "
+  # File path passed via argv, not string-interpolated (see _token_info_claude).
+  python3 - "$file" <<'PYEOF' 2>/dev/null
 import json, sys
 try:
-    d = json.load(open('$file'))
+    d = json.load(open(sys.argv[1]))
     tokens = d.get('tokens') or {}
     print('present=True')
-    print(f\"account_id={tokens.get('account_id', 'unknown')}\")
+    print(f"account_id={tokens.get('account_id', 'unknown')}")
 except Exception as e:
     print(f'error={e}')
-" 2>/dev/null
+PYEOF
   echo "store=$store"
 }
 

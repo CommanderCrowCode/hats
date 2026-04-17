@@ -27,6 +27,11 @@ INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Parse --check etc. already done above. COMMIT comes from `git rev-parse` and
+# is interpolated into a sed replacement expression below; constrain it to
+# hex-only so that a tampered-git scenario (packed-refs, unusual HEAD) can't
+# inject sed metacharacters (`/`, `&`, newline).
+
 # Pre-install smoke check: run the test suite before overwriting the installed
 # binary. Useful for CI or operators who want a safety gate on source changes.
 if [ "$CHECK" -eq 1 ]; then
@@ -45,6 +50,9 @@ mkdir -p "$INSTALL_DIR"
 
 # Stamp the commit hash into the installed copy
 COMMIT=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+if ! [[ "$COMMIT" =~ ^[0-9a-f]+$|^unknown$ ]]; then
+  COMMIT="unknown"
+fi
 
 # Atomic install: write to temp file then mv, so any running hats process
 # keeps reading the old inode instead of seeing partial new content.
