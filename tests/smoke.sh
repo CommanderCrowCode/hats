@@ -467,6 +467,38 @@ test_install_to_sandbox_stamps_commit() {
   fi
 }
 
+test_doctor_flags_missing_auth_and_broken_symlink() {
+  # Covers doctor §4a (missing $PRIMARY_AUTH_FILE) and §4b (broken symlink
+  # under the account dir). Previously only the base-level doctor checks
+  # (§2b/§2d/§2e/§2f) had coverage. These two detections are what catch the
+  # "user half-deleted their ~/.credentials.json" and "user pointed a symlink
+  # at a path that no longer exists" scenarios — both real regression targets.
+  local acct="$HATS_DIR/claude/docbroken"
+  mkdir -p "$acct"
+  # §4a: no .credentials.json on disk
+  # §4b: symlink to a path that does not exist
+  ln -s /nonexistent/target "$acct/dangling"
+
+  local out rc=0
+  out=$("$HATS_SCRIPT" doctor 2>&1) || rc=$?
+
+  rm -rf "$acct"
+
+  local missing_ok=0 broken_ok=0
+  echo "$out" | grep -q "FAIL .credentials.json missing" && missing_ok=1
+  echo "$out" | grep -q "FAIL broken symlink: dangling"  && broken_ok=1
+
+  # Doctor must exit non-zero because both are FAIL (not WARN).
+  local nonzero_ok=0
+  [ "$rc" -ne 0 ] && nonzero_ok=1
+
+  if [ "$missing_ok" -eq 1 ] && [ "$broken_ok" -eq 1 ] && [ "$nonzero_ok" -eq 1 ]; then
+    ok "doctor flags per-account missing auth file + broken symlink with non-zero exit"
+  else
+    die "doctor per-account checks broken (missing=$missing_ok broken=$broken_ok rc_nonzero=$nonzero_ok)"
+  fi
+}
+
 test_swap_error_paths() {
   # `hats swap <missing>` and `hats swap <account-with-no-credentials>` are
   # the only swap paths reachable without a real `claude` binary. Both must
@@ -876,6 +908,7 @@ test_link_unlink_resource_validation
 test_account_crud_roundtrip
 test_codex_provider_routing
 test_codex_completion_emits_script
+test_doctor_flags_missing_auth_and_broken_symlink
 test_swap_error_paths
 test_command_aliases
 test_link_unlink_happy_path
