@@ -467,6 +467,71 @@ test_install_to_sandbox_stamps_commit() {
   fi
 }
 
+test_swap_error_paths() {
+  # `hats swap <missing>` and `hats swap <account-with-no-credentials>` are
+  # the only swap paths reachable without a real `claude` binary. Both must
+  # exit non-zero with specific error text so CI pipelines can detect
+  # failure — the regression concern is a silent rc=0 after an Error: line
+  # (would be invisible to `set -e` callers).
+  local acct="$HATS_DIR/claude/nocred"
+  mkdir -p "$acct"
+  # NOTE: no .credentials.json
+
+  local out_missing rc_missing=0
+  out_missing=$("$HATS_SCRIPT" swap does-not-exist 2>&1) || rc_missing=$?
+
+  local out_nocred rc_nocred=0
+  out_nocred=$("$HATS_SCRIPT" swap nocred 2>&1) || rc_nocred=$?
+
+  rm -rf "$acct"
+
+  local missing_ok=0 nocred_ok=0
+  [ "$rc_missing" -ne 0 ] && echo "$out_missing" | grep -q "not found" && missing_ok=1
+  [ "$rc_nocred"  -ne 0 ] && echo "$out_nocred"  | grep -q "no credentials" && nocred_ok=1
+
+  if [ "$missing_ok" -eq 1 ] && [ "$nocred_ok" -eq 1 ]; then
+    ok "swap rejects missing + no-credentials accounts with non-zero rc"
+  else
+    die "swap error paths broken (missing=$missing_ok/rc=$rc_missing nocred=$nocred_ok/rc=$rc_nocred)"
+  fi
+}
+
+test_command_aliases() {
+  # Aliases `ls`, `rm`, `mv` for list / remove / rename — listed in help + the
+  # completion scripts but previously untested. Verifies the main-dispatch
+  # case statement routes them identically.
+  local acct="$HATS_DIR/claude/aliastest"
+  mkdir -p "$acct"
+  : > "$acct/.credentials.json"
+  chmod 600 "$acct/.credentials.json"
+  echo '{}' > "$acct/.claude.json"
+
+  # ls: equivalent to list
+  local ls_out; ls_out=$("$HATS_SCRIPT" ls 2>&1)
+  local ls_ok=0
+  echo "$ls_out" | grep -q "hats v.* — Claude Code Accounts" \
+    && echo "$ls_out" | grep -q "aliastest" && ls_ok=1
+
+  # mv: equivalent to rename
+  local rc_mv=0
+  "$HATS_SCRIPT" mv aliastest aliastest2 >/dev/null 2>&1 || rc_mv=$?
+  local mv_ok=0
+  [ "$rc_mv" -eq 0 ] && [ -d "$HATS_DIR/claude/aliastest2" ] \
+    && [ ! -d "$HATS_DIR/claude/aliastest" ] && mv_ok=1
+
+  # rm: equivalent to remove
+  local rc_rm=0
+  "$HATS_SCRIPT" rm aliastest2 >/dev/null 2>&1 || rc_rm=$?
+  local rm_ok=0
+  [ "$rc_rm" -eq 0 ] && [ ! -d "$HATS_DIR/claude/aliastest2" ] && rm_ok=1
+
+  if [ "$ls_ok" -eq 1 ] && [ "$mv_ok" -eq 1 ] && [ "$rm_ok" -eq 1 ]; then
+    ok "command aliases ls/mv/rm route to list/rename/remove"
+  else
+    die "aliases broken (ls=$ls_ok mv=$mv_ok rm=$rm_ok)"
+  fi
+}
+
 test_link_unlink_happy_path() {
   # Happy path for cmd_link / cmd_unlink — complementary to
   # test_link_unlink_resource_validation which only covers the rejection paths.
@@ -811,6 +876,8 @@ test_link_unlink_resource_validation
 test_account_crud_roundtrip
 test_codex_provider_routing
 test_codex_completion_emits_script
+test_swap_error_paths
+test_command_aliases
 test_link_unlink_happy_path
 test_providers_and_default_getter
 test_shell_init_emits_functions_per_account
