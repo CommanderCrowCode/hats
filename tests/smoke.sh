@@ -448,8 +448,10 @@ test_install_to_sandbox_stamps_commit() {
        && ! grep -q '^COMMIT="dev"$' "$installed"; then
       have_commit=1
     fi
-    # Atomic install must not leave temp/bak residue behind.
-    if ls "$dest"/hats.tmp.* "$dest"/hats.tmp.*.bak 2>/dev/null | grep -q .; then
+    # Atomic install must not leave temp/bak residue behind. `compgen -G`
+    # is bash-native and returns 0 iff any file matches the glob — safer
+    # than `ls | grep` (SC2010).
+    if compgen -G "$dest/hats.tmp.*" >/dev/null; then
       have_no_tmp=0
     fi
     "$installed" version >/dev/null 2>&1 && runs_ok=1
