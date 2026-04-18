@@ -467,6 +467,65 @@ test_install_to_sandbox_stamps_commit() {
   fi
 }
 
+test_install_check_gates_on_smoke() {
+  # `install.sh --check <dir>` must: (1) run the smoke suite, (2) install only
+  # on pass, (3) abort with exit 1 on fail. We verify both branches hermetically
+  # by staging a fake repo with a stub smoke.sh — otherwise --check would invoke
+  # this very file and recurse.
+  local stage pass_dest fail_dest rc_pass=0 rc_fail=0 installed_on_pass=0 installed_on_fail=0
+  stage=$(mktemp -d "${TMPDIR:-/tmp}/hats-install-check-XXXXXX")
+  mkdir -p "$stage/tests"
+  cp "$HATS_REPO/install.sh" "$stage/install.sh"
+  cp "$HATS_REPO/hats"       "$stage/hats"
+
+  # Passing stub
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$stage/tests/smoke.sh"
+  chmod +x "$stage/tests/smoke.sh"
+  pass_dest=$(mktemp -d "${TMPDIR:-/tmp}/hats-install-check-pass-XXXXXX")
+  "$stage/install.sh" --check "$pass_dest" >/dev/null 2>&1 || rc_pass=$?
+  [ -x "$pass_dest/hats" ] && installed_on_pass=1
+
+  # Failing stub
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$stage/tests/smoke.sh"
+  chmod +x "$stage/tests/smoke.sh"
+  fail_dest=$(mktemp -d "${TMPDIR:-/tmp}/hats-install-check-fail-XXXXXX")
+  "$stage/install.sh" --check "$fail_dest" >/dev/null 2>&1 || rc_fail=$?
+  [ -x "$fail_dest/hats" ] && installed_on_fail=1
+
+  rm -rf "$stage" "$pass_dest" "$fail_dest"
+
+  if [ "$rc_pass" -eq 0 ] && [ "$installed_on_pass" -eq 1 ] \
+     && [ "$rc_fail" -eq 1 ] && [ "$installed_on_fail" -eq 0 ]; then
+    ok "install.sh --check installs on smoke pass, aborts on smoke fail"
+  else
+    die "install.sh --check gate broken (pass rc=$rc_pass installed=$installed_on_pass / fail rc=$rc_fail installed=$installed_on_fail)"
+  fi
+}
+
+test_install_is_idempotent_on_reinstall() {
+  # Second install over the same target must succeed atomically: no leftover
+  # hats.tmp.* files, binary still runs, and the mv -f overwrites the previous
+  # copy in place.
+  local dest rc1=0 rc2=0 have_no_tmp=1 runs_ok=0
+  dest=$(mktemp -d "${TMPDIR:-/tmp}/hats-reinstall-XXXXXX")
+
+  "$HATS_REPO/install.sh" "$dest" >/dev/null 2>&1 || rc1=$?
+  "$HATS_REPO/install.sh" "$dest" >/dev/null 2>&1 || rc2=$?
+
+  if compgen -G "$dest/hats.tmp.*" >/dev/null; then
+    have_no_tmp=0
+  fi
+  "$dest/hats" version >/dev/null 2>&1 && runs_ok=1
+
+  rm -rf "$dest"
+
+  if [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ] && [ "$have_no_tmp" -eq 1 ] && [ "$runs_ok" -eq 1 ]; then
+    ok "install.sh is idempotent on reinstall (no tmp residue, binary still runs)"
+  else
+    die "install.sh reinstall broken (rc1=$rc1 rc2=$rc2 no_tmp=$have_no_tmp runs=$runs_ok)"
+  fi
+}
+
 test_config_migration_is_idempotent() {
   # Plant a legacy `default` key, run hats, verify it migrates to default_claude.
   cat > "$HATS_DIR/config.toml" <<'EOF'
@@ -521,6 +580,8 @@ test_install_help_exits_zero
 test_install_rejects_unknown_flag
 test_install_rejects_too_many_args
 test_install_to_sandbox_stamps_commit
+test_install_check_gates_on_smoke
+test_install_is_idempotent_on_reinstall
 test_config_migration_is_idempotent
 
 say "summary: $pass pass, $fail fail"
