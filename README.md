@@ -227,7 +227,7 @@ codex_work() { CODEX_HOME="$HOME/.hats/codex/work" codex -c 'cli_auth_credential
 ### Maintenance
 
 ```bash
-hats fix               # Repair broken symlinks, verify auth
+hats fix               # Repair broken symlinks, verify auth, dedupe base/settings.json hooks
 hats doctor            # Read-only health check (tooling, layout, symlinks, permissions)
 hats completion bash   # Emit bash completion script; eval "$(...)" in .bashrc
 hats completion zsh    # Emit zsh completion script; eval "$(...)" in .zshrc

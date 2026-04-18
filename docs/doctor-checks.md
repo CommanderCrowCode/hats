@@ -82,7 +82,7 @@ loops per account.
 
 ## 2e. Duplicate hook registrations (claude only)
 
-### `OK/WARN duplicate hook registration: event=X matcher=Y count=N`
+### `OK/WARN duplicate hook registration: event=X matcher=Y count=N (run 'hats fix' to dedupe)`
 
 - **What.** Fingerprints every entry under `hooks.<event>` as
   `(matcher, sorted-command-paths)` and flags fingerprints that appear
@@ -90,9 +90,12 @@ loops per account.
 - **Why.** Duplicated entries cause claude-code to run the hook N times per
   matching tool call — usually benign but wasteful, and non-idempotent hook
   scripts can produce surprising side effects.
-- **Remediate WARN.** Open `base/settings.json` and dedupe the affected
-  `hooks.<event>` array. Python one-liner works; preserve order within event
-  and keep only the first occurrence of each fingerprint.
+- **Remediate WARN.** Run `hats fix`. It rewrites `base/settings.json`
+  atomically, collapsing each event's hook list to one entry per
+  `(matcher, command-set)` fingerprint. First occurrence wins; remaining
+  ordering is preserved; unique entries are left verbatim. Fix emits one
+  line per event+matcher that had removals:
+  `deduped base/settings.json hooks: event=<E> matcher=<M> removed=<N>`.
 
 ---
 
