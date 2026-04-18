@@ -331,6 +331,8 @@ hats v1.1.0 — Claude Code Accounts
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `HATS_DIR` | `~/.hats` | Hats root directory |
+| `NO_COLOR` | unset | Any non-empty value disables ANSI color (see [no-color.org](https://no-color.org)) |
+| `HATS_NO_COLOR` | `0` | Same as `NO_COLOR`, hats-scoped alias |
 
 ### File Layout
 
