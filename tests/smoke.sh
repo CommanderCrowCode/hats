@@ -15,7 +15,9 @@
 set -euo pipefail
 
 HATS_SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/hats"
+HATS_REPO="$(dirname "$HATS_SCRIPT")"
 [ -x "$HATS_SCRIPT" ] || { echo "missing or non-executable hats at $HATS_SCRIPT" >&2; exit 1; }
+[ -x "$HATS_REPO/install.sh" ] || { echo "missing or non-executable install.sh at $HATS_REPO/install.sh" >&2; exit 1; }
 
 # Sandbox both HOME and HATS_DIR so the suite never touches the user's real
 # `~/.claude` / `~/.codex` runtime symlinks. hats resolves $HOME/.claude
@@ -396,6 +398,73 @@ test_link_unlink_resource_validation() {
   fi
 }
 
+test_install_help_exits_zero() {
+  local out rc=0
+  out=$("$HATS_REPO/install.sh" --help 2>&1) || rc=$?
+  if [ "$rc" -eq 0 ] && echo "$out" | grep -q "Install hats to"; then
+    ok "install.sh --help exits 0 with help text"
+  else
+    die "install.sh --help broken (rc=$rc)"
+  fi
+}
+
+test_install_rejects_unknown_flag() {
+  local rc=0
+  "$HATS_REPO/install.sh" --bogus >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    ok "install.sh rejects unknown flag with exit 2"
+  else
+    die "install.sh unknown-flag rejection broken (rc=$rc, want 2)"
+  fi
+}
+
+test_install_rejects_too_many_args() {
+  local rc=0
+  "$HATS_REPO/install.sh" /tmp/a /tmp/b >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    ok "install.sh rejects >1 positional arg with exit 2"
+  else
+    die "install.sh too-many-args rejection broken (rc=$rc, want 2)"
+  fi
+}
+
+test_install_to_sandbox_stamps_commit() {
+  # Installs hats into a throwaway dir and verifies the atomic-install
+  # succeeds + the COMMIT line was rewritten from "dev" to a real short
+  # sha (or "unknown" if git is unavailable). Also confirms the resulting
+  # binary is executable and runnable.
+  local dest
+  dest=$(mktemp -d "${TMPDIR:-/tmp}/hats-install-XXXXXX")
+
+  local rc=0
+  "$HATS_REPO/install.sh" "$dest" >/dev/null 2>&1 || rc=$?
+
+  local installed="$dest/hats"
+  local have_bin=0 have_exec=0 have_commit=0 have_no_tmp=1 runs_ok=0
+  [ -f "$installed" ] && have_bin=1
+  [ -x "$installed" ] && have_exec=1
+  if [ "$have_bin" -eq 1 ]; then
+    if grep -qE '^COMMIT="([0-9a-f]+|unknown)"$' "$installed" \
+       && ! grep -q '^COMMIT="dev"$' "$installed"; then
+      have_commit=1
+    fi
+    # Atomic install must not leave temp/bak residue behind.
+    if ls "$dest"/hats.tmp.* "$dest"/hats.tmp.*.bak 2>/dev/null | grep -q .; then
+      have_no_tmp=0
+    fi
+    "$installed" version >/dev/null 2>&1 && runs_ok=1
+  fi
+
+  rm -rf "$dest"
+
+  if [ "$rc" -eq 0 ] && [ "$have_bin" -eq 1 ] && [ "$have_exec" -eq 1 ] \
+     && [ "$have_commit" -eq 1 ] && [ "$have_no_tmp" -eq 1 ] && [ "$runs_ok" -eq 1 ]; then
+    ok "install.sh installs hats atomically and stamps COMMIT"
+  else
+    die "install.sh install broken (rc=$rc bin=$have_bin exec=$have_exec commit=$have_commit no_tmp=$have_no_tmp runs=$runs_ok)"
+  fi
+}
+
 test_config_migration_is_idempotent() {
   # Plant a legacy `default` key, run hats, verify it migrates to default_claude.
   cat > "$HATS_DIR/config.toml" <<'EOF'
@@ -446,6 +515,10 @@ test_completion_scripts
 test_doctor_flags_suspicious_symlink
 test_no_color_flag
 test_link_unlink_resource_validation
+test_install_help_exits_zero
+test_install_rejects_unknown_flag
+test_install_rejects_too_many_args
+test_install_to_sandbox_stamps_commit
 test_config_migration_is_idempotent
 
 say "summary: $pass pass, $fail fail"
