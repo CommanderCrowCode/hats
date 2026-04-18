@@ -6,16 +6,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HATS="$SCRIPT_DIR/hats"
 
+# POSIX-portable VERSION extraction: avoid grep -P (BSD grep has no -P) by
+# using sed with a capture group, same style as the rest of the repo's
+# GNU/BSD portability commits (cd60c46, ea71c83, ea331a2).
+_read_version() { sed -n 's/^VERSION="\([^"]*\)"$/\1/p' "$HATS"; }
+
 part="${1:-}"
 if [ -z "$part" ]; then
-  current=$(grep -oP '^VERSION="\K[^"]+' "$HATS")
+  current=$(_read_version)
   echo "Usage: ./bump <major|minor|patch>" >&2
   echo "" >&2
   echo "Current version: $current" >&2
   exit 1
 fi
 
-current=$(grep -oP '^VERSION="\K[^"]+' "$HATS")
+current=$(_read_version)
 IFS='.' read -r major minor patch <<< "$current"
 
 case "$part" in
@@ -29,5 +34,8 @@ case "$part" in
 esac
 
 new_version="${major}.${minor}.${patch}"
-sed -i "s/^VERSION=\"$current\"/VERSION=\"$new_version\"/" "$HATS"
+# BSD sed needs an explicit extension for -i; GNU accepts it too. Matches
+# install.sh's atomic-install pattern.
+sed -i.bak "s/^VERSION=\"$current\"/VERSION=\"$new_version\"/" "$HATS"
+rm -f "$HATS.bak"
 echo "$current -> $new_version"
