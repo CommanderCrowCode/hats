@@ -1179,6 +1179,11 @@ cmd_status() {
     fi
   done
   [ "$linked_any" = false ] && echo "    (none)"
+  # Explicit rc=0: when linked_any=true the previous `[ false ] && echo` short-
+  # circuits to rc=1, which would leak out as the function's return code under
+  # `set -e` callers. Normal `hats status` on a typical account always has
+  # linked resources, so without this the happy path returned rc=1.
+  return 0
 }
 
 cmd_shell_init() {

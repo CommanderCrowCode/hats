@@ -467,6 +467,33 @@ test_install_to_sandbox_stamps_commit() {
   fi
 }
 
+test_init_idempotent_and_status_iterator() {
+  # (a) `hats init` on an already-initialized tree must be a no-op success
+  #     (prints "already initialized" + exits 0). Regression fence against
+  #     a future init rewrite that accidentally wipes existing accounts.
+  # (b) `hats status` with no argument iterates all accounts. At this point
+  #     only `foo` is left on the claude side after CRUD tests cleaned up.
+  local out_reinit rc_reinit=0
+  out_reinit=$("$HATS_SCRIPT" init 2>&1) || rc_reinit=$?
+  local reinit_ok=0
+  [ "$rc_reinit" -eq 0 ] && echo "$out_reinit" | grep -q "already initialized" \
+    && [ -d "$HATS_DIR/claude/foo" ] && reinit_ok=1
+
+  local out_status rc_status=0
+  out_status=$("$HATS_SCRIPT" status 2>&1) || rc_status=$?
+  local status_iter_ok=0
+  [ "$rc_status" -eq 0 ] \
+    && echo "$out_status" | grep -q "Provider: claude" \
+    && echo "$out_status" | grep -q "Account: foo" \
+    && status_iter_ok=1
+
+  if [ "$reinit_ok" -eq 1 ] && [ "$status_iter_ok" -eq 1 ]; then
+    ok "init is idempotent on already-initialized tree; status iterates all accounts"
+  else
+    die "init/status-iter broken (reinit=$reinit_ok status_iter=$status_iter_ok)"
+  fi
+}
+
 test_rejection_paths_exit_nonzero() {
   # Three small rejection paths that must remain non-zero — regression against
   # any future refactor that prints "Error:" but forgets to `die` / exit 1.
@@ -928,6 +955,7 @@ test_link_unlink_resource_validation
 test_account_crud_roundtrip
 test_codex_provider_routing
 test_codex_completion_emits_script
+test_init_idempotent_and_status_iterator
 test_rejection_paths_exit_nonzero
 test_doctor_flags_missing_auth_and_broken_symlink
 test_swap_error_paths
