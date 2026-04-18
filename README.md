@@ -231,8 +231,12 @@ hats fix               # Repair broken symlinks, verify auth, dedupe base/settin
 hats doctor            # Read-only health check (tooling, layout, symlinks, permissions)
 hats completion bash   # Emit bash completion script; eval "$(...)" in .bashrc
 hats completion zsh    # Emit zsh completion script; eval "$(...)" in .zshrc
+hats providers         # List supported providers and show the default
 hats version           # Show version
 ```
+
+Global flag: `--no-color` (or `NO_COLOR` / `HATS_NO_COLOR` env var) disables
+ANSI color output for any `hats` invocation.
 
 **`hats doctor`** is a read-only companion to `hats fix` — it verifies layout
 integrity without changing anything, then exits non-zero on hard issues. See
