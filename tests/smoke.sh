@@ -255,6 +255,64 @@ EOF
   fi
 }
 
+test_fix_dedupes_duplicate_hooks() {
+  local base="$HATS_DIR/claude/base"
+  local cfg="$base/settings.json"
+  mkdir -p "$base"
+
+  # Seed the same matcher 3x under PostToolUse and 2x under Stop (no matcher),
+  # plus one unique entry that must survive verbatim.
+  cat > "$cfg" <<'EOF'
+{
+  "hooks": {
+    "PostToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/bin/sh"}]},
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/bin/sh"}]},
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/bin/sh"}]},
+      {"matcher": "Edit", "hooks": [{"type": "command", "command": "/bin/true"}]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "/bin/stop"}]},
+      {"hooks": [{"type": "command", "command": "/bin/stop"}]}
+    ]
+  }
+}
+EOF
+
+  local out_fix
+  out_fix=$("$HATS_SCRIPT" fix 2>/dev/null || true)
+
+  local out_doctor
+  out_doctor=$("$HATS_SCRIPT" doctor 2>/dev/null || true)
+
+  # Content checks: fix must report removal counts; doctor must now be clean;
+  # the unique Edit entry and exactly one Bash entry must remain.
+  local rc_fix_bash=1 rc_fix_stop=1 rc_doctor=1 rc_kept_edit=1 rc_bash_count=1
+  echo "$out_fix"    | grep -q "deduped base/settings.json hooks: event=PostToolUse matcher=Bash removed=2" && rc_fix_bash=0
+  echo "$out_fix"    | grep -q "deduped base/settings.json hooks: event=Stop matcher=(no-matcher) removed=1" && rc_fix_stop=0
+  echo "$out_doctor" | grep -q "no duplicate hook registrations" && rc_doctor=0
+
+  if command -v python3 >/dev/null 2>&1; then
+    local bash_count edit_count
+    bash_count=$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(sum(1 for i in d["hooks"]["PostToolUse"] if i.get("matcher")=="Bash"))' "$cfg")
+    edit_count=$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(sum(1 for i in d["hooks"]["PostToolUse"] if i.get("matcher")=="Edit"))' "$cfg")
+    [ "$bash_count" = "1" ] && rc_bash_count=0
+    [ "$edit_count" = "1" ] && rc_kept_edit=0
+  else
+    rc_bash_count=0
+    rc_kept_edit=0
+  fi
+
+  echo '{}' > "$cfg"
+
+  if [ "$rc_fix_bash" -eq 0 ] && [ "$rc_fix_stop" -eq 0 ] \
+     && [ "$rc_doctor" -eq 0 ] && [ "$rc_bash_count" -eq 0 ] && [ "$rc_kept_edit" -eq 0 ]; then
+    ok "fix dedupes duplicate hook registrations in base/settings.json"
+  else
+    die "fix dedupe broken (fix_bash=$rc_fix_bash fix_stop=$rc_fix_stop doctor=$rc_doctor bash_count=$rc_bash_count kept_edit=$rc_kept_edit)"
+  fi
+}
+
 test_completion_scripts() {
   local bash_out zsh_out
   bash_out=$("$HATS_SCRIPT" completion bash)
@@ -383,6 +441,7 @@ test_doctor_runs_after_fixture
 test_doctor_catches_invalid_json
 test_doctor_catches_missing_hook_command
 test_doctor_catches_duplicate_hooks
+test_fix_dedupes_duplicate_hooks
 test_completion_scripts
 test_doctor_flags_suspicious_symlink
 test_no_color_flag

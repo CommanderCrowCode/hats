@@ -336,6 +336,92 @@ _ensure_account_defaults() {
   esac
 }
 
+_dedupe_claude_hook_registrations() {
+  # Rewrite base/settings.json with duplicate hook entries collapsed to one
+  # per (event, matcher, command-set) fingerprint. First occurrence wins;
+  # remaining order is preserved. Silent no-op when absent / unreadable /
+  # already deduped. Emits one tab-separated line per event+matcher that had
+  # removals so the caller can report.
+  [ "$CURRENT_PROVIDER" = "claude" ] || return 0
+  [ -f "$BASE_DIR/settings.json" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  python3 - "$BASE_DIR/settings.json" <<'PY' 2>/dev/null || true
+import json, os, sys, tempfile
+from collections import Counter
+
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        d = json.load(f)
+except Exception:
+    sys.exit(0)
+
+hooks = d.get("hooks") or {}
+if not isinstance(hooks, dict):
+    sys.exit(0)
+
+any_change = False
+report_lines = []
+for event_name, event_items in hooks.items():
+    if not isinstance(event_items, list):
+        continue
+    fps = []
+    for item in event_items:
+        if not isinstance(item, dict):
+            fps.append(None)
+            continue
+        matcher = item.get("matcher", "") or ""
+        cmds = tuple(sorted(
+            (h.get("command") or "") for h in (item.get("hooks") or [])
+            if isinstance(h, dict)
+        ))
+        fps.append((matcher, cmds))
+    counts = Counter(fp for fp in fps if fp is not None)
+    if not any(n > 1 for n in counts.values()):
+        continue
+    seen = set()
+    unique = []
+    for item, fp in zip(event_items, fps):
+        if fp is None:
+            unique.append(item)
+            continue
+        if fp in seen:
+            continue
+        seen.add(fp)
+        unique.append(item)
+    hooks[event_name] = unique
+    any_change = True
+    for (matcher, _cmds), n in sorted(counts.items()):
+        if n <= 1:
+            continue
+        disp = matcher if matcher else "(no-matcher)"
+        report_lines.append(f"{event_name}\t{disp}\t{n - 1}")
+
+if any_change:
+    dirn = os.path.dirname(path) or "."
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", delete=False, dir=dirn, prefix=".settings.", suffix=".tmp"
+    )
+    try:
+        json.dump(d, tmp, indent=2)
+        tmp.write("\n")
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp.close()
+        os.replace(tmp.name, path)
+    except Exception:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+        sys.exit(0)
+
+for line in report_lines:
+    print(line)
+PY
+}
+
 _provider_login_hint() {
   local auth_mode="${1:-}"
   case "$CURRENT_PROVIDER" in
@@ -1144,6 +1230,17 @@ cmd_fix() {
   local issues=0
   _ensure_provider_defaults
 
+  if [ "$CURRENT_PROVIDER" = "claude" ]; then
+    local dedupe_report
+    dedupe_report=$(_dedupe_claude_hook_registrations)
+    if [ -n "$dedupe_report" ]; then
+      while IFS=$'\t' read -r _ev _m _n; do
+        [ -n "$_ev" ] || continue
+        echo "  deduped base/settings.json hooks: event=$_ev matcher=$_m removed=$_n"
+      done <<< "$dedupe_report"
+    fi
+  fi
+
   for name in $(_accounts); do
     local acct_dir
     acct_dir=$(_account_dir "$name")
@@ -1352,7 +1449,7 @@ for event_name, event_items in (d.get("hooks") or {}).items():
     if [ -n "$dup_out" ]; then
       while IFS=$'\t' read -r event_name matcher count; do
         [ -n "$event_name" ] || continue
-        echo "  WARN duplicate hook registration: event=$event_name matcher=$matcher count=$count"
+        echo "  WARN duplicate hook registration: event=$event_name matcher=$matcher count=$count (run '$(_hats_cmd_prefix) fix' to dedupe)"
         warnings=$((warnings + 1))
       done <<< "$dup_out"
     else
