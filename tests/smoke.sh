@@ -467,6 +467,81 @@ test_install_to_sandbox_stamps_commit() {
   fi
 }
 
+test_link_unlink_happy_path() {
+  # Happy path for cmd_link / cmd_unlink — complementary to
+  # test_link_unlink_resource_validation which only covers the rejection paths.
+  # - link creates a symlink `<acct>/<res> -> ../base/<res>`
+  # - unlink removes the symlink and copies the base content into the account
+  #   dir so the account owns an isolated copy
+  local base="$HATS_DIR/claude/base"
+  local acct="$HATS_DIR/claude/foo"
+  local resource="scratchpad"
+  local base_file="$base/$resource"
+  local acct_file="$acct/$resource"
+
+  # Seed base with a content file that's not already hard-linked into foo.
+  echo "hello from base" > "$base_file"
+
+  # link: symlink points to ../base/<resource>
+  local rc_link=0
+  "$HATS_SCRIPT" link foo "$resource" >/dev/null 2>&1 || rc_link=$?
+  local is_symlink=0 target_ok=0
+  if [ -L "$acct_file" ]; then
+    is_symlink=1
+    [ "$(readlink "$acct_file")" = "../base/$resource" ] && target_ok=1
+  fi
+
+  # link again must fail — "already linked"
+  local rc_relink=0
+  "$HATS_SCRIPT" link foo "$resource" >/dev/null 2>&1 || rc_relink=$?
+
+  # unlink: replaces the symlink with a copy of base content
+  local rc_unlink=0
+  "$HATS_SCRIPT" unlink foo "$resource" >/dev/null 2>&1 || rc_unlink=$?
+  local is_file=0 content_ok=0
+  if [ -f "$acct_file" ] && [ ! -L "$acct_file" ]; then
+    is_file=1
+    [ "$(cat "$acct_file")" = "hello from base" ] && content_ok=1
+  fi
+
+  # unlink again must fail — "already isolated"
+  local rc_reunlink=0
+  "$HATS_SCRIPT" unlink foo "$resource" >/dev/null 2>&1 || rc_reunlink=$?
+
+  # Cleanup leaves base seeded for downstream tests — remove the fixture we added.
+  rm -f "$base_file" "$acct_file"
+
+  if [ "$rc_link" -eq 0 ] && [ "$is_symlink" -eq 1 ] && [ "$target_ok" -eq 1 ] \
+     && [ "$rc_relink" -ne 0 ] && [ "$rc_unlink" -eq 0 ] && [ "$is_file" -eq 1 ] \
+     && [ "$content_ok" -eq 1 ] && [ "$rc_reunlink" -ne 0 ]; then
+    ok "link/unlink happy path — symlink created, content materialized on unlink, re-ops reject"
+  else
+    die "link/unlink broken (rc_link=$rc_link sym=$is_symlink tgt=$target_ok rc_relink=$rc_relink rc_unlink=$rc_unlink file=$is_file content=$content_ok rc_reunlink=$rc_reunlink)"
+  fi
+}
+
+test_providers_and_default_getter() {
+  # `hats providers` lists the supported providers and marks the current
+  # default. `hats default` with no arg prints the current default. Both are
+  # small surface commands with zero prior coverage.
+  local prov_out def_out
+  prov_out=$("$HATS_SCRIPT" providers 2>&1)
+  def_out=$("$HATS_SCRIPT" default 2>&1)
+
+  local prov_ok=0 def_ok=0
+  echo "$prov_out" | grep -q "claude" \
+    && echo "$prov_out" | grep -q "codex" \
+    && echo "$prov_out" | grep -q "Default provider:" \
+    && prov_ok=1
+  echo "$def_out" | grep -q "Default account: foo" && def_ok=1
+
+  if [ "$prov_ok" -eq 1 ] && [ "$def_ok" -eq 1 ]; then
+    ok "providers + default-getter surfaces print expected content"
+  else
+    die "providers/default getter broken (providers=$prov_ok default=$def_ok)"
+  fi
+}
+
 test_shell_init_emits_functions_per_account() {
   # `hats shell-init` is the primary user integration — emits shell functions
   # so typing the account name runs the provider with that account's config
@@ -736,6 +811,8 @@ test_link_unlink_resource_validation
 test_account_crud_roundtrip
 test_codex_provider_routing
 test_codex_completion_emits_script
+test_link_unlink_happy_path
+test_providers_and_default_getter
 test_shell_init_emits_functions_per_account
 test_install_help_exits_zero
 test_install_rejects_unknown_flag
