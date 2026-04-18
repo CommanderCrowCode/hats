@@ -467,6 +467,32 @@ test_install_to_sandbox_stamps_commit() {
   fi
 }
 
+test_codex_doctor_runs_clean_on_fresh_init() {
+  # `hats codex doctor` was never exercised — all doctor tests before this
+  # hit the claude path. Verifies the provider-aware doctor runs to the
+  # "Done. N issue(s), M warning(s)." summary line, skips claude-only
+  # sections (hooks.json / settings.json), and emits a codex tooling row.
+  # On CI (ubuntu-latest) `codex` is typically not installed, so the
+  # tooling check accepts either OK or FAIL form — the regression guard
+  # is "doctor reached the tooling section for codex" rather than the
+  # value. Similarly accept any rc since missing binary yields rc=1.
+  local out rc=0
+  out=$("$HATS_SCRIPT" codex doctor 2>&1) || rc=$?
+
+  local header_ok=0 summary_ok=0 tooling_ok=0
+  echo "$out" | grep -q "Running hats doctor for codex"            && header_ok=1
+  echo "$out" | grep -qE "^Done\. [0-9]+ issue\(s\), [0-9]+ warning\(s\)\.$" && summary_ok=1
+  # Tooling row mentions codex in either pass (OK codex found) or fail
+  # (FAIL codex not on PATH) form.
+  echo "$out" | grep -qE "(OK   codex found|FAIL codex not on PATH)" && tooling_ok=1
+
+  if [ "$header_ok" -eq 1 ] && [ "$summary_ok" -eq 1 ] && [ "$tooling_ok" -eq 1 ]; then
+    ok "hats codex doctor runs + emits codex tooling + summary (rc=$rc, codex optional)"
+  else
+    die "codex doctor broken (header=$header_ok summary=$summary_ok tooling=$tooling_ok rc=$rc)"
+  fi
+}
+
 test_init_idempotent_and_status_iterator() {
   # (a) `hats init` on an already-initialized tree must be a no-op success
   #     (prints "already initialized" + exits 0). Regression fence against
@@ -955,6 +981,7 @@ test_link_unlink_resource_validation
 test_account_crud_roundtrip
 test_codex_provider_routing
 test_codex_completion_emits_script
+test_codex_doctor_runs_clean_on_fresh_init
 test_init_idempotent_and_status_iterator
 test_rejection_paths_exit_nonzero
 test_doctor_flags_missing_auth_and_broken_symlink
