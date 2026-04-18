@@ -467,6 +467,45 @@ test_install_to_sandbox_stamps_commit() {
   fi
 }
 
+test_show_account_status_parses_without_grep_P() {
+  # Regression test for the BSD-portability rewrite of _show_account_status:
+  # the original used `grep -oP 'key=\K...'` (GNU-only) to parse
+  # key=value pairs out of _token_info. We rewrote parsing to a bash
+  # while/read loop with parameter expansion. The guard here is the
+  # _output_ shape of `hats list`, which only materializes correctly when
+  # the parser actually extracted the fields.
+  local acct="$HATS_DIR/claude/parsed"
+  mkdir -p "$acct"
+  # Stage a credentials file with a future expiry + remote_control scope.
+  # python3's json.load will read this and _token_info_claude will emit
+  # expires=... refresh=True remote_control=True expired=False.
+  local future_ms=$((($(date +%s) + 3600) * 1000))
+  cat > "$acct/.credentials.json" <<EOF
+{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":$future_ms,"scopes":["user:sessions:claude_code"]}}
+EOF
+  chmod 600 "$acct/.credentials.json"
+
+  local out
+  out=$("$HATS_SCRIPT" list 2>&1)
+
+  # Locate the line for the `parsed` account. Must carry `ok (expires ...)`
+  # and `[rc]` — these only print when expired/has_refresh/has_rc/exp_date
+  # were all successfully parsed.
+  local line_ok=0 rc_tag_ok=0
+  echo "$out" | grep -q "parsed" && \
+    echo "$out" | grep -qE "parsed.*ok \(expires [0-9]{4}-[0-9]{2}-[0-9]{2}\)" && \
+    line_ok=1
+  echo "$out" | grep -q "parsed.*\[rc\]" && rc_tag_ok=1
+
+  rm -rf "$acct"
+
+  if [ "$line_ok" -eq 1 ] && [ "$rc_tag_ok" -eq 1 ]; then
+    ok "_show_account_status parses key=value output portably (no grep -oP)"
+  else
+    die "token-info parser broken (line=$line_ok rc_tag=$rc_tag_ok out=$(echo "$out" | grep parsed | head -1))"
+  fi
+}
+
 test_codex_doctor_runs_clean_on_fresh_init() {
   # `hats codex doctor` was never exercised — all doctor tests before this
   # hit the claude path. Verifies the provider-aware doctor runs to the
@@ -981,6 +1020,7 @@ test_link_unlink_resource_validation
 test_account_crud_roundtrip
 test_codex_provider_routing
 test_codex_completion_emits_script
+test_show_account_status_parses_without_grep_P
 test_codex_doctor_runs_clean_on_fresh_init
 test_init_idempotent_and_status_iterator
 test_rejection_paths_exit_nonzero

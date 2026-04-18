@@ -604,19 +604,32 @@ _show_account_status() {
   local info
   info=$(_token_info "$cfile")
 
-  if echo "$info" | grep -q "^error="; then
-    echo "ERROR: $(echo "$info" | grep -oP 'error=\K.*')"
+  # Parse the key=value lines from _token_info using bash built-ins — BSD
+  # grep has no -P / \K so the prior `grep -oP 'key=\K...'` pattern only
+  # worked on GNU grep. Reading into variables via a while-read loop keeps
+  # parsing portable while preserving existing semantics (exp_date keeps the
+  # date portion only, matching the old `[^ ]+` boundary).
+  local expired="" has_refresh="" has_rc="" exp_date="" store="" account_id="" error=""
+  local _key _val
+  while IFS='=' read -r _key _val; do
+    case "$_key" in
+      error)           error="$_val" ;;
+      expired)         expired="$_val" ;;
+      refresh)         has_refresh="$_val" ;;
+      remote_control)  has_rc="$_val" ;;
+      expires)         exp_date="${_val%% *}" ;;
+      store)           store="$_val" ;;
+      account_id)      account_id="$_val" ;;
+    esac
+  done <<< "$info"
+
+  if [ -n "$error" ]; then
+    echo "ERROR: $error"
     return
   fi
 
   case "$CURRENT_PROVIDER" in
     claude)
-      local expired has_refresh has_rc exp_date
-      expired=$(echo "$info" | grep -oP 'expired=\K\w+')
-      has_refresh=$(echo "$info" | grep -oP 'refresh=\K\w+')
-      has_rc=$(echo "$info" | grep -oP 'remote_control=\K\w+')
-      exp_date=$(echo "$info" | grep -oP 'expires=\K[^ ]+')
-
       local status=""
       if [ "$expired" = "True" ]; then
         if [ "$has_refresh" = "True" ]; then
@@ -632,9 +645,6 @@ _show_account_status() {
       echo "$status"
       ;;
     codex)
-      local store account_id
-      store=$(echo "$info" | grep -oP 'store=\K.*')
-      account_id=$(echo "$info" | grep -oP 'account_id=\K.*')
       if [ "$store" = "file" ]; then
         echo "ok (auth.json present; store=file; account $account_id)"
       else
