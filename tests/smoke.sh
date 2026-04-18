@@ -467,6 +467,26 @@ test_install_to_sandbox_stamps_commit() {
   fi
 }
 
+test_rejection_paths_exit_nonzero() {
+  # Three small rejection paths that must remain non-zero — regression against
+  # any future refactor that prints "Error:" but forgets to `die` / exit 1.
+  #
+  # (a) `hats add <name> --api-key` on the claude provider — the flag is
+  #     codex-only and cmd_add dies explicitly.
+  # (b) `hats default <missing>` — account not found.
+  # (c) `hats status <missing>` — account not found.
+  local rc_a=0 rc_b=0 rc_c=0
+  "$HATS_SCRIPT" add probe --api-key        >/dev/null 2>&1 || rc_a=$?
+  "$HATS_SCRIPT" default nosuchaccount      >/dev/null 2>&1 || rc_b=$?
+  "$HATS_SCRIPT" status  nosuchaccount      >/dev/null 2>&1 || rc_c=$?
+
+  if [ "$rc_a" -ne 0 ] && [ "$rc_b" -ne 0 ] && [ "$rc_c" -ne 0 ]; then
+    ok "add/default/status reject invalid input with non-zero rc"
+  else
+    die "rejection paths leak rc=0 (add=$rc_a default=$rc_b status=$rc_c)"
+  fi
+}
+
 test_doctor_flags_missing_auth_and_broken_symlink() {
   # Covers doctor §4a (missing $PRIMARY_AUTH_FILE) and §4b (broken symlink
   # under the account dir). Previously only the base-level doctor checks
@@ -908,6 +928,7 @@ test_link_unlink_resource_validation
 test_account_crud_roundtrip
 test_codex_provider_routing
 test_codex_completion_emits_script
+test_rejection_paths_exit_nonzero
 test_doctor_flags_missing_auth_and_broken_symlink
 test_swap_error_paths
 test_command_aliases
