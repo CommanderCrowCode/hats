@@ -308,7 +308,7 @@ Claude Code's [Remote Control](https://docs.anthropic.com/en/docs/claude-code/re
 
 ```
 $ hats list
-hats v1.0.0 — Claude Code Accounts
+hats v1.1.0 — Claude Code Accounts
 =======================================
 
   * work         ok (expires 2026-03-07 14:30) [rc]
