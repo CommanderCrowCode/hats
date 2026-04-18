@@ -467,6 +467,64 @@ test_install_to_sandbox_stamps_commit() {
   fi
 }
 
+test_account_crud_roundtrip() {
+  # Walks through list → rename → status → remove using a second fixture
+  # account (alongside the `foo` already staged by test_fixture_account_and_default).
+  # No tests currently exercise cmd_remove / cmd_rename / cmd_status, so this is
+  # the first coverage for the account-lifecycle CRUD surface.
+  local acct="$HATS_DIR/claude/bar"
+  mkdir -p "$acct"
+  : > "$acct/.credentials.json"
+  chmod 600 "$acct/.credentials.json"
+  echo '{}' > "$acct/.claude.json"
+
+  local list_out; list_out=$("$HATS_SCRIPT" list 2>&1)
+  local list_ok=0
+  echo "$list_out" | grep -q "foo" && echo "$list_out" | grep -q "bar" \
+    && echo "$list_out" | grep -q "2 account" && list_ok=1
+
+  # rename bar → baz
+  local rename_out rc_rename=0
+  rename_out=$("$HATS_SCRIPT" rename bar baz 2>&1) || rc_rename=$?
+  local rename_ok=0
+  [ "$rc_rename" -eq 0 ] && [ -d "$HATS_DIR/claude/baz" ] && [ ! -d "$HATS_DIR/claude/bar" ] \
+    && echo "$rename_out" | grep -q "renamed to 'baz'" && rename_ok=1
+
+  # status baz must print Provider/Account/Directory headers
+  local status_out; status_out=$("$HATS_SCRIPT" status baz 2>&1)
+  local status_ok=0
+  echo "$status_out" | grep -q "Provider: claude" \
+    && echo "$status_out" | grep -q "Account: baz" \
+    && echo "$status_out" | grep -q "Directory: .*claude/baz" \
+    && status_ok=1
+
+  # rename validates: rejects unknown source, rejects existing target
+  local rc_unknown=0 rc_collision=0
+  "$HATS_SCRIPT" rename nope also-nope >/dev/null 2>&1 || rc_unknown=$?
+  "$HATS_SCRIPT" rename baz foo       >/dev/null 2>&1 || rc_collision=$?
+  local rename_validate_ok=0
+  [ "$rc_unknown" -ne 0 ] && [ "$rc_collision" -ne 0 ] && rename_validate_ok=1
+
+  # remove baz
+  local rc_remove=0
+  "$HATS_SCRIPT" remove baz >/dev/null 2>&1 || rc_remove=$?
+  local remove_ok=0
+  [ "$rc_remove" -eq 0 ] && [ ! -d "$HATS_DIR/claude/baz" ] && remove_ok=1
+
+  # remove on nonexistent must fail
+  local rc_remove_missing=0
+  "$HATS_SCRIPT" remove baz >/dev/null 2>&1 || rc_remove_missing=$?
+  local remove_missing_ok=0
+  [ "$rc_remove_missing" -ne 0 ] && remove_missing_ok=1
+
+  if [ "$list_ok" -eq 1 ] && [ "$rename_ok" -eq 1 ] && [ "$status_ok" -eq 1 ] \
+     && [ "$rename_validate_ok" -eq 1 ] && [ "$remove_ok" -eq 1 ] && [ "$remove_missing_ok" -eq 1 ]; then
+    ok "account CRUD roundtrip (list/rename/status/remove) enforces validation"
+  else
+    die "CRUD roundtrip broken (list=$list_ok rename=$rename_ok status=$status_ok validate=$rename_validate_ok remove=$remove_ok remove_missing=$remove_missing_ok)"
+  fi
+}
+
 test_codex_provider_routing() {
   # `hats codex <cmd>` dispatches to the codex provider: a separate ~/.hats/codex
   # tree, a "Codex Accounts" list header, and completion that still works.
@@ -627,6 +685,7 @@ test_completion_scripts
 test_doctor_flags_suspicious_symlink
 test_no_color_flag
 test_link_unlink_resource_validation
+test_account_crud_roundtrip
 test_codex_provider_routing
 test_codex_completion_emits_script
 test_install_help_exits_zero
