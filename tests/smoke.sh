@@ -467,6 +467,57 @@ test_install_to_sandbox_stamps_commit() {
   fi
 }
 
+test_codex_provider_routing() {
+  # `hats codex <cmd>` dispatches to the codex provider: a separate ~/.hats/codex
+  # tree, a "Codex Accounts" list header, and completion that still works.
+  # None of these require the `codex` binary to be installed.
+  local rc_init=0 rc_list=0
+  local list_out=""
+  local have_codex_base=0 have_claude_untouched=1
+
+  "$HATS_SCRIPT" codex init >/dev/null 2>&1 || rc_init=$?
+  [ -d "$HATS_DIR/codex/base" ] && have_codex_base=1
+  # Initializing codex must not disturb the existing claude tree — accounts
+  # from earlier tests (foo fixture) must still be there.
+  [ -d "$HATS_DIR/claude/foo" ] || have_claude_untouched=0
+
+  list_out=$("$HATS_SCRIPT" codex list 2>&1) || rc_list=$?
+
+  local header_ok=0 no_accts_ok=0
+  echo "$list_out" | grep -q "hats v.* — Codex Accounts" && header_ok=1
+  echo "$list_out" | grep -q "No accounts found" && no_accts_ok=1
+
+  if [ "$rc_init" -eq 0 ] && [ "$have_codex_base" -eq 1 ] && [ "$have_claude_untouched" -eq 1 ] \
+     && [ "$rc_list" -eq 0 ] && [ "$header_ok" -eq 1 ] && [ "$no_accts_ok" -eq 1 ]; then
+    ok "hats codex init + list route to codex/ tree without disturbing claude/"
+  else
+    die "codex provider routing broken (rc_init=$rc_init codex_base=$have_codex_base claude_ok=$have_claude_untouched rc_list=$rc_list header=$header_ok no_accts=$no_accts_ok)"
+  fi
+}
+
+test_codex_completion_emits_script() {
+  # `hats codex completion bash|zsh` must emit the same provider-agnostic
+  # completion script (which internally supports both `hats <cmd>` and
+  # `hats codex <cmd>` via providers-list parsing).
+  local bash_out zsh_out
+  bash_out=$("$HATS_SCRIPT" codex completion bash 2>/dev/null)
+  zsh_out=$("$HATS_SCRIPT" codex completion zsh 2>/dev/null)
+
+  local bash_ok=0 zsh_ok=0
+  echo "$bash_out" | grep -q "^_hats_completion()" \
+    && echo "$bash_out" | grep -q 'providers=.*codex' \
+    && bash_ok=1
+  echo "$zsh_out"  | grep -q "^_hats()" \
+    && echo "$zsh_out"  | grep -q 'providers=.*codex' \
+    && zsh_ok=1
+
+  if [ "$bash_ok" -eq 1 ] && [ "$zsh_ok" -eq 1 ]; then
+    ok "hats codex completion emits bash+zsh scripts covering both providers"
+  else
+    die "codex completion broken (bash=$bash_ok zsh=$zsh_ok)"
+  fi
+}
+
 test_install_check_gates_on_smoke() {
   # `install.sh --check <dir>` must: (1) run the smoke suite, (2) install only
   # on pass, (3) abort with exit 1 on fail. We verify both branches hermetically
@@ -576,6 +627,8 @@ test_completion_scripts
 test_doctor_flags_suspicious_symlink
 test_no_color_flag
 test_link_unlink_resource_validation
+test_codex_provider_routing
+test_codex_completion_emits_script
 test_install_help_exits_zero
 test_install_rejects_unknown_flag
 test_install_rejects_too_many_args
