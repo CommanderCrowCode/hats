@@ -1960,6 +1960,18 @@ _hats_completion() {
       fi
       COMPREPLY=( $(compgen -W "$accts" -- "$cur") )
       ;;
+    list|ls)
+      # `--provider <name>` takes an arg — offer the provider list when that
+      # was the previous word. Otherwise offer the flag set itself.
+      if [ "$prev" = "--provider" ]; then
+        COMPREPLY=( $(compgen -W "$providers" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -W "--rc-only --expired --provider --help" -- "$cur") )
+      fi
+      ;;
+    doctor)
+      COMPREPLY=( $(compgen -W "--metrics --help" -- "$cur") )
+      ;;
     completion)
       COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") )
       ;;
@@ -2046,6 +2058,31 @@ _hats_complete_arg() {
         accts+=("$n")
       done
       _describe 'account' accts
+      ;;
+    list|ls)
+      # `--provider <name>` takes an arg; offer provider names when that flag
+      # was the previous word, otherwise offer the flag set itself.
+      if [[ "$words[CURRENT-1]" == "--provider" ]]; then
+        local -a provs; provs=(claude codex)
+        _describe 'provider' provs
+      else
+        local -a list_flags
+        list_flags=(
+          '--rc-only:Filter to remote-control-scoped tokens'
+          '--expired:Filter to past-expiry tokens'
+          '--provider:Override the provider (claude|codex)'
+          '--help:Show list-flag reference'
+        )
+        _describe 'list flag' list_flags
+      fi
+      ;;
+    doctor)
+      local -a doctor_flags
+      doctor_flags=(
+        '--metrics:Add per-account token-freshness section'
+        '--help:Show doctor-flag reference'
+      )
+      _describe 'doctor flag' doctor_flags
       ;;
     completion)
       local -a shells; shells=(bash zsh)

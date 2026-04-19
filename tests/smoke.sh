@@ -333,10 +333,21 @@ test_completion_scripts() {
   echo "$zsh_out" | grep -q "'doctor:Read-only health check'" \
     || { die "zsh completion missing subcommand descriptions"; return; }
 
+  # Newly-shipped flags (roadmap #5 list filters + #8 doctor metrics) must
+  # surface in BOTH bash and zsh completion scripts so tab completion stays
+  # in sync with the CLI. Plain string presence is enough — execution-side
+  # behavior is exercised by completion's own state-machine, not unit-tested.
+  for flag in --rc-only --expired --metrics; do
+    echo "$bash_out" | grep -q -- "$flag" \
+      || { die "bash completion missing $flag flag"; return; }
+    echo "$zsh_out" | grep -q -- "$flag" \
+      || { die "zsh completion missing $flag flag"; return; }
+  done
+
   # Sourcing + live simulation needs a recent bash + bash-completion; skip if
   # either is missing (macOS GH runner ships bash 3.2 at /bin/bash with no
   # bash-completion). The static-content checks above are what matter.
-  ok "completion scripts emit expected content for bash + zsh"
+  ok "completion scripts emit expected content for bash + zsh (incl. --rc-only/--expired/--metrics)"
 }
 
 test_doctor_flags_suspicious_symlink() {
