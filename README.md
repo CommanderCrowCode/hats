@@ -335,6 +335,19 @@ hats v1.1.0 — Claude Code Accounts
 - `[rc]` = Remote Control supported
 - Access tokens expire every ~8 hours but auto-refresh via the refresh token
 
+### Filters
+
+`hats list` accepts filter flags to narrow the view on larger fleets:
+
+```
+$ hats list --rc-only              # only RC-scoped tokens
+$ hats list --expired              # only past-expiry tokens (pair with --rc-only if needed)
+$ hats list --provider codex       # reroute the listing to the codex tree
+$ hats list --rc-only --expired    # AND — RC-scoped AND expired
+```
+
+When any filter is active, the summary line reports `X of Y account(s) matched`.
+
 ## Configuration
 
 | Variable | Default | Purpose |

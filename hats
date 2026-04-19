@@ -1090,27 +1090,121 @@ cmd_rename() {
   fi
 }
 
+_list_usage() {
+  cat <<EOF
+Usage: $(_hats_cmd_prefix) list [--rc-only] [--expired] [--provider <claude|codex>]
+
+  --rc-only            Show only accounts whose token carries the Claude Code
+                       remote-control scope. Codex accounts have no RC concept
+                       so they never match.
+  --expired            Show only accounts whose token is past expiry. Codex
+                       accounts (token expiry not surfaced) never match.
+  --provider <name>    Override the provider for this invocation (equivalent to
+                       '$(_hats_cmd_prefix_of "\$name") list').
+EOF
+}
+
+_hats_cmd_prefix_of() {
+  # Like _hats_cmd_prefix but for an explicitly-named provider, used in help
+  # strings where CURRENT_PROVIDER may not be the relevant one yet.
+  case "${1:-claude}" in
+    claude) echo "hats" ;;
+    codex)  echo "hats codex" ;;
+    *)      echo "hats $1" ;;
+  esac
+}
+
+_account_passes_list_filters() {
+  # Returns 0 (pass) if the named account satisfies every active filter,
+  # 1 otherwise. Accounts with no credential file or parse errors fail any
+  # token-predicate filter (they cannot be proved to match), but pass if no
+  # predicate filter is active.
+  local name="$1" want_rc="$2" want_expired="$3"
+  [ "$want_rc" = "0" ] && [ "$want_expired" = "0" ] && return 0
+
+  local cfile
+  cfile=$(_credential_file "$name")
+  [ -f "$cfile" ] || return 1
+
+  local info has_rc="" is_expired=""
+  info=$(_token_info "$cfile" 2>/dev/null)
+  local _key _val
+  while IFS='=' read -r _key _val; do
+    case "$_key" in
+      remote_control) has_rc="$_val" ;;
+      expired)        is_expired="$_val" ;;
+    esac
+  done <<< "$info"
+
+  [ "$want_rc" = "1" ]      && [ "$has_rc" != "True" ]      && return 1
+  [ "$want_expired" = "1" ] && [ "$is_expired" != "True" ]  && return 1
+  return 0
+}
+
 cmd_list() {
+  local want_rc=0 want_expired=0 override_provider=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --rc-only)  want_rc=1 ;;
+      --expired)  want_expired=1 ;;
+      --provider)
+        shift || die "$(_list_usage)"
+        [ $# -gt 0 ] || die "$(_list_usage)"
+        override_provider="$1"
+        ;;
+      --provider=*)
+        override_provider="${1#--provider=}"
+        ;;
+      -h|--help)  _list_usage; return 0 ;;
+      *) die "Unknown list flag '$1'"$'\n'"$(_list_usage)" ;;
+    esac
+    shift || true
+  done
+
+  # --provider rewires the dispatch. Validate first, then call _configure_provider
+  # so downstream helpers resolve against the correct tree.
+  if [ -n "$override_provider" ]; then
+    _is_supported_provider "$override_provider" \
+      || die "Unsupported provider '$override_provider'. Supported: claude, codex"
+    _configure_provider "$override_provider"
+  fi
+
   echo "hats v$VERSION — $PROVIDER_TITLE Accounts"
   echo "======================================="
+
+  # Describe the active filter set so a zero-result output isn't mysterious.
+  local filter_desc=""
+  [ "$want_rc" = "1" ]      && filter_desc="$filter_desc --rc-only"
+  [ "$want_expired" = "1" ] && filter_desc="$filter_desc --expired"
+  [ -n "$filter_desc" ] && echo "Filters:$filter_desc"
+
   echo ""
 
   local default
   default=$(_default_account)
-  local count=0
+  local count=0 matched=0
 
   for name in $(_accounts); do
     count=$((count + 1))
-    _show_account_status "$name" "$default"
+    if _account_passes_list_filters "$name" "$want_rc" "$want_expired"; then
+      matched=$((matched + 1))
+      _show_account_status "$name" "$default"
+    fi
   done
 
   if [ "$count" -eq 0 ]; then
     echo "  No accounts found."
     echo "  Run '$(_hats_cmd_prefix) add <name>' to create one."
+  elif [ "$matched" -eq 0 ]; then
+    echo "  No accounts matched the filters ($count total)."
   fi
 
   echo ""
-  echo "  $count account(s)"
+  if [ -n "$filter_desc" ]; then
+    echo "  $matched of $count account(s) matched"
+  else
+    echo "  $count account(s)"
+  fi
 }
 
 cmd_default() {
@@ -1973,7 +2067,8 @@ Account Management:
   remove <name>        Remove an account
   rename <old> <new>   Rename an account
   default [name]       Get or set the default account
-  list                 Show all accounts and auth status
+  list [flags]         Show all accounts and auth status
+                       Flags: --rc-only --expired --provider <claude|codex>
 
 Session Management:
   swap <name> [args]   Run the provider CLI with the account's isolated home
@@ -2057,7 +2152,7 @@ case "${1:-}" in
   add)              shift; cmd_add "$@" ;;
   remove|rm)        cmd_remove "${2:-}" ;;
   rename|mv)        cmd_rename "${2:-}" "${3:-}" ;;
-  list|ls)          cmd_list ;;
+  list|ls)          shift; cmd_list "$@" ;;
   swap)             shift; cmd_swap "$@" ;;
   default)          cmd_default "${2:-}" ;;
   link)             cmd_link "${2:-}" "${3:-}" ;;

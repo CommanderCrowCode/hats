@@ -1072,6 +1072,116 @@ EOF
   fi
 }
 
+test_list_filter_flags() {
+  # `hats list` now accepts --rc-only / --expired / --provider to slice the
+  # account view (roadmap #5). Verify each flag:
+  #   (a) --help documents all three flag names;
+  #   (b) --rc-only matches an RC-scoped, non-expired token;
+  #   (c) --expired matches an expired token and rejects a non-expired one;
+  #   (d) combined --rc-only --expired respects both predicates (AND);
+  #   (e) --bogus rejects with "Unknown list flag" + non-zero rc;
+  #   (f) --provider codex reroutes the listing to the codex tree.
+  # Stage two well-formed claude credential files so token-info parses
+  # successfully — the bare fixture account has an empty creds file that
+  # errors-out the parser, which would make every predicate filter-miss.
+
+  local future_ms past_ms
+  future_ms=$(python3 -c 'import time; print(int((time.time()+86400)*1000))')
+  past_ms=$(python3 -c 'import time; print(int((time.time()-86400)*1000))')
+
+  local rcact="$HATS_DIR/claude/rctest"
+  mkdir -p "$rcact"
+  cat > "$rcact/.credentials.json" <<EOF
+{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":$future_ms,"scopes":["user:sessions:claude_code"]}}
+EOF
+  chmod 600 "$rcact/.credentials.json"
+  echo '{}' > "$rcact/.claude.json"
+
+  local expact="$HATS_DIR/claude/expiredtest"
+  mkdir -p "$expact"
+  cat > "$expact/.credentials.json" <<EOF
+{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":$past_ms,"scopes":["user:sessions:claude_code"]}}
+EOF
+  chmod 600 "$expact/.credentials.json"
+  echo '{}' > "$expact/.claude.json"
+
+  local out rc
+
+  # (a) --help documents flags
+  out=$("$HATS_SCRIPT" list --help 2>&1)
+  rc=$?
+  if ! { [ "$rc" -eq 0 ] && echo "$out" | grep -q -- '--rc-only' && echo "$out" | grep -q -- '--expired' && echo "$out" | grep -q -- '--provider'; }; then
+    printf 'got: %s\n' "$out" >&2
+    die "hats list --help missing expected flag docs (rc=$rc)"
+    return
+  fi
+
+  # (b) --rc-only matches rctest + expiredtest (both carry the RC scope), NOT
+  # the bare fixture accounts (foo etc.) whose parser errors out.
+  out=$("$HATS_SCRIPT" list --rc-only 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] \
+     || ! echo "$out" | grep -q 'Filters: --rc-only' \
+     || ! echo "$out" | grep -q 'rctest' \
+     || ! echo "$out" | grep -q 'expiredtest' \
+     || ! echo "$out" | grep -Eq '[0-9]+ of [0-9]+ account\(s\) matched'; then
+    printf 'got: %s\n' "$out" >&2
+    die "hats list --rc-only did not match staged RC tokens (rc=$rc)"
+    return
+  fi
+
+  # (c) --expired matches expiredtest, NOT rctest. Check the matched-count
+  # summary ("1 of N") as the authoritative signal — parsing a specific
+  # non-match line out of list output is regex-fragile.
+  out=$("$HATS_SCRIPT" list --expired 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] \
+     || ! echo "$out" | grep -q 'expiredtest' \
+     || ! echo "$out" | grep -Eq '^\s+1 of [0-9]+ account\(s\) matched'; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "hats list --expired did not match exactly the past-expiry token (rc=$rc)"
+    return
+  fi
+
+  # (d) Combined --rc-only --expired: AND semantics — only expiredtest.
+  out=$("$HATS_SCRIPT" list --rc-only --expired 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] \
+     || ! echo "$out" | grep -q 'Filters: --rc-only --expired' \
+     || ! echo "$out" | grep -q 'expiredtest'; then
+    printf 'got: %s\n' "$out" >&2
+    die "hats list --rc-only --expired combined filter failed (rc=$rc)"
+    return
+  fi
+
+  # (e) Unknown flag rejection — capture with `|| rc=$?` so set -e doesn't
+  # propagate the intentional non-zero exit from hats.
+  rc=0
+  out=$("$HATS_SCRIPT" list --bogus 2>&1) || rc=$?
+  if [ "$rc" -eq 0 ] || ! echo "$out" | grep -qi "Unknown list flag"; then
+    printf 'got: %s\n' "$out" >&2
+    die "hats list --bogus should reject with non-zero rc (rc=$rc)"
+    return
+  fi
+
+  # (f) --provider override: init codex tree so `hats list --provider codex`
+  # can route to it. No codex accounts yet, so header check is enough.
+  "$HATS_SCRIPT" codex init >/dev/null 2>&1 || true
+  out=$("$HATS_SCRIPT" list --provider codex 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] || ! echo "$out" | grep -qi "Codex Accounts"; then
+    printf 'got: %s\n' "$out" >&2
+    die "hats list --provider codex did not reroute to Codex (rc=$rc)"
+    return
+  fi
+
+  # Cleanup our staged accounts so downstream tests (symmetry audit, etc.)
+  # see the layout they expect.
+  rm -rf "$rcact" "$expact"
+
+  ok "hats list filters (--rc-only --expired --provider --help) work + AND-composition + bogus-flag rejection"
+}
+
 test_fleet_symmetry_check_runs_clean() {
   # The cross-provider symmetry audit (scripts/hats-fleet-symmetry-check,
   # roadmap #4) mechanizes case-law B-11/A-28 — flag any `case
@@ -1135,6 +1245,7 @@ test_install_to_sandbox_stamps_commit
 test_install_check_gates_on_smoke
 test_install_is_idempotent_on_reinstall
 test_config_migration_is_idempotent
+test_list_filter_flags
 test_fleet_symmetry_check_runs_clean
 
 say "summary: $pass pass, $fail fail"
