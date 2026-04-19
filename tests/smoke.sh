@@ -1072,6 +1072,85 @@ EOF
   fi
 }
 
+test_doctor_metrics_flag() {
+  # `hats doctor --metrics` adds a per-account token-freshness section using
+  # credential-file mtime as a "last activity" proxy (roadmap #8). Verify:
+  #   (a) bare `hats doctor` does NOT print the metrics section (no
+  #       behavioral change for the no-flag default);
+  #   (b) `hats doctor --metrics` prints the section with at least one
+  #       account row in the expected `last refresh Nd ago (YYYY-MM-DD)`
+  #       shape;
+  #   (c) accounts older than 30d emit `WARN dormant`; older than 90d emit
+  #       `WARN very dormant`;
+  #   (d) `--bogus` flag rejects with non-zero rc + clear error.
+
+  local future_ms
+  future_ms=$(python3 -c 'import time; print(int((time.time()+86400)*1000))')
+
+  local fresh="$HATS_DIR/claude/freshmetric"
+  local dormant="$HATS_DIR/claude/dormantmetric"
+  local ancient="$HATS_DIR/claude/ancientmetric"
+  for d in "$fresh" "$dormant" "$ancient"; do
+    mkdir -p "$d"
+    cat > "$d/.credentials.json" <<EOF
+{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":$future_ms,"scopes":["user:sessions:claude_code"]}}
+EOF
+    chmod 600 "$d/.credentials.json"
+    echo '{}' > "$d/.claude.json"
+  done
+  touch -d "45 days ago"  "$dormant/.credentials.json"
+  touch -d "120 days ago" "$ancient/.credentials.json"
+
+  # (a) bare doctor — no Metrics header in output.
+  local plain
+  plain=$("$HATS_SCRIPT" doctor 2>&1) || true
+  if echo "$plain" | grep -q "Metrics — token freshness"; then
+    printf 'got:\n%s\n' "$plain" >&2
+    die "bare 'hats doctor' unexpectedly printed metrics section"
+    return
+  fi
+
+  # (b)+(c) doctor --metrics — section header + per-account lines + dormancy
+  # tags on the backdated accounts.
+  local m
+  m=$("$HATS_SCRIPT" doctor --metrics 2>&1) || true
+  if ! echo "$m" | grep -q "Metrics — token freshness"; then
+    printf 'got:\n%s\n' "$m" >&2
+    die "doctor --metrics missing 'Metrics — token freshness' header"
+    return
+  fi
+  if ! echo "$m" | grep -Eq 'freshmetric +last refresh +0d ago'; then
+    printf 'got:\n%s\n' "$m" >&2
+    die "doctor --metrics fresh account did not show 0d-ago line"
+    return
+  fi
+  if ! echo "$m" | grep -Eq 'dormantmetric +last refresh +4[0-9]d ago.*WARN dormant'; then
+    printf 'got:\n%s\n' "$m" >&2
+    die "doctor --metrics did not flag 45d-old account as 'WARN dormant'"
+    return
+  fi
+  if ! echo "$m" | grep -Eq 'ancientmetric +last refresh +1[12][0-9]d ago.*WARN very dormant'; then
+    printf 'got:\n%s\n' "$m" >&2
+    die "doctor --metrics did not flag 120d-old account as 'WARN very dormant'"
+    return
+  fi
+
+  # (d) bogus flag rejection — capture with `|| rc=$?` so set -e doesn't
+  # propagate the intentional non-zero exit.
+  local rc=0 out
+  out=$("$HATS_SCRIPT" doctor --bogus 2>&1) || rc=$?
+  if [ "$rc" -eq 0 ] || ! echo "$out" | grep -qi "Unknown doctor flag"; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "doctor --bogus should reject (rc=$rc)"
+    return
+  fi
+
+  # Cleanup our staged metric accounts so subsequent tests don't see them.
+  rm -rf "$fresh" "$dormant" "$ancient"
+
+  ok "doctor --metrics emits per-account freshness section with dormant/very-dormant WARNs + rejects bogus flags"
+}
+
 test_list_filter_flags() {
   # `hats list` now accepts --rc-only / --expired / --provider to slice the
   # account view (roadmap #5). Verify each flag:
@@ -1245,6 +1324,7 @@ test_install_to_sandbox_stamps_commit
 test_install_check_gates_on_smoke
 test_install_is_idempotent_on_reinstall
 test_config_migration_is_idempotent
+test_doctor_metrics_flag
 test_list_filter_flags
 test_fleet_symmetry_check_runs_clean
 

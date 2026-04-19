@@ -1485,7 +1485,107 @@ cmd_fix() {
   echo "Done."
 }
 
+_account_token_mtime_age_days() {
+  # Emit the credential file's mtime in ISO-8601 and its age in whole days.
+  # Format: `mtime=<YYYY-MM-DD>\nage_days=<int>`. Empty output if the file is
+  # missing — callers treat that as "no data" and skip the metrics line.
+  # Portable across GNU + BSD stat (falls back to python3 for age arithmetic).
+  local cfile="$1"
+  [ -f "$cfile" ] || return 0
+  python3 - "$cfile" <<'PYEOF' 2>/dev/null
+import os, sys, time
+try:
+    st = os.stat(sys.argv[1])
+    age = int((time.time() - st.st_mtime) // 86400)
+    iso = time.strftime('%Y-%m-%d', time.localtime(st.st_mtime))
+    print(f'mtime={iso}')
+    print(f'age_days={age}')
+except Exception:
+    pass
+PYEOF
+}
+
+_doctor_metrics_section() {
+  # Invoked when `hats doctor --metrics` is used. Prints a per-account
+  # freshness line using the credential file's mtime (a strong proxy for
+  # "last time this account was actually used", since hats saves back the
+  # refreshed token at end-of-session). Flags dormant accounts so the
+  # operator can clean up before a long session hits a surprise re-auth.
+  echo ""
+  echo "Metrics — token freshness:"
+
+  local default
+  default=$(_default_account)
+  local any=0
+
+  for name in $(_accounts); do
+    any=1
+    local cfile
+    cfile=$(_credential_file "$name")
+
+    local marker=" "
+    [ "$name" = "$default" ] && marker="*"
+
+    if [ ! -f "$cfile" ]; then
+      printf "  %s %-12s NO CREDENTIALS\n" "$marker" "$name"
+      continue
+    fi
+
+    local info mtime="" age_days=""
+    info=$(_account_token_mtime_age_days "$cfile")
+    local _key _val
+    while IFS='=' read -r _key _val; do
+      case "$_key" in
+        mtime)    mtime="$_val" ;;
+        age_days) age_days="$_val" ;;
+      esac
+    done <<< "$info"
+
+    if [ -z "$age_days" ]; then
+      printf "  %s %-12s mtime unreadable\n" "$marker" "$name"
+      continue
+    fi
+
+    # Dormancy thresholds: >30d WARN, >90d stronger (shows in tag). Thresholds
+    # picked to match how Claude Code tokens drift in practice — active daily
+    # use keeps mtime within a day, weekly use within 7d, and anything over
+    # 30d is usually an account that's been abandoned without `hats remove`.
+    local tag=""
+    if [ "$age_days" -gt 90 ]; then
+      tag=" WARN very dormant"
+    elif [ "$age_days" -gt 30 ]; then
+      tag=" WARN dormant"
+    fi
+
+    printf "  %s %-12s last refresh %3sd ago (%s)%s\n" \
+      "$marker" "$name" "$age_days" "$mtime" "$tag"
+  done
+
+  if [ "$any" -eq 0 ]; then
+    echo "  (no accounts)"
+  fi
+}
+
 cmd_doctor() {
+  local show_metrics=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --metrics) show_metrics=1 ;;
+      -h|--help)
+        cat <<EOF
+Usage: $(_hats_cmd_prefix) doctor [--metrics]
+
+Read-only health check for the hats layout. With --metrics, also prints
+per-account token-freshness (credential-file mtime + dormancy WARN for
+accounts untouched in >30d / >90d).
+EOF
+        return 0
+        ;;
+      *) die "Unknown doctor flag '$1'. Try 'hats doctor --help'." ;;
+    esac
+    shift || true
+  done
+
   echo "Running hats doctor for $CURRENT_PROVIDER..."
 
   local issues=0
@@ -1773,6 +1873,10 @@ for event_name, event_items in (d.get("hooks") or {}).items():
     done
     [ "$unlinked" -eq 0 ] && echo "    OK   no unintended shared-resource overrides"
   done
+
+  if [ "$show_metrics" -eq 1 ]; then
+    _doctor_metrics_section
+  fi
 
   echo "Done. $issues issue(s), $warnings warning(s)."
   [ "$issues" -eq 0 ]
@@ -2083,7 +2187,8 @@ Shell Integration:
 
 Maintenance:
   fix                  Repair symlinks, verify auth, detect issues
-  doctor               Read-only health check (tooling, layout, symlinks, permissions)
+  doctor [--metrics]   Read-only health check (tooling, layout, symlinks, permissions)
+                       --metrics adds per-account token-freshness readout
   completion <shell>   Emit tab-completion script for bash or zsh
   providers            Show supported providers
   audit [-n N] [--raw] Read the hats audit log (opt-in via HATS_AUDIT=1)
@@ -2160,7 +2265,7 @@ case "${1:-}" in
   status)           cmd_status "${2:-}" ;;
   shell-init)       shift; cmd_shell_init "$@" ;;
   fix)              cmd_fix | _colorize_stream; exit "${PIPESTATUS[0]}" ;;
-  doctor)           cmd_doctor | _colorize_stream; exit "${PIPESTATUS[0]}" ;;
+  doctor)           shift; cmd_doctor "$@" | _colorize_stream; exit "${PIPESTATUS[0]}" ;;
   completion)       cmd_completion "${2:-}" ;;
   providers)        cmd_providers ;;
   audit)            shift; cmd_audit "$@" ;;

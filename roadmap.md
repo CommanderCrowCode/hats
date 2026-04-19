@@ -42,10 +42,8 @@ nothing left to ship — hats is near that state.
 **Scope:** weeks (design + implementation + test + migration path).
 **Blocker:** operator crypto choice (same choice as #1).
 
-### 8. Token refresh telemetry — `hats doctor --metrics`
-**Why now:** knowing which accounts have refreshed in the last N days surfaces dormant / dead credentials before the operator needs them. Auxiliary to #2 audit log but focused on token freshness rather than swap events.
-**Scope:** hours. Reads the same `_token_info` output `_show_account_status` parses.
-**Blocker:** none.
+### 8. Token refresh telemetry — `hats doctor --metrics`  ✅ SHIPPED 2026-04-19
+**Status:** landed. `hats doctor --metrics` adds a `Metrics — token freshness:` section under the existing health checks. Each account row shows `last refresh Nd ago (YYYY-MM-DD)`, derived from `.credentials.json` mtime (a strong "last activity" proxy because hats writes the refreshed token back at end-of-session). Dormancy WARNs: `WARN dormant` at >30d, `WARN very dormant` at >90d. Symmetric across claude + codex providers (both use the same mtime-based helper). Bare `hats doctor` is byte-identical to before — no behavior change without the flag. Smoke: `test_doctor_metrics_flag` covers (a) bare doctor doesn't emit the section, (b) section header + per-account lines render, (c) dormant + very-dormant tags fire on backdated accounts, (d) `--bogus` rejects with non-zero rc.
 
 ### 9. macOS CI: pure-BSD userland lane
 **Why now:** current `macos-latest` GitHub Actions runners ship GNU grep + GNU coreutils by default; that masked the `grep -oP` BSD-incompatibility I caught in commit 48fc27e. A separate job that unsets Homebrew PATH prefixes and runs with pure BSD userland would catch the next portability regression at CI time instead of at user time.
