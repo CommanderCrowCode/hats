@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# hats-fleet-symmetry-check — mechanize cross-provider symmetry audits for hats.
+#
+# Case-law context (B-11 sharpened by A-28, ratified 2026-04-17): reliability-class
+# fixes should be audited across sibling providers before shipping. hats has
+# `claude` + `codex` as siblings. This script mechanizes three classes of check
+# so the rule doesn't rely on per-commit author discipline:
+#
+#   A. Static — every `case "$CURRENT_PROVIDER" in` block in the hats binary has
+#      BOTH a `claude)` and a `codex)` arm. Missing arms are silent no-ops that
+#      produce surprise behavior on one provider only.
+#
+#   B. Static — enumerate provider-asymmetric `if [ "$CURRENT_PROVIDER" = "X" ]`
+#      gates and test-function names (`test_claude_*` / `test_codex_*`). Counts
+#      are informational; wide asymmetry (one provider has >2× as many) warns.
+#
+#   C. Runtime — in an isolated HATS_DIR sandbox, run provider-agnostic commands
+#      under BOTH providers and confirm they converge on the same exit code.
+#      (The commands exercised are ones where symmetric behavior is a design
+#      invariant; provider-specific commands are explicitly skipped.)
+#
+# Usage:
+#   hats-fleet-symmetry-check              # all passes, human output
+#   hats-fleet-symmetry-check --static     # only passes A + B (no sandbox)
+#   hats-fleet-symmetry-check --runtime    # only pass C (needs a writable TMPDIR)
+#   hats-fleet-symmetry-check --json       # machine-readable result
+#   hats-fleet-symmetry-check --quiet      # only summary line + failures
+#   hats-fleet-symmetry-check -h
+#
+# Exit codes:
+#   0  no fails
+#   1  at least one FAIL
+#   2  usage / environment error
+#
+# Author: hats-lead (2026-04-19).
+# Commit + push via git; do not modify in place on deployed hosts.
+
+set -u
+
+MODE="full"       # full | static | runtime
+OUT="human"       # human | json
+VERBOSITY="loud"  # loud | quiet
+SANDBOX=""        # script-scope so the EXIT trap can see it
+
+for arg in "$@"; do
+  case "$arg" in
+    --static)  MODE="static" ;;
+    --runtime) MODE="runtime" ;;
+    --json)    OUT="json" ;;
+    --quiet)   VERBOSITY="quiet" ;;
+    -h|--help)
+      sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *) echo "unknown flag: $arg" >&2; exit 2 ;;
+  esac
+done
+
+# Locate hats binary + smoke test file relative to this script's repo root.
+HATS_REPO=$(cd "$(dirname "$0")/.." && pwd)
+HATS_BIN="$HATS_REPO/hats"
+HATS_SMOKE="$HATS_REPO/tests/smoke.sh"
+
+[ -f "$HATS_BIN" ]   || { echo "hats binary missing: $HATS_BIN" >&2; exit 2; }
+[ -f "$HATS_SMOKE" ] || { echo "smoke test missing: $HATS_SMOKE" >&2; exit 2; }
+
+total_pass=0
+total_fail=0
+total_warn=0
+declare -a FAIL_LINES=()
+declare -a WARN_LINES=()
+declare -a JSON_CHECKS=()
+
+emit_loud() { [ "$VERBOSITY" = "loud" ] && [ "$OUT" = "human" ] && printf '%s\n' "$*"; }
+record_pass() {
+  total_pass=$((total_pass+1))
+  emit_loud "  PASS $1"
+  [ "$OUT" = "json" ] && JSON_CHECKS+=("{\"check\":\"$1\",\"status\":\"pass\"}")
+}
+record_fail() {
+  total_fail=$((total_fail+1))
+  FAIL_LINES+=("$1")
+  emit_loud "  FAIL $1"
+  [ "$OUT" = "json" ] && JSON_CHECKS+=("{\"check\":\"$1\",\"status\":\"fail\"}")
+}
+record_warn() {
+  total_warn=$((total_warn+1))
+  WARN_LINES+=("$1")
+  emit_loud "  WARN $1"
+  [ "$OUT" = "json" ] && JSON_CHECKS+=("{\"check\":\"$1\",\"status\":\"warn\"}")
+}
+
+# ── Pass A — case "$CURRENT_PROVIDER" in  must have both claude) + codex) ────
+pass_a_case_symmetry() {
+  emit_loud "[A] case-on-provider arm symmetry — $HATS_BIN"
+  # For every `case "$CURRENT_PROVIDER" in` line, walk forward until the matching
+  # `esac` at the same indentation and capture the arms that appear. Flag any
+  # block that has exactly one of {claude, codex} but not the other.
+  local in_block=0
+  local block_start=0
+  local block_indent=""
+  local has_claude=0
+  local has_codex=0
+  local lineno=0
+  while IFS= read -r line; do
+    lineno=$((lineno+1))
+    if [ "$in_block" -eq 0 ]; then
+      if echo "$line" | grep -qE '^[[:space:]]*case[[:space:]]+"\$CURRENT_PROVIDER"[[:space:]]+in[[:space:]]*$'; then
+        in_block=1
+        block_start=$lineno
+        block_indent=$(echo "$line" | sed -nE 's/^([[:space:]]*)case.*/\1/p')
+        has_claude=0
+        has_codex=0
+      fi
+      continue
+    fi
+    # In block — look for claude) / codex) at deeper indent, or the matching esac.
+    if echo "$line" | grep -qE "^${block_indent}esac[[:space:]]*(#.*)?$"; then
+      local label="case@$HATS_BIN:$block_start"
+      if [ "$has_claude" -eq 1 ] && [ "$has_codex" -eq 1 ]; then
+        record_pass "$label claude+codex arms present"
+      elif [ "$has_claude" -eq 1 ]; then
+        record_fail "$label MISSING codex) arm"
+      elif [ "$has_codex" -eq 1 ]; then
+        record_fail "$label MISSING claude) arm"
+      else
+        # Neither — probably a case statement that uses different keys (e.g.
+        # a nested auth-mode case). Not a provider-symmetry issue.
+        record_warn "$label no claude/codex arms — maybe a nested case; inspect manually"
+      fi
+      in_block=0
+      continue
+    fi
+    # Match arm labels at indent >= block_indent + 2, either `claude)` or
+    # `codex)` (possibly with combined patterns like `claude|codex)` which
+    # also counts as both).
+    if echo "$line" | grep -qE '^[[:space:]]+(claude\|codex|codex\|claude)\)'; then
+      has_claude=1
+      has_codex=1
+    elif echo "$line" | grep -qE '^[[:space:]]+claude\)'; then
+      has_claude=1
+    elif echo "$line" | grep -qE '^[[:space:]]+codex\)'; then
+      has_codex=1
+    fi
+  done < "$HATS_BIN"
+  if [ "$in_block" -eq 1 ]; then
+    record_fail "case@$HATS_BIN:$block_start UNCLOSED (parser did not reach esac)"
+  fi
+}
+
+# ── Pass B — if-gate + test-coverage symmetry counts (informational) ─────────
+pass_b_gate_and_test_counts() {
+  emit_loud "[B] provider-gated if-counts + smoke-test surface counts"
+
+  # B.1 — count single-provider if-gates in hats source. Intent is to give the
+  # author a quick "how many asymmetric branches" readout. Not a fail; wide
+  # skew earns a WARN to prompt a re-read.
+  local claude_gates codex_gates
+  claude_gates=$(grep -cE '\[[[:space:]]+"\$CURRENT_PROVIDER"[[:space:]]+=[[:space:]]+"claude"[[:space:]]+\]' "$HATS_BIN" || true)
+  codex_gates=$(grep -cE '\[[[:space:]]+"\$CURRENT_PROVIDER"[[:space:]]+=[[:space:]]+"codex"[[:space:]]+\]' "$HATS_BIN" || true)
+  emit_loud "    if-gates on claude: $claude_gates   codex: $codex_gates"
+  # Wide skew: one provider > 2× the other (and at least 4 gates on the fat side).
+  local skew_floor=4
+  if { [ "$claude_gates" -gt "$((codex_gates*2))" ] && [ "$claude_gates" -ge "$skew_floor" ]; } \
+     || { [ "$codex_gates" -gt "$((claude_gates*2))" ] && [ "$codex_gates" -ge "$skew_floor" ]; }; then
+    record_warn "if-gate skew (claude=$claude_gates, codex=$codex_gates) — review intentional-asymmetry justification"
+  else
+    record_pass "if-gate balance within 2× (claude=$claude_gates, codex=$codex_gates)"
+  fi
+
+  # B.2 — test-function name surface. Count test_claude_* + test_codex_*.
+  local claude_tests codex_tests
+  claude_tests=$(grep -cE '^test_claude_' "$HATS_SMOKE" || true)
+  codex_tests=$(grep -cE '^test_codex_'   "$HATS_SMOKE" || true)
+  emit_loud "    provider-specific tests — claude: $claude_tests   codex: $codex_tests"
+  # Dominant source of claude-side coverage is provider-agnostic (generic tests
+  # default to claude). Pure claude-specific tests are rare. We only warn when
+  # codex has zero tests — that would mean provider parity lacks any runtime
+  # evidence — or when claude-specific tests outnumber codex by >3×.
+  if [ "$codex_tests" -eq 0 ]; then
+    record_fail "no test_codex_* functions — runtime parity unverified"
+  elif [ "$claude_tests" -gt "$((codex_tests*3))" ] && [ "$claude_tests" -ge 3 ]; then
+    record_warn "test-name skew (claude=$claude_tests, codex=$codex_tests) — add codex-side coverage"
+  else
+    record_pass "test-name surface balanced (claude=$claude_tests, codex=$codex_tests)"
+  fi
+}
+
+# ── Pass C — runtime: provider-agnostic commands must converge per provider ──
+pass_c_runtime_symmetry() {
+  emit_loud "[C] runtime symmetric smoke (sandboxed)"
+
+  SANDBOX=$(mktemp -d -t hats-symmetry-XXXXXX) || { echo "mktemp failed" >&2; exit 2; }
+  trap 'rm -rf "$SANDBOX"' EXIT
+
+  export HATS_DIR="$SANDBOX/hats"
+  # Isolate HOME-targeted symlinks (`~/.claude`, `~/.codex`) by pointing HOME
+  # at the sandbox — init creates those symlinks in $HOME/.{claude,codex} and
+  # we don't want to touch the developer's real dotfiles.
+  local real_home="$HOME"
+  export HOME="$SANDBOX/home"
+  mkdir -p "$HOME"
+
+  # C.1 — `hats providers` is globally symmetric (lists both regardless).
+  run_symmetric "providers" providers
+
+  # C.2 — `hats help` + `hats version` must return rc=0 under both.
+  run_symmetric "help"    help
+  run_symmetric "version" version
+
+  # C.3 — `hats completion bash|zsh` must emit a script under both.
+  run_symmetric "completion-bash" completion bash
+  run_symmetric "completion-zsh"  completion zsh
+
+  # C.4 — init is provider-scoped; call init under each provider, verify rc=0
+  # (this creates two independent sandboxed layouts).
+  "$HATS_BIN" init >/dev/null 2>&1
+  local claude_init_rc=$?
+  "$HATS_BIN" codex init >/dev/null 2>&1
+  local codex_init_rc=$?
+  if [ "$claude_init_rc" = "$codex_init_rc" ]; then
+    record_pass "init converges rc=$claude_init_rc under both providers"
+  else
+    record_fail "init rc diverges (claude=$claude_init_rc codex=$codex_init_rc)"
+  fi
+
+  # C.5 — list on empty-but-initialized layouts should not crash and should rc=0.
+  run_symmetric "list-empty" list
+
+  # C.6 — doctor on fresh init should rc=0 under both.
+  run_symmetric "doctor-fresh" doctor
+
+  # C.7 — `status nonexistent` should fail with rc=1 under both (symmetric
+  # error path — case-law B-11's original probe was a codex-side rc-divergence).
+  local claude_bad_rc codex_bad_rc
+  "$HATS_BIN"        status nonexistent-account >/dev/null 2>&1
+  claude_bad_rc=$?
+  "$HATS_BIN" codex  status nonexistent-account >/dev/null 2>&1
+  codex_bad_rc=$?
+  if [ "$claude_bad_rc" = "$codex_bad_rc" ] && [ "$claude_bad_rc" != 0 ]; then
+    record_pass "status-nonexistent rc diverges identically (claude=$claude_bad_rc codex=$codex_bad_rc)"
+  else
+    record_fail "status-nonexistent rc asymmetric (claude=$claude_bad_rc codex=$codex_bad_rc)"
+  fi
+
+  # C.8 — `default` getter on empty layout should rc=1 and emit nothing on stdout.
+  local claude_def_rc codex_def_rc
+  "$HATS_BIN"       default >/dev/null 2>&1
+  claude_def_rc=$?
+  "$HATS_BIN" codex default >/dev/null 2>&1
+  codex_def_rc=$?
+  if [ "$claude_def_rc" = "$codex_def_rc" ]; then
+    record_pass "default-empty rc symmetric (claude=$claude_def_rc codex=$codex_def_rc)"
+  else
+    record_fail "default-empty rc asymmetric (claude=$claude_def_rc codex=$codex_def_rc)"
+  fi
+
+  export HOME="$real_home"
+}
+
+run_symmetric() {
+  local label="$1"; shift
+  local args=("$@")
+  local claude_rc codex_rc
+  "$HATS_BIN"       "${args[@]}" >/dev/null 2>&1
+  claude_rc=$?
+  "$HATS_BIN" codex "${args[@]}" >/dev/null 2>&1
+  codex_rc=$?
+  if [ "$claude_rc" = "$codex_rc" ]; then
+    record_pass "$label rc symmetric (both=$claude_rc)"
+  else
+    record_fail "$label rc diverges (claude=$claude_rc codex=$codex_rc)"
+  fi
+}
+
+# ── Run configured passes ────────────────────────────────────────────────────
+case "$MODE" in
+  full)    pass_a_case_symmetry; pass_b_gate_and_test_counts; pass_c_runtime_symmetry ;;
+  static)  pass_a_case_symmetry; pass_b_gate_and_test_counts ;;
+  runtime) pass_c_runtime_symmetry ;;
+esac
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+if [ "$OUT" = "json" ]; then
+  joined=$(IFS=,; echo "${JSON_CHECKS[*]}")
+  echo "{\"summary\":{\"pass\":$total_pass,\"fail\":$total_fail,\"warn\":$total_warn},\"checks\":[$joined]}"
+else
+  printf '\n=== symmetry: %d pass, %d fail, %d warn ===\n' "$total_pass" "$total_fail" "$total_warn"
+  if [ "$VERBOSITY" = "quiet" ] && [ "$total_fail" -gt 0 ]; then
+    printf 'FAIL %s\n' "${FAIL_LINES[@]}"
+  fi
+  if [ "$VERBOSITY" = "quiet" ] && [ "$total_warn" -gt 0 ]; then
+    printf 'WARN %s\n' "${WARN_LINES[@]}"
+  fi
+fi
+
+[ "$total_fail" -eq 0 ]

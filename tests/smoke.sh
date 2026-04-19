@@ -1072,6 +1072,29 @@ EOF
   fi
 }
 
+test_fleet_symmetry_check_runs_clean() {
+  # The cross-provider symmetry audit (scripts/hats-fleet-symmetry-check,
+  # roadmap #4) mechanizes case-law B-11/A-28 — flag any `case
+  # "$CURRENT_PROVIDER"` block missing a claude or codex arm, plus wide
+  # if-gate / test-surface skew. Must rc=0 against the current tree; if it
+  # starts failing, a new asymmetric code path was introduced without its
+  # counterpart.
+  local script="$HATS_REPO/scripts/hats-fleet-symmetry-check"
+  [ -x "$script" ] || { die "symmetry-check script missing or non-executable"; return; }
+  local out rc
+  # --static is dependency-free (no sandboxing, no provider CLI lookups); keep
+  # the smoke suite fast and deterministic. Full --runtime mode is verified
+  # ad-hoc; exposing it here would duplicate existing per-command smoke tests.
+  out=$("$script" --static 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '0 fail'; then
+    ok "fleet symmetry audit runs clean (rc=0, 0 fail)"
+  else
+    printf '%s\n' "$out" >&2
+    die "fleet symmetry audit reported failures (rc=$rc)"
+  fi
+}
+
 # ── Run ───────────────────────────────────────────────────────────
 
 say "HOME=$HOME"
@@ -1112,6 +1135,7 @@ test_install_to_sandbox_stamps_commit
 test_install_check_gates_on_smoke
 test_install_is_idempotent_on_reinstall
 test_config_migration_is_idempotent
+test_fleet_symmetry_check_runs_clean
 
 say "summary: $pass pass, $fail fail"
 [ "$fail" -eq 0 ]

@@ -26,10 +26,8 @@ nothing left to ship — hats is near that state.
 **Scope:** days. Depends on what "deep" should cover — TBD but a reasonable v1 cut.
 **Blocker:** none. Mostly a scoping decision.
 
-### 4. Cross-provider symmetry audit script — fleet_scope hygiene (A-22/B-11/A-28)
-**Why now:** Case-law B-11 (sharpened by A-28) requires reliability-class fixes to be audited across sibling providers. hats has `claude` + `codex` as siblings. A `scripts/hats-fleet-symmetry-check.sh` that runs tests symmetrically on both provider dispatch paths and flags suspicious asymmetries would mechanize the rule at the source, not rely on author discipline per-commit.
-**Scope:** hours.
-**Blocker:** none.
+### 4. Cross-provider symmetry audit script — fleet_scope hygiene (A-22/B-11/A-28)  ✅ SHIPPED 2026-04-19
+**Status:** landed as `scripts/hats-fleet-symmetry-check`. Three passes: (A) every `case "$CURRENT_PROVIDER"` block in `hats` has both `claude)` and `codex)` arms; (B) informational count of single-provider `if`-gates and `test_{claude,codex}_*` names with wide-skew warnings; (C) runtime symmetric smoke on the provider-agnostic command surface (`providers`, `help`, `version`, `completion bash|zsh`, `init`, `list`, `doctor`, `status nonexistent`, `default`-empty) — each pair must converge on the same rc. Caught one real asymmetry on first run: `_ensure_account_defaults` only branched `claude)`, fixed with an explicit codex no-op arm. Smoke suite calls `--static` to fence regressions. Flags: `--static` / `--runtime` / `--json` / `--quiet`. Exit 0 all-pass, 1 any-fail.
 
 ### 5. `hats list` filters (`--rc-only`, `--expired`, `--provider claude`)
 **Why now:** `hats list` currently dumps all accounts. For operators with 5-10 accounts across two providers, filtering by Remote-Control scope / expiry / provider is quality-of-life. The token-info parser already extracts the signals; filter flags are flag-plumbing on top of the existing loop.

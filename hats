@@ -372,6 +372,13 @@ _ensure_account_defaults() {
     claude)
       [ -f "$acct_dir/.claude.json" ] || echo '{}' > "$acct_dir/.claude.json"
       ;;
+    codex)
+      # Codex has no per-account default-state file analogous to .claude.json.
+      # `_ensure_codex_base_config` already handles base-level defaults. Leave
+      # this arm explicit so hats-fleet-symmetry-check doesn't flag the block
+      # as a missing-codex-branch.
+      :
+      ;;
   esac
 }
 
