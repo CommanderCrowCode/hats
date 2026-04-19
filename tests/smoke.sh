@@ -611,6 +611,80 @@ test_doctor_flags_missing_auth_and_broken_symlink() {
   fi
 }
 
+test_audit_log_opt_in_records_mutations_and_skips_reads() {
+  # Audit log v1 regression fences:
+  #   1. HATS_AUDIT unset → NO log file created, even after mutations.
+  #   2. HATS_AUDIT=1 → mutations (default setter, rename, remove, link,
+  #      unlink) append JSONL lines with the expected event+account keys.
+  #   3. Read-only commands (list, doctor, status, help, version) must NOT
+  #      write audit entries — otherwise shared-machine signal is drowned.
+  #   4. `hats audit` reader pretty-prints; `hats audit --raw` returns
+  #      the unmodified JSONL.
+  local audit_log="$HATS_DIR/audit.log"
+  local acct="$HATS_DIR/claude/auditprobe"
+  mkdir -p "$acct"
+  : > "$acct/.credentials.json"
+  chmod 600 "$acct/.credentials.json"
+  echo '{}' > "$acct/.claude.json"
+
+  # (1) Silent when HATS_AUDIT is unset.
+  rm -f "$audit_log"
+  (unset HATS_AUDIT; "$HATS_SCRIPT" default auditprobe >/dev/null 2>&1)
+  local silent_ok=0
+  [ ! -f "$audit_log" ] && silent_ok=1
+
+  # (2) Mutations log when HATS_AUDIT=1.
+  HATS_AUDIT=1 "$HATS_SCRIPT" default auditprobe >/dev/null 2>&1
+  HATS_AUDIT=1 "$HATS_SCRIPT" rename auditprobe auditprobe2 >/dev/null 2>&1
+  # stage base/scratchaudit so link target exists
+  echo "content" > "$HATS_DIR/claude/base/scratchaudit"
+  HATS_AUDIT=1 "$HATS_SCRIPT" link   auditprobe2 scratchaudit >/dev/null 2>&1
+  HATS_AUDIT=1 "$HATS_SCRIPT" unlink auditprobe2 scratchaudit >/dev/null 2>&1
+  HATS_AUDIT=1 "$HATS_SCRIPT" remove auditprobe2 >/dev/null 2>&1
+
+  local mutations_ok=0
+  if [ -f "$audit_log" ]; then
+    local has_default=0 has_rename=0 has_link=0 has_unlink=0 has_remove=0
+    grep -q '"event":"default"' "$audit_log" && grep -q '"account":"auditprobe"' "$audit_log" && has_default=1
+    grep -q '"event":"rename".*"from":"auditprobe".*"to":"auditprobe2"' "$audit_log" && has_rename=1
+    grep -q '"event":"link".*"resource":"scratchaudit"'   "$audit_log" && has_link=1
+    grep -q '"event":"unlink".*"resource":"scratchaudit"' "$audit_log" && has_unlink=1
+    grep -q '"event":"remove".*"account":"auditprobe2"'   "$audit_log" && has_remove=1
+    [ "$has_default" -eq 1 ] && [ "$has_rename" -eq 1 ] && [ "$has_link" -eq 1 ] \
+      && [ "$has_unlink" -eq 1 ] && [ "$has_remove" -eq 1 ] && mutations_ok=1
+  fi
+
+  # (3) Read-only commands must not grow the log.
+  local lines_before lines_after
+  lines_before=$(wc -l < "$audit_log")
+  HATS_AUDIT=1 "$HATS_SCRIPT" list    >/dev/null 2>&1
+  HATS_AUDIT=1 "$HATS_SCRIPT" doctor  >/dev/null 2>&1 || true
+  HATS_AUDIT=1 "$HATS_SCRIPT" status  >/dev/null 2>&1 || true
+  HATS_AUDIT=1 "$HATS_SCRIPT" version >/dev/null 2>&1
+  HATS_AUDIT=1 "$HATS_SCRIPT" help    >/dev/null 2>&1
+  lines_after=$(wc -l < "$audit_log")
+  local readonly_quiet_ok=0
+  [ "$lines_before" = "$lines_after" ] && readonly_quiet_ok=1
+
+  # (4) Reader works in both modes.
+  local pretty_out raw_out
+  pretty_out=$(HATS_AUDIT=1 "$HATS_SCRIPT" audit -n 2 2>&1)
+  raw_out=$(HATS_AUDIT=1 "$HATS_SCRIPT" audit -n 2 --raw 2>&1)
+  local pretty_ok=0 raw_ok=0
+  echo "$pretty_out" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z +[[:alnum:]_]+ +(claude|codex)' && pretty_ok=1
+  # raw output must be JSONL (starts with { and contains "event":)
+  echo "$raw_out" | grep -q '^{.*"event":' && raw_ok=1
+
+  rm -f "$HATS_DIR/claude/base/scratchaudit" "$audit_log"
+
+  if [ "$silent_ok" -eq 1 ] && [ "$mutations_ok" -eq 1 ] \
+     && [ "$readonly_quiet_ok" -eq 1 ] && [ "$pretty_ok" -eq 1 ] && [ "$raw_ok" -eq 1 ]; then
+    ok "audit log records mutations + skips read-only + opt-in silent + reader works"
+  else
+    die "audit log broken (silent=$silent_ok mutations=$mutations_ok readonly_quiet=$readonly_quiet_ok pretty=$pretty_ok raw=$raw_ok)"
+  fi
+}
+
 test_swap_error_paths() {
   # `hats swap <missing>` and `hats swap <account-with-no-credentials>` are
   # the only swap paths reachable without a real `claude` binary. Both must
@@ -1022,6 +1096,7 @@ test_codex_provider_routing
 test_codex_completion_emits_script
 test_show_account_status_parses_without_grep_P
 test_codex_doctor_runs_clean_on_fresh_init
+test_audit_log_opt_in_records_mutations_and_skips_reads
 test_init_idempotent_and_status_iterator
 test_rejection_paths_exit_nonzero
 test_doctor_flags_missing_auth_and_broken_symlink

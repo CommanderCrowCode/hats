@@ -18,10 +18,8 @@ nothing left to ship — hats is near that state.
 **Scope:** days (scaffold = hours; full backend wiring = days once unblocked).
 **Blocker:** operator crypto choice (age vs gpg vs OS-keychain). Not going to preempt. Scaffold work is unblocked.
 
-### 2. Audit log — timestamped swap / add / remove history
-**Why now:** already on ROADMAP Future Ideas. SECURITY.md explicitly calls out "No audit logging" as a feature gap for shared machines. Simple append-only JSONL at `$HATS_DIR/audit.log` would unblock multi-user deployments (operator currently runs hats multi-cred on shared dev boxes via the `hats/claude/monet|shannon|debussy` pattern; an audit trail for which account ran when is real value).
-**Scope:** hours for v1 (append + `hats audit` reader). Opt-in via env var to keep personal-machine UX clean.
-**Blocker:** none.
+### 2. Audit log — timestamped swap / add / remove history  ✅ SHIPPED 2026-04-19
+**Status:** landed as opt-in JSONL audit log. Enable via `HATS_AUDIT=1`; reader is `hats audit` with `-n <count>` and `--raw` flags. Events: add / remove / rename / default / swap / link / unlink. Read-only commands (list / doctor / status / help / version) are NOT logged — signal hygiene on shared machines. Tests in `tests/smoke.sh::test_audit_log_opt_in_records_mutations_and_skips_reads`. Threat-model note: SECURITY.md's "No audit logging" gap now has a concrete answer for multi-user dev boxes. Commit: see `git log --grep 'audit'`.
 
 ### 3. `hats verify` — deep health check, split from `hats doctor`
 **Why now:** `hats doctor` is a quick + non-destructive health pass. A deeper `hats verify` could parse credentials JSON, check expiry horizons, verify `claude`/`codex` binary versions against a known-compatible matrix, and ping the provider's auth endpoint (lightweight HEAD). Operator could `hats verify` before a long session to pre-empt surprises.

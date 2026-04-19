@@ -232,8 +232,17 @@ hats doctor            # Read-only health check (tooling, layout, symlinks, perm
 hats completion bash   # Emit bash completion script; eval "$(...)" in .bashrc
 hats completion zsh    # Emit zsh completion script; eval "$(...)" in .zshrc
 hats providers         # List supported providers and show the default
+hats audit             # Read the hats audit log (opt-in, see below)
 hats version           # Show version
 ```
+
+**`hats audit`** reads an opt-in JSONL audit log of account-mutating
+operations (add / remove / rename / default / swap / link / unlink). Read-only
+commands are deliberately NOT logged so the signal stays useful on shared
+machines. Enable with `export HATS_AUDIT=1`; override the path with
+`HATS_AUDIT_LOG=/path/to/audit.log` if `$HATS_DIR/audit.log` isn't where you
+want it. `hats audit -n 20` shows the last 20 entries pretty-printed;
+`hats audit --raw` emits JSONL for piping into `jq` / log shippers.
 
 Global flag: `--no-color` (or `NO_COLOR` / `HATS_NO_COLOR` env var) disables
 ANSI color output for any `hats` invocation.
@@ -333,6 +342,8 @@ hats v1.1.0 — Claude Code Accounts
 | `HATS_DIR` | `~/.hats` | Hats root directory |
 | `NO_COLOR` | unset | Any non-empty value disables ANSI color (see [no-color.org](https://no-color.org)) |
 | `HATS_NO_COLOR` | `0` | Same as `NO_COLOR`, hats-scoped alias |
+| `HATS_AUDIT` | `0` | Set to `1` to enable the audit log (off by default) |
+| `HATS_AUDIT_LOG` | `$HATS_DIR/audit.log` | Override the audit-log path |
 
 ### File Layout
 

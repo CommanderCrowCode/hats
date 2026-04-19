@@ -13,6 +13,13 @@ set -euo pipefail
 
 HATS_DIR="${HATS_DIR:-$HOME/.hats}"
 HATS_CONFIG="$HATS_DIR/config.toml"
+# Audit log: opt-in via HATS_AUDIT=1 (default path $HATS_DIR/audit.log) OR
+# HATS_AUDIT_LOG=/custom/path. Records account-mutating + swap events as
+# one JSON object per line (JSONL). Read-only commands (list/doctor/help/
+# version/status/completion/providers) are NOT logged — they don't mutate
+# state and would otherwise dwarf the signal on shared machines.
+HATS_AUDIT="${HATS_AUDIT:-0}"
+HATS_AUDIT_LOG="${HATS_AUDIT_LOG:-$HATS_DIR/audit.log}"
 
 CURRENT_PROVIDER="claude"
 PROVIDER_TITLE=""
@@ -29,6 +36,38 @@ SHARED_ALLOWLIST=()
 # ── Helpers ──────────────────────────────────────────────────────
 
 die() { echo "Error: $*" >&2; exit 1; }
+
+# Append one JSON line to the audit log. No-op unless HATS_AUDIT=1. Keys
+# are passed as alternating name/value args after the event string. Values
+# are shell-escaped by python3 (same argv-via-stdin pattern as _token_info_*
+# to avoid shell-meta injection from $USER / account names). Errors are
+# swallowed — audit failure must never break the user's command.
+_audit_log() {
+  [ "$HATS_AUDIT" = "1" ] || return 0
+  local event="$1"; shift
+  local logdir
+  logdir=$(dirname "$HATS_AUDIT_LOG")
+  mkdir -p "$logdir" 2>/dev/null || return 0
+  python3 - "$HATS_AUDIT_LOG" "$event" "$CURRENT_PROVIDER" "${USER:-unknown}" "$@" <<'PYEOF' 2>/dev/null || true
+import datetime, json, os, sys
+log_path, event, provider, user = sys.argv[1:5]
+kv_args = sys.argv[5:]
+entry = {
+    "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "event": event,
+    "provider": provider,
+    "user": user,
+}
+# Alternating key/value pairs after the fixed prefix
+for i in range(0, len(kv_args) - 1, 2):
+    entry[kv_args[i]] = kv_args[i + 1]
+line = json.dumps(entry, separators=(",", ":"))
+# Append is atomic under POSIX for writes <= PIPE_BUF (4KB); each JSONL
+# line stays well under that limit.
+with open(log_path, "a", encoding="utf-8") as f:
+    f.write(line + "\n")
+PYEOF
+}
 
 _is_supported_provider() {
   case "$1" in
@@ -986,6 +1025,7 @@ cmd_add() {
     echo "Account '$name' added."
     _sync_new_account_defaults "$name"
     _show_account_status "$name" "$(_default_account)"
+    _audit_log "add" "account" "$name"
   else
     rm -rf "$acct_dir"
     die "No credentials found after session. Account removed."
@@ -1008,6 +1048,7 @@ cmd_remove() {
 
   rm -rf "$(_account_dir "$name")"
   echo "Account '$name' removed."
+  _audit_log "remove" "account" "$name"
 
   if [ "$name" = "$default" ]; then
     rm -f "$RUNTIME_DIR"
@@ -1016,6 +1057,7 @@ cmd_remove() {
     if [ -n "$new_default" ]; then
       _set_default "$new_default"
       echo "New default: $new_default"
+      _audit_log "default" "account" "$new_default" "reason" "previous_default_removed"
     fi
   fi
 }
@@ -1031,11 +1073,13 @@ cmd_rename() {
 
   mv "$(_account_dir "$old_name")" "$(_account_dir "$new_name")"
   echo "Account '$old_name' renamed to '$new_name'."
+  _audit_log "rename" "from" "$old_name" "to" "$new_name"
 
   if [ "$old_name" = "$(_default_account)" ]; then
     _set_default "$new_name"
     echo "Default account set to '$new_name'."
     echo "$RUNTIME_DIR -> $PROVIDER_DIR/$new_name/"
+    _audit_log "default" "account" "$new_name" "reason" "renamed_from_default"
   fi
 }
 
@@ -1074,6 +1118,7 @@ cmd_default() {
   _set_default "$name"
   echo "Default account set to '$name'."
   echo "$RUNTIME_DIR -> $PROVIDER_DIR/$name/"
+  _audit_log "default" "account" "$name"
 }
 
 cmd_swap() {
@@ -1089,6 +1134,10 @@ cmd_swap() {
   acct_dir=$(_account_dir "$name")
 
   [ -f "$(_credential_file "$name")" ] || die "Account '$name' has no credentials. $(_provider_add_failure_hint "$name")"
+  # Log the swap BEFORE exec — _run_provider_command exec-chains into the
+  # provider CLI, so anything after this line doesn't execute in the
+  # parent shell.
+  _audit_log "swap" "account" "$name"
   _run_provider_command "$acct_dir" "$@"
 }
 
@@ -1098,6 +1147,7 @@ cmd_link() {
 
   _account_exists "$name" || die "Account '$name' not found."
   _link_resource "$name" "$resource"
+  _audit_log "link" "account" "$name" "resource" "$resource"
 }
 
 cmd_unlink() {
@@ -1106,6 +1156,7 @@ cmd_unlink() {
 
   _account_exists "$name" || die "Account '$name' not found."
   _unlink_resource "$name" "$resource"
+  _audit_log "unlink" "account" "$name" "resource" "$resource"
 }
 
 cmd_status() {
@@ -1664,7 +1715,7 @@ _hats_completion() {
   }
 
   local providers="claude codex"
-  local cmds="init add remove rm rename mv list ls swap default link unlink status shell-init fix doctor completion providers version help"
+  local cmds="init add remove rm rename mv list ls swap default link unlink status shell-init fix doctor completion providers audit version help"
   local first="${words[1]:-}"
   local second="${words[2]:-}"
 
@@ -1740,6 +1791,7 @@ _hats() {
     'doctor:Read-only health check'
     'completion:Emit shell-completion script (bash|zsh)'
     'providers:Show supported providers'
+    'audit:Read the hats audit log (opt-in via HATS_AUDIT=1)'
     'version:Show version'
     'help:Show help'
   )
@@ -1809,6 +1861,89 @@ cmd_providers() {
   echo "Default provider: $(_default_provider)"
 }
 
+cmd_audit() {
+  # Reader for the opt-in audit log. Prints the last N entries
+  # (default 20) in a human-friendly form. Passes through `--raw` to
+  # emit the underlying JSONL unmodified for piping into `jq` / other
+  # tools. Non-fatal when the log doesn't exist yet.
+  local n=20
+  local raw=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n)
+        shift || die "Usage: hats audit [-n <count>] [--raw]"
+        [ $# -gt 0 ] || die "Usage: hats audit [-n <count>] [--raw]"
+        n="$1"
+        ;;
+      --raw) raw=1 ;;
+      -h|--help)
+        cat <<EOF
+Usage: hats audit [-n <count>] [--raw]
+
+Read the hats audit log. Opt-in via HATS_AUDIT=1 (writes to
+\$HATS_AUDIT_LOG, default $HATS_DIR/audit.log). Events recorded:
+add, remove, rename, default, link, unlink, swap.
+
+  -n <count>   Show only the last <count> entries (default 20).
+  --raw        Emit JSONL unmodified, for jq / log shippers.
+EOF
+        return 0
+        ;;
+      *) die "Unknown flag: $1. See 'hats audit --help'." ;;
+    esac
+    shift || true
+  done
+
+  if [ ! -f "$HATS_AUDIT_LOG" ]; then
+    echo "No audit log at $HATS_AUDIT_LOG."
+    if [ "$HATS_AUDIT" != "1" ]; then
+      echo "Audit logging is disabled. Enable with: export HATS_AUDIT=1"
+    fi
+    return 0
+  fi
+
+  if [ "$raw" -eq 1 ]; then
+    tail -n "$n" "$HATS_AUDIT_LOG"
+    return 0
+  fi
+
+  # Pretty-print: one line per event, fixed-width columns. python3 is
+  # already a hats hard-dep (token inspection) so reusing it for JSON
+  # decode is consistent with the rest of the script. Note: argv-style
+  # invocation (log path + count passed as sys.argv), heredoc is
+  # SINGLE-quoted so no shell substitution inside. Don't pipe tail |
+  # python3 - << heredoc — the heredoc collides with the pipe on stdin.
+  python3 - "$HATS_AUDIT_LOG" "$n" <<'PYEOF' 2>/dev/null || true
+import json, sys
+from collections import deque
+log_path, n_str = sys.argv[1], sys.argv[2]
+try:
+    n = int(n_str)
+except ValueError:
+    n = 20
+# Efficient tail: deque with maxlen keeps only the last N lines in memory
+# even on huge logs.
+with open(log_path, "r", encoding="utf-8") as f:
+    lines = deque(f, maxlen=n)
+for raw in lines:
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        e = json.loads(raw)
+    except Exception:
+        # Skip malformed lines rather than aborting — audit readers
+        # must be forgiving of partial writes.
+        continue
+    ts = e.pop("ts", "?")
+    event = e.pop("event", "?")
+    provider = e.pop("provider", "?")
+    user = e.pop("user", "?")
+    extras = " ".join(f"{k}={v}" for k, v in e.items())
+    print(f"{ts}  {user:<10}  {provider:<6}  {event:<8}  {extras}")
+PYEOF
+}
+
 cmd_version() {
   echo "hats $VERSION ($COMMIT)"
 }
@@ -1849,6 +1984,7 @@ Maintenance:
   doctor               Read-only health check (tooling, layout, symlinks, permissions)
   completion <shell>   Emit tab-completion script for bash or zsh
   providers            Show supported providers
+  audit [-n N] [--raw] Read the hats audit log (opt-in via HATS_AUDIT=1)
   version              Show version
 
 Examples:
@@ -1874,6 +2010,8 @@ Environment Variables:
   HATS_DIR             Hats root directory (default: ~/.hats)
   NO_COLOR             Disable colored output (https://no-color.org)
   HATS_NO_COLOR        Same as NO_COLOR, hats-scoped alias
+  HATS_AUDIT           Set to 1 to enable the audit log (default: 0 / off)
+  HATS_AUDIT_LOG       Audit log path (default: \$HATS_DIR/audit.log)
 
 Global flags:
   --no-color           Disable colored output for this invocation
@@ -1923,6 +2061,7 @@ case "${1:-}" in
   doctor)           cmd_doctor | _colorize_stream; exit "${PIPESTATUS[0]}" ;;
   completion)       cmd_completion "${2:-}" ;;
   providers)        cmd_providers ;;
+  audit)            shift; cmd_audit "$@" ;;
   version|-v|--version) cmd_version ;;
   help|-h|--help|"") cmd_help ;;
   *)
