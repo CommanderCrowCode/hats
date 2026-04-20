@@ -391,20 +391,21 @@ _ensure_provider_defaults() {
   return 0
 }
 
-_ensure_account_defaults() {
+_ensure_account_defaults_claude() {
   local acct_dir="$1"
-  case "$CURRENT_PROVIDER" in
-    claude)
-      [ -f "$acct_dir/.claude.json" ] || echo '{}' > "$acct_dir/.claude.json"
-      ;;
-    codex)
-      # Codex has no per-account default-state file analogous to .claude.json.
-      # `_ensure_codex_base_config` already handles base-level defaults. Leave
-      # this arm explicit so hats-fleet-symmetry-check doesn't flag the block
-      # as a missing-codex-branch.
-      :
-      ;;
-  esac
+  [ -f "$acct_dir/.claude.json" ] || echo '{}' > "$acct_dir/.claude.json"
+}
+
+_ensure_account_defaults_codex() {
+  # No-op. Codex has no per-account default-state file analogous to
+  # .claude.json; `_ensure_codex_base_config` already handles base-level
+  # defaults. Kept as an explicit function so _call_provider_variant's
+  # missing-variant guard stays meaningful.
+  :
+}
+
+_ensure_account_defaults() {
+  _call_provider_variant ensure_account_defaults "$@"
 }
 
 _dedupe_claude_hook_registrations() {
@@ -493,27 +494,28 @@ for line in report_lines:
 PY
 }
 
-_provider_login_hint() {
+_provider_login_hint_claude() {
+  # auth_mode arg ignored — claude login is single-flow.
+  echo "Run /login inside the session to authenticate, then /exit when done."
+}
+
+_provider_login_hint_codex() {
   local auth_mode="${1:-}"
-  case "$CURRENT_PROVIDER" in
-    claude) echo "Run /login inside the session to authenticate, then /exit when done." ;;
-    codex)
-      case "$auth_mode" in
-        api-key) echo "Codex login will read OPENAI_API_KEY and store file-backed credentials in the account directory." ;;
-        device-auth) echo "Codex device auth will run with file-backed credentials stored in the account directory." ;;
-        chatgpt|"") echo "Codex ChatGPT login will run with file-backed credentials stored in the account directory." ;;
-        *) echo "Codex login will run with file-backed credentials stored in the account directory." ;;
-      esac
-      ;;
+  case "$auth_mode" in
+    api-key)     echo "Codex login will read OPENAI_API_KEY and store file-backed credentials in the account directory." ;;
+    device-auth) echo "Codex device auth will run with file-backed credentials stored in the account directory." ;;
+    chatgpt|"")  echo "Codex ChatGPT login will run with file-backed credentials stored in the account directory." ;;
+    *)           echo "Codex login will run with file-backed credentials stored in the account directory." ;;
   esac
 }
 
-_provider_add_failure_hint() {
-  case "$CURRENT_PROVIDER" in
-    claude) echo "Run: hats add $1" ;;
-    codex) echo "Run: hats codex add $1" ;;
-  esac
+_provider_login_hint() {
+  _call_provider_variant provider_login_hint "$@"
 }
+
+_provider_add_failure_hint_claude() { echo "Run: hats add $1"; }
+_provider_add_failure_hint_codex()  { echo "Run: hats codex add $1"; }
+_provider_add_failure_hint() { _call_provider_variant provider_add_failure_hint "$@"; }
 
 _credential_file() {
   echo "$(_account_dir "$1")/$PRIMARY_AUTH_FILE"
@@ -776,44 +778,48 @@ _choose_codex_auth_mode() {
   done
 }
 
-_run_provider_login() {
+_run_provider_login_claude() {
+  local acct_dir="$1"
+  # auth_mode unused for claude — single-flow /login.
+  CLAUDE_CONFIG_DIR="$acct_dir" claude || true
+}
+
+_run_provider_login_codex() {
   local acct_dir="$1"
   local auth_mode="${2:-}"
-  case "$CURRENT_PROVIDER" in
-    claude)
-      CLAUDE_CONFIG_DIR="$acct_dir" claude || true
+  case "$auth_mode" in
+    api-key)
+      [ -n "${OPENAI_API_KEY:-}" ] || die "OPENAI_API_KEY is required for Codex API key login."
+      printf '%s\n' "$OPENAI_API_KEY" | CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' login --with-api-key || true
       ;;
-    codex)
-      case "$auth_mode" in
-        api-key)
-          [ -n "${OPENAI_API_KEY:-}" ] || die "OPENAI_API_KEY is required for Codex API key login."
-          printf '%s\n' "$OPENAI_API_KEY" | CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' login --with-api-key || true
-          ;;
-        device-auth)
-          CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' login --device-auth || true
-          ;;
-        chatgpt|"")
-          CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' login || true
-          ;;
-        *)
-          die "Unsupported Codex auth mode '$auth_mode'."
-          ;;
-      esac
+    device-auth)
+      CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' login --device-auth || true
+      ;;
+    chatgpt|"")
+      CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' login || true
+      ;;
+    *)
+      die "Unsupported Codex auth mode '$auth_mode'."
       ;;
   esac
 }
 
+_run_provider_login() {
+  _call_provider_variant run_provider_login "$@"
+}
+
+_run_provider_command_claude() {
+  local acct_dir="$1"; shift
+  CLAUDE_CONFIG_DIR="$acct_dir" claude "$@"
+}
+
+_run_provider_command_codex() {
+  local acct_dir="$1"; shift
+  CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' "$@"
+}
+
 _run_provider_command() {
-  local acct_dir="$1"
-  shift
-  case "$CURRENT_PROVIDER" in
-    claude)
-      CLAUDE_CONFIG_DIR="$acct_dir" claude "$@"
-      ;;
-    codex)
-      CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' "$@"
-      ;;
-  esac
+  _call_provider_variant run_provider_command "$@"
 }
 
 _sync_new_account_defaults() {
