@@ -2459,13 +2459,14 @@ _verify_one_account() {
   # `doctor`, which checks the layout (dirs, symlinks, permissions) — this
   # walks the token semantics: is the JSON well-formed, is expiry still in
   # the future or at least backed by a refresh token, are the required
-  # scopes present, does the provider CLI version read cleanly. Emits one
-  # line per check, prefixed with '    PASS'/'    WARN'/'    FAIL'. Sets
-  # the named issues/warnings counter variables by reference.
+  # scopes present, does the provider CLI version read cleanly.
+  #
+  # Emits one line per check, prefixed with '    PASS'/'    WARN'/'    FAIL'.
+  # The caller (cmd_verify) tallies issues + warnings by counting the FAIL/
+  # WARN prefixes in the captured output — this avoids `local -n` namerefs
+  # which were a bash 4.3+ feature (macOS ships bash 3.2 by default).
   local name="$1"
   local default="$2"
-  local -n _issues=$3
-  local -n _warnings=$4
 
   local acct_dir cfile
   acct_dir=$(_account_dir "$name")
@@ -2477,14 +2478,12 @@ _verify_one_account() {
 
   if [ ! -f "$cfile" ]; then
     echo "    FAIL credentials file missing: $(basename "$cfile")"
-    _issues=$((_issues + 1))
     return
   fi
 
   # 1. JSON parse — reject anything that would silently null out in _token_info.
   if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$cfile" 2>/dev/null; then
     echo "    FAIL credentials file is not valid JSON"
-    _issues=$((_issues + 1))
     return
   fi
   echo "    PASS credentials parse as JSON"
@@ -2494,7 +2493,7 @@ _verify_one_account() {
   mode=$(stat -c '%a' "$cfile" 2>/dev/null || stat -f '%Lp' "$cfile" 2>/dev/null || echo "?")
   case "$mode" in
     600|400) echo "    PASS credentials mode=$mode" ;;
-    *)       echo "    WARN credentials mode=$mode (expected 600 or 400)"; _warnings=$((_warnings + 1)) ;;
+    *)       echo "    WARN credentials mode=$mode (expected 600 or 400)" ;;
   esac
 
   # 3. Provider-specific token semantics. Genuine data asymmetry — claude
@@ -2543,7 +2542,6 @@ PYEOF
 
       if [ -n "$err" ]; then
         echo "    FAIL claude token: $err"
-        _issues=$((_issues + 1))
         return
       fi
 
@@ -2558,10 +2556,8 @@ PYEOF
         echo "    PASS token expiry in ${horizon}h"
       elif [ "$has_refresh" = "True" ]; then
         echo "    WARN access token expired (${horizon}h) but refreshToken present — will auto-refresh"
-        _warnings=$((_warnings + 1))
       else
         echo "    FAIL token expired (${horizon}h) and no refreshToken — /login required"
-        _issues=$((_issues + 1))
       fi
 
       # RC-scope presence is warn-only: some operators deliberately use non-RC
@@ -2570,7 +2566,6 @@ PYEOF
         echo "    PASS remote-control scope present"
       else
         echo "    WARN no remote-control scope (scopes: $scopes)"
-        _warnings=$((_warnings + 1))
       fi
       ;;
     codex)
@@ -2601,14 +2596,12 @@ PYEOF
 
       if [ -n "$err" ]; then
         echo "    FAIL codex token: $err"
-        _issues=$((_issues + 1))
         return
       fi
       if [ "$present" = "True" ]; then
         echo "    PASS codex tokens present (account_id=${acct_id:-unknown})"
       else
         echo "    FAIL codex tokens missing"
-        _issues=$((_issues + 1))
       fi
 
       # config.toml credential-store mode — 'file' is the only hats-supported
@@ -2619,8 +2612,8 @@ PYEOF
                 | head -1 | sed -E 's/^[^=]*=[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' | tr -d '[:space:]')
         case "$store" in
           file)  echo "    PASS config.toml cli_auth_credentials_store=file" ;;
-          '')    echo "    WARN config.toml has no cli_auth_credentials_store line"; _warnings=$((_warnings + 1)) ;;
-          *)     echo "    FAIL config.toml cli_auth_credentials_store=$store (hats requires 'file')"; _issues=$((_issues + 1)) ;;
+          '')    echo "    WARN config.toml has no cli_auth_credentials_store line" ;;
+          *)     echo "    FAIL config.toml cli_auth_credentials_store=$store (hats requires 'file')" ;;
         esac
       fi
       ;;
@@ -2700,8 +2693,19 @@ EOF
     fi
   fi
 
+  # Capture per-account output so we can tally issues + warnings by prefix
+  # after the fact. This sidesteps bash 4.3+ `local -n` nameref passing,
+  # which macOS's default bash 3.2 doesn't support. `grep -c` exits 1 when
+  # there are no matches — under `set -e` that would short-circuit the loop
+  # and skip the summary, so each grep is wrapped with `|| true`.
+  local per_acct _fc _wc
   for name in $names; do
-    _verify_one_account "$name" "$default" issues warnings
+    per_acct=$(_verify_one_account "$name" "$default")
+    printf '%s\n' "$per_acct"
+    _fc=$(printf '%s\n' "$per_acct" | grep -c '^    FAIL ' || true)
+    _wc=$(printf '%s\n' "$per_acct" | grep -c '^    WARN ' || true)
+    issues=$((issues + ${_fc:-0}))
+    warnings=$((warnings + ${_wc:-0}))
   done
 
   echo ""

@@ -1294,14 +1294,21 @@ EOF
   ) || { die "export/import roundtrip or rename/force guard broken (see stderr above)"; return; }
 
   # Path-traversal rejection: craft a malicious tarball and confirm refusal.
-  local evil_stage="$SANDBOX_ROOT/evil-stage"
-  mkdir -p "$evil_stage"
-  printf '{"name":"x","provider":"claude","hats_version":"1.1.0","isolated_files":[]}' > "$evil_stage/MANIFEST.json"
-  printf 'haxx' > "$evil_stage/etc_passwd"
+  # Use python's tarfile so the entry name (`../../etc/passwd`) is embedded
+  # literally — portable across GNU and BSD tar, neither of which supports
+  # each other's path-rewriting flags (--transform on GNU, -s on BSD).
   local evil_bundle="$SANDBOX_ROOT/evil.tar"
-  tar -C "$evil_stage" --transform 's,^etc_passwd,../../etc/passwd,' \
-      -cf "$evil_bundle" MANIFEST.json etc_passwd 2>/dev/null \
-    || { die "could not stage evil tarball"; return; }
+  python3 - "$evil_bundle" <<'PYEOF' || { die "could not stage evil tarball"; return; }
+import io, sys, tarfile
+bundle = sys.argv[1]
+with tarfile.open(bundle, "w") as tf:
+    mb = b'{"name":"x","provider":"claude","hats_version":"1.1.0","isolated_files":[]}'
+    mi = tarfile.TarInfo("MANIFEST.json"); mi.size = len(mb)
+    tf.addfile(mi, io.BytesIO(mb))
+    eb = b"haxx"
+    ei = tarfile.TarInfo("../../etc/passwd"); ei.size = len(eb)
+    tf.addfile(ei, io.BytesIO(eb))
+PYEOF
   local rc=0
   "$HATS_SCRIPT" import "$evil_bundle" >/dev/null 2>&1 || rc=$?
   if [ "$rc" -eq 0 ]; then
