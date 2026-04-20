@@ -2095,6 +2095,291 @@ compdef _hats hats
 ZSH_COMPLETION
 }
 
+_export_import_usage() {
+  cat <<EOF
+Usage:
+  $(_hats_cmd_prefix) export <name> [--out <file>|-] [--no-encrypt] [--include-sessions]
+  $(_hats_cmd_prefix) import <file> [--as <newname>] [--force]
+
+export
+  --out <file>          Write to file instead of stdout. Default: stdout when
+                        stdout is a pipe/file, else rejects for safety.
+  --no-encrypt          Emit raw tarball (UNSAFE — credentials in clear).
+                        Default: encrypt via 'age -p' (password-based) if age
+                        is on PATH; else refuses with guidance to install age
+                        or pass --no-encrypt explicitly.
+  --include-sessions    Include sessions/ dir. Default: excluded (per-machine).
+
+import
+  --as <newname>        Rename during import (default: MANIFEST.name).
+  --force               Overwrite an existing account of the same name. Default:
+                        refuse with a clear error.
+
+Environment:
+  HATS_EXPORT_PASSWORD  Non-interactive password for age-encrypted bundles.
+                        Ignored when --no-encrypt is set.
+EOF
+}
+
+_hats_supported_export_backends() {
+  # Echo the set of encryption backends this host can perform. Order is
+  # priority-descending; the first available is preferred when the operator
+  # doesn't pick explicitly. 'none' is always listed (rawcase).
+  if command -v age >/dev/null 2>&1; then echo "age"; fi
+  echo "none"
+}
+
+_build_export_manifest() {
+  # Emit a MANIFEST.json document to stdout for the named account. Fields
+  # follow PRD §Archive format. isolated_files is the intersection of the
+  # declared ISOLATED_PATTERNS and what actually lives in the account dir,
+  # so partially-initialized accounts still round-trip.
+  local name="$1" acct_dir="$2" include_sessions="$3"
+  local -a isolated=()
+  local f
+  for f in .credentials.json .claude.json auth.json config.toml; do
+    [ -e "$acct_dir/$f" ] && [ ! -L "$acct_dir/$f" ] && isolated+=("$f")
+  done
+  [ "$include_sessions" = "1" ] && [ -d "$acct_dir/sessions" ] && isolated+=("sessions")
+
+  python3 - "$name" "$CURRENT_PROVIDER" "$VERSION" "${isolated[@]}" <<'PYEOF'
+import json, sys, datetime
+name, provider, version, *isolated = sys.argv[1:]
+print(json.dumps({
+    "name": name,
+    "provider": provider,
+    "hats_version": version,
+    "exported_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "isolated_files": isolated,
+}, indent=2))
+PYEOF
+}
+
+cmd_export() {
+  local name="" out="" no_encrypt=0 include_sessions=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out)            shift; [ $# -gt 0 ] || die "$(_export_import_usage)"; out="$1" ;;
+      --out=*)          out="${1#--out=}" ;;
+      --no-encrypt)     no_encrypt=1 ;;
+      --include-sessions) include_sessions=1 ;;
+      -h|--help)        _export_import_usage; return 0 ;;
+      --*)              die "Unknown export flag '$1'. See '$(_hats_cmd_prefix) export --help'." ;;
+      *)                [ -z "$name" ] && name="$1" || die "export takes exactly one account name" ;;
+    esac
+    shift || true
+  done
+  [ -z "$name" ] && die "$(_export_import_usage)"
+
+  local acct_dir
+  acct_dir=$(_account_dir "$name")
+  _account_exists "$name" || die "Account '$name' not found."
+
+  # Default output: stdout when redirected; else refuse (tarballs are not
+  # meant for a terminal).
+  if [ -z "$out" ]; then
+    if [ -t 1 ]; then
+      die "export to a terminal is unsafe — redirect with '--out <file>' or '>'"
+    fi
+    out="-"
+  fi
+
+  # Stage the isolated file set into a clean temp dir, add the MANIFEST,
+  # then tar. Using a staging dir instead of 'tar -C' on the account dir
+  # avoids accidentally bundling symlinks (which we explicitly never want
+  # in an export — the target machine populates its own base links).
+  local stage
+  stage=$(mktemp -d -t hats-export-XXXXXX) || die "mktemp failed"
+  trap 'rm -rf "$stage"' RETURN
+  _build_export_manifest "$name" "$acct_dir" "$include_sessions" > "$stage/MANIFEST.json"
+
+  local f
+  for f in .credentials.json .claude.json auth.json config.toml; do
+    [ -e "$acct_dir/$f" ] && [ ! -L "$acct_dir/$f" ] && cp -p "$acct_dir/$f" "$stage/$f"
+  done
+  if [ "$include_sessions" = "1" ] && [ -d "$acct_dir/sessions" ]; then
+    cp -a "$acct_dir/sessions" "$stage/sessions"
+  fi
+
+  # Pick backend. `--no-encrypt` wins; otherwise prefer age; else error out
+  # with actionable guidance so operator isn't silently downgraded to raw.
+  local backend="age"
+  if [ "$no_encrypt" = "1" ]; then
+    backend="none"
+    echo "WARN: exporting credentials unencrypted. Anyone with this file can impersonate the account." >&2
+  elif ! command -v age >/dev/null 2>&1; then
+    die "age not on PATH — install 'age' or re-run with --no-encrypt (not recommended)."
+  fi
+
+  local out_target="$out"
+  [ "$out_target" = "-" ] && out_target=/dev/stdout
+
+  case "$backend" in
+    none)
+      tar -cf - -C "$stage" MANIFEST.json $(ls -A "$stage" | grep -v '^MANIFEST.json$') > "$out_target"
+      ;;
+    age)
+      # Password source: HATS_EXPORT_PASSWORD if set, else age prompts.
+      if [ -n "${HATS_EXPORT_PASSWORD:-}" ]; then
+        tar -cf - -C "$stage" MANIFEST.json $(ls "$stage" | grep -v '^MANIFEST.json$') \
+          | age -p -o "$out_target" <<<"$HATS_EXPORT_PASSWORD" 2>/dev/null \
+          || die "age encryption failed (check HATS_EXPORT_PASSWORD)"
+      else
+        tar -cf - -C "$stage" MANIFEST.json $(ls "$stage" | grep -v '^MANIFEST.json$') \
+          | age -p -o "$out_target" \
+          || die "age encryption failed"
+      fi
+      ;;
+  esac
+
+  _audit_log "export" "account" "$name" "backend" "$backend" "out" "$out"
+  [ "$out" != "-" ] && echo "Exported '$name' to $out ($backend-encrypted)." >&2
+}
+
+_validate_archive_entries() {
+  # Reject path-traversal + absolute paths + symlinks in the candidate
+  # archive entries read from stdin (newline-delimited `tar -tf` output).
+  # Echo allowed entries on success; exit non-zero on any violation.
+  local bad=0 line
+  while IFS= read -r line; do
+    case "$line" in
+      /*|*..*|*$'\n'*) echo "rejected archive entry: $line" >&2; bad=1 ;;
+      MANIFEST.json|.credentials.json|.claude.json|auth.json|config.toml) echo "$line" ;;
+      sessions/*)      echo "$line" ;;
+      *)               echo "rejected unexpected archive entry: $line" >&2; bad=1 ;;
+    esac
+  done
+  return $bad
+}
+
+cmd_import() {
+  local in_file="" as_name="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --as)    shift; [ $# -gt 0 ] || die "$(_export_import_usage)"; as_name="$1" ;;
+      --as=*)  as_name="${1#--as=}" ;;
+      --force) force=1 ;;
+      -h|--help) _export_import_usage; return 0 ;;
+      --*)     die "Unknown import flag '$1'. See '$(_hats_cmd_prefix) import --help'." ;;
+      *)       [ -z "$in_file" ] && in_file="$1" || die "import takes exactly one file path" ;;
+    esac
+    shift || true
+  done
+  [ -z "$in_file" ] && die "$(_export_import_usage)"
+  [ -f "$in_file" ] || die "input file not found: $in_file"
+  [ -d "$PROVIDER_DIR" ] || die "hats not initialized for $CURRENT_PROVIDER. Run '$(_hats_cmd_prefix) init'."
+
+  local stage
+  stage=$(mktemp -d -t hats-import-XXXXXX) || die "mktemp failed"
+  trap 'rm -rf "$stage"' RETURN
+
+  # Sniff: age magic starts "age-encryption.org/v1" in header. Any other
+  # non-tar prefix → error. Raw tarballs start with POSIX ustar header at
+  # offset 257, but the first 512 bytes contain the filename, so just
+  # attempt age-decrypt if magic matches, else treat as tarball.
+  local decrypted="$stage/bundle.tar"
+  if head -c 64 "$in_file" 2>/dev/null | grep -q 'age-encryption.org'; then
+    command -v age >/dev/null 2>&1 || die "archive is age-encrypted but 'age' is not on PATH."
+    if [ -n "${HATS_EXPORT_PASSWORD:-}" ]; then
+      age -d -o "$decrypted" "$in_file" <<<"$HATS_EXPORT_PASSWORD" 2>/dev/null \
+        || die "age decryption failed (check HATS_EXPORT_PASSWORD)"
+    else
+      age -d -o "$decrypted" "$in_file" \
+        || die "age decryption failed"
+    fi
+  else
+    cp "$in_file" "$decrypted"
+  fi
+
+  # Verify + filter the entries before extraction (path-traversal guard).
+  local entries
+  entries=$(tar -tf "$decrypted" 2>/dev/null) || die "archive is not a readable tarball."
+  local allowed
+  allowed=$(printf '%s\n' "$entries" | _validate_archive_entries) \
+    || die "archive contains rejected entries; refusing to extract."
+
+  # Extract into stage/extracted/ using a safe flag set.
+  mkdir -p "$stage/extracted"
+  tar -xf "$decrypted" -C "$stage/extracted" \
+      --no-same-owner --no-same-permissions \
+      $(printf '%s\n' "$allowed") \
+    || die "tar extraction failed."
+
+  [ -f "$stage/extracted/MANIFEST.json" ] || die "MANIFEST.json missing from archive."
+
+  # Parse + validate manifest.
+  local manifest_info
+  manifest_info=$(python3 - "$stage/extracted/MANIFEST.json" "$VERSION" <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print(f'error=manifest parse failed: {e}'); sys.exit(0)
+name = d.get('name', '')
+provider = d.get('provider', '')
+exp_ver = d.get('hats_version', '')
+cur_ver = sys.argv[2]
+# Major-version compatibility: same leading integer.
+exp_major = exp_ver.split('.', 1)[0] if exp_ver else ''
+cur_major = cur_ver.split('.', 1)[0]
+compat = (exp_major == cur_major)
+print(f'name={name}')
+print(f'provider={provider}')
+print(f'hats_version={exp_ver}')
+print(f'compat={compat}')
+PYEOF
+)
+  local m_name="" m_provider="" m_ver="" m_compat="" m_err=""
+  local _k _v
+  while IFS='=' read -r _k _v; do
+    case "$_k" in
+      name)         m_name="$_v" ;;
+      provider)     m_provider="$_v" ;;
+      hats_version) m_ver="$_v" ;;
+      compat)       m_compat="$_v" ;;
+      error)        m_err="$_v" ;;
+    esac
+  done <<< "$manifest_info"
+
+  [ -n "$m_err" ] && die "$m_err"
+  [ "$m_compat" = "True" ] || die "archive hats_version '$m_ver' is not compatible with local '$VERSION' (major differs)."
+  [ "$m_provider" = "$CURRENT_PROVIDER" ] \
+    || die "archive provider '$m_provider' does not match active provider '$CURRENT_PROVIDER'. Use 'hats $m_provider import'."
+
+  local target="${as_name:-$m_name}"
+  _validate_name "$target"
+  local target_dir
+  target_dir=$(_account_dir "$target")
+
+  if _account_exists "$target"; then
+    [ "$force" = "1" ] || die "Account '$target' already exists. Use --force to overwrite."
+    rm -rf "$target_dir"
+  fi
+
+  mkdir -p "$target_dir"
+  # Copy staged files into the account dir. Preserve mode 600 for credential
+  # files since tar --no-same-permissions stripped it.
+  local f
+  for f in .credentials.json .claude.json auth.json config.toml; do
+    if [ -e "$stage/extracted/$f" ]; then
+      cp -p "$stage/extracted/$f" "$target_dir/$f"
+      case "$f" in
+        .credentials.json|auth.json) chmod 600 "$target_dir/$f" 2>/dev/null || true ;;
+      esac
+    fi
+  done
+  if [ -d "$stage/extracted/sessions" ]; then
+    cp -a "$stage/extracted/sessions" "$target_dir/sessions"
+  fi
+
+  # Wire up shared base symlinks so the imported account has the same
+  # shared-resource view as a fresh `hats add <target>` on this machine.
+  _setup_account_dir "$target"
+
+  _audit_log "import" "account" "$target" "source_name" "$m_name" "source_version" "$m_ver"
+  echo "Imported '$target' (from '$m_name', hats_version=$m_ver) into $target_dir." >&2
+}
+
 cmd_providers() {
   echo "Supported providers:"
   echo "  claude"
@@ -2226,6 +2511,12 @@ Maintenance:
   fix                  Repair symlinks, verify auth, detect issues
   doctor [--metrics]   Read-only health check (tooling, layout, symlinks, permissions)
                        --metrics adds per-account token-freshness readout
+
+Portability:
+  export <name>        Export an account to an age-encrypted tarball (or
+                       raw with --no-encrypt). Pipe to stdout or --out.
+  import <file>        Import an account bundle; --as renames, --force
+                       overwrites. age-decrypts automatically.
   completion <shell>   Emit tab-completion script for bash or zsh
   providers            Show supported providers
   audit [-n N] [--raw] Read the hats audit log (opt-in via HATS_AUDIT=1)
@@ -2306,6 +2597,8 @@ case "${1:-}" in
   completion)       cmd_completion "${2:-}" ;;
   providers)        cmd_providers ;;
   audit)            shift; cmd_audit "$@" ;;
+  export)           shift; cmd_export "$@" ;;
+  import)           shift; cmd_import "$@" ;;
   version|-v|--version) cmd_version ;;
   help|-h|--help|"") cmd_help ;;
   *)

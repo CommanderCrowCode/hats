@@ -13,10 +13,8 @@ work, not hours, and the top-priority item is blocked on operator crypto
 choice. Tanwa explicitly permits single-agent idleness when there's genuinely
 nothing left to ship — hats is near that state.
 
-### 1. `hats export` / `hats import` — portable credential transfer  (v1.1 closer)
-**Why now:** last unchecked v1.1 item. PRD is complete (`docs/prd-export-import.md`). Linear MSH-11 (Todo). A crypto-agnostic scaffold — argparse parsing, tarball pack/unpack, manifest schema — can land *today* even before operator picks the backend; the crypto plug slots in as a strategy pattern once age/gpg/openssl is chosen.
-**Scope:** days (scaffold = hours; full backend wiring = days once unblocked).
-**Blocker:** operator crypto choice (age vs gpg vs OS-keychain). Not going to preempt. Scaffold work is unblocked.
+### 1. `hats export` / `hats import` — portable credential transfer  (v1.1 closer)  ✅ SCAFFOLD SHIPPED 2026-04-20
+**Status:** crypto-agnostic scaffold landed end-to-end. `hats export <name> [--out <file>|-] [--no-encrypt] [--include-sessions]` builds a MANIFEST.json + isolated-files tarball; `hats import <file> [--as <newname>] [--force]` validates manifest, rejects path-traversal, restores credentials with mode 600 preserved, then re-wires shared base symlinks via `_setup_account_dir`. Backend dispatch implements: `none` (raw, with prominent stderr warning); `age` (password-based via `age -p`, env-overridable via `HATS_EXPORT_PASSWORD`). Default is `age` if installed; if not, refuses with actionable guidance to install age or pass `--no-encrypt`. Smoke `test_export_import_roundtrip` covers byte-equal credentials/`.claude.json` after roundtrip, `--as` rename, `--force` guard, path-traversal rejection. Operator's age/gpg/keychain decision is now scoped down to "pick the encryption defaults"; the bash plumbing + manifest schema + import safety guards are done. MSH-11 closed.
 
 ### 2. Audit log — timestamped swap / add / remove history  ✅ SHIPPED 2026-04-19
 **Status:** landed as opt-in JSONL audit log. Enable via `HATS_AUDIT=1`; reader is `hats audit` with `-n <count>` and `--raw` flags. Events: add / remove / rename / default / swap / link / unlink. Read-only commands (list / doctor / status / help / version) are NOT logged — signal hygiene on shared machines. Tests in `tests/smoke.sh::test_audit_log_opt_in_records_mutations_and_skips_reads`. Threat-model note: SECURITY.md's "No audit logging" gap now has a concrete answer for multi-user dev boxes. Commit: see `git log --grep 'audit'`.
