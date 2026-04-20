@@ -2380,6 +2380,250 @@ PYEOF
   echo "Imported '$target' (from '$m_name', hats_version=$m_ver) into $target_dir." >&2
 }
 
+_verify_one_account() {
+  # Deep-verify one account's credentials and runtime surface. Distinct from
+  # `doctor`, which checks the layout (dirs, symlinks, permissions) — this
+  # walks the token semantics: is the JSON well-formed, is expiry still in
+  # the future or at least backed by a refresh token, are the required
+  # scopes present, does the provider CLI version read cleanly. Emits one
+  # line per check, prefixed with '    PASS'/'    WARN'/'    FAIL'. Sets
+  # the named issues/warnings counter variables by reference.
+  local name="$1"
+  local default="$2"
+  local -n _issues=$3
+  local -n _warnings=$4
+
+  local acct_dir cfile
+  acct_dir=$(_account_dir "$name")
+  cfile=$(_credential_file "$name")
+
+  local marker=" "
+  [ "$name" = "$default" ] && marker="*"
+  echo "  $marker $name"
+
+  if [ ! -f "$cfile" ]; then
+    echo "    FAIL credentials file missing: $(basename "$cfile")"
+    _issues=$((_issues + 1))
+    return
+  fi
+
+  # 1. JSON parse — reject anything that would silently null out in _token_info.
+  if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$cfile" 2>/dev/null; then
+    echo "    FAIL credentials file is not valid JSON"
+    _issues=$((_issues + 1))
+    return
+  fi
+  echo "    PASS credentials parse as JSON"
+
+  # 2. File mode — credentials should be 600 / 400.
+  local mode
+  mode=$(stat -c '%a' "$cfile" 2>/dev/null || stat -f '%Lp' "$cfile" 2>/dev/null || echo "?")
+  case "$mode" in
+    600|400) echo "    PASS credentials mode=$mode" ;;
+    *)       echo "    WARN credentials mode=$mode (expected 600 or 400)"; _warnings=$((_warnings + 1)) ;;
+  esac
+
+  # 3. Provider-specific token semantics.
+  case "$CURRENT_PROVIDER" in
+    claude)
+      local probe
+      probe=$(python3 - "$cfile" <<'PYEOF' 2>/dev/null
+import json, sys, time
+try:
+    d = json.load(open(sys.argv[1]))
+    auth = d.get('claudeAiOauth') or {}
+    if not auth:
+        print('error=no claudeAiOauth key')
+        sys.exit(0)
+    exp_ms = auth.get('expiresAt')
+    if not isinstance(exp_ms, (int, float)):
+        print('error=expiresAt missing or non-numeric')
+        sys.exit(0)
+    now_s = time.time()
+    horizon_h = (exp_ms / 1000 - now_s) / 3600
+    print(f'horizon_h={horizon_h:.2f}')
+    print(f'has_refresh={bool(auth.get("refreshToken"))}')
+    scopes = auth.get('scopes') or []
+    print(f'has_rc={"user:sessions:claude_code" in scopes}')
+    print(f'scopes={",".join(scopes) if scopes else "(none)"}')
+except Exception as e:
+    print(f'error={e}')
+PYEOF
+)
+      local err="" horizon="" has_refresh="" has_rc="" scopes=""
+      local _k _v
+      while IFS='=' read -r _k _v; do
+        case "$_k" in
+          error)       err="$_v" ;;
+          horizon_h)   horizon="$_v" ;;
+          has_refresh) has_refresh="$_v" ;;
+          has_rc)      has_rc="$_v" ;;
+          scopes)      scopes="$_v" ;;
+        esac
+      done <<< "$probe"
+
+      if [ -n "$err" ]; then
+        echo "    FAIL claude token: $err"
+        _issues=$((_issues + 1))
+        return
+      fi
+
+      # Expiry horizon. Claude access tokens are ~8h; positive horizon is ok;
+      # negative with refresh token is auto-recoverable; negative without
+      # refresh token is a hard fail (the operator must /login again).
+      local neg=0
+      case "$horizon" in
+        -*) neg=1 ;;
+      esac
+      if [ "$neg" = "0" ]; then
+        echo "    PASS token expiry in ${horizon}h"
+      elif [ "$has_refresh" = "True" ]; then
+        echo "    WARN access token expired (${horizon}h) but refreshToken present — will auto-refresh"
+        _warnings=$((_warnings + 1))
+      else
+        echo "    FAIL token expired (${horizon}h) and no refreshToken — /login required"
+        _issues=$((_issues + 1))
+      fi
+
+      # RC-scope presence is warn-only: some operators deliberately use non-RC
+      # accounts for automation that doesn't need remote-control.
+      if [ "$has_rc" = "True" ]; then
+        echo "    PASS remote-control scope present"
+      else
+        echo "    WARN no remote-control scope (scopes: $scopes)"
+        _warnings=$((_warnings + 1))
+      fi
+      ;;
+    codex)
+      local probe
+      probe=$(python3 - "$cfile" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    tokens = d.get('tokens') or {}
+    if not tokens:
+        print('error=no tokens key')
+        sys.exit(0)
+    print(f'present=True')
+    print(f'account_id={tokens.get("account_id", "")}')
+except Exception as e:
+    print(f'error={e}')
+PYEOF
+)
+      local err="" present="" acct_id=""
+      local _k _v
+      while IFS='=' read -r _k _v; do
+        case "$_k" in
+          error)      err="$_v" ;;
+          present)    present="$_v" ;;
+          account_id) acct_id="$_v" ;;
+        esac
+      done <<< "$probe"
+
+      if [ -n "$err" ]; then
+        echo "    FAIL codex token: $err"
+        _issues=$((_issues + 1))
+        return
+      fi
+      if [ "$present" = "True" ]; then
+        echo "    PASS codex tokens present (account_id=${acct_id:-unknown})"
+      else
+        echo "    FAIL codex tokens missing"
+        _issues=$((_issues + 1))
+      fi
+
+      # config.toml credential-store mode — 'file' is the only hats-supported
+      # value; 'keyring'/'auto' breaks the per-account isolation promise.
+      if [ -f "$acct_dir/config.toml" ]; then
+        local store
+        store=$(grep '^cli_auth_credentials_store' "$acct_dir/config.toml" 2>/dev/null \
+                | head -1 | sed -E 's/^[^=]*=[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' | tr -d '[:space:]')
+        case "$store" in
+          file)  echo "    PASS config.toml cli_auth_credentials_store=file" ;;
+          '')    echo "    WARN config.toml has no cli_auth_credentials_store line"; _warnings=$((_warnings + 1)) ;;
+          *)     echo "    FAIL config.toml cli_auth_credentials_store=$store (hats requires 'file')"; _issues=$((_issues + 1)) ;;
+        esac
+      fi
+      ;;
+  esac
+}
+
+cmd_verify() {
+  local only="" all=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)     all=1 ;;
+      -h|--help)
+        cat <<EOF
+Usage: $(_hats_cmd_prefix) verify [<account>|--all]
+
+Deep per-account semantic check that complements 'hats doctor' (layout
+checks). Walks token internals: JSON parse, file permissions, expiry
+horizon, scope presence, and provider-specific sanity. Read-only; never
+mutates state.
+
+  <account>   Verify only the named account (default).
+  --all       Verify every account in the active provider's tree.
+
+Exit 0 if no failures, 1 otherwise.
+EOF
+        return 0
+        ;;
+      --*)       die "Unknown verify flag '$1'. Try '$(_hats_cmd_prefix) verify --help'." ;;
+      *)         [ -z "$only" ] && only="$1" || die "verify takes at most one account name" ;;
+    esac
+    shift || true
+  done
+
+  [ -d "$PROVIDER_DIR" ] || die "hats not initialized for $CURRENT_PROVIDER. Run '$(_hats_cmd_prefix) init'."
+
+  echo "Running hats verify for $CURRENT_PROVIDER..."
+
+  # Tooling preflight — matches doctor's first section, but terser since verify
+  # focuses on the accounts themselves.
+  local issues=0 warnings=0
+  if command -v python3 >/dev/null 2>&1; then
+    echo "  OK   python3 found"
+  else
+    echo "  FAIL python3 not on PATH (cannot parse credential JSON)"
+    issues=$((issues + 1))
+  fi
+  if command -v "$RUNTIME_COMMAND" >/dev/null 2>&1; then
+    local ver
+    ver=$("$RUNTIME_COMMAND" --version 2>/dev/null | head -1)
+    echo "  OK   $RUNTIME_COMMAND found${ver:+ ($ver)}"
+  else
+    echo "  WARN $RUNTIME_COMMAND not on PATH — accounts can't launch sessions"
+    warnings=$((warnings + 1))
+  fi
+
+  local default
+  default=$(_default_account)
+
+  # Pick the account set to verify.
+  local names
+  if [ "$all" = "1" ]; then
+    names=$(_accounts)
+  elif [ -n "$only" ]; then
+    _account_exists "$only" || die "Account '$only' not found."
+    names="$only"
+  else
+    if [ -n "$default" ]; then
+      names="$default"
+    else
+      die "no default account set; use '$(_hats_cmd_prefix) verify <account>' or '--all'."
+    fi
+  fi
+
+  for name in $names; do
+    _verify_one_account "$name" "$default" issues warnings
+  done
+
+  echo ""
+  echo "Done. $issues issue(s), $warnings warning(s)."
+  [ "$issues" -eq 0 ]
+}
+
 cmd_providers() {
   echo "Supported providers:"
   echo "  claude"
@@ -2511,6 +2755,8 @@ Maintenance:
   fix                  Repair symlinks, verify auth, detect issues
   doctor [--metrics]   Read-only health check (tooling, layout, symlinks, permissions)
                        --metrics adds per-account token-freshness readout
+  verify [acct|--all]  Deep per-account token check (JSON, expiry, scopes,
+                       permissions) — complements doctor's layout checks
 
 Portability:
   export <name>        Export an account to an age-encrypted tarball (or
@@ -2594,6 +2840,7 @@ case "${1:-}" in
   shell-init)       shift; cmd_shell_init "$@" ;;
   fix)              cmd_fix | _colorize_stream; exit "${PIPESTATUS[0]}" ;;
   doctor)           shift; cmd_doctor "$@" | _colorize_stream; exit "${PIPESTATUS[0]}" ;;
+  verify)           shift; cmd_verify "$@" | _colorize_stream; exit "${PIPESTATUS[0]}" ;;
   completion)       cmd_completion "${2:-}" ;;
   providers)        cmd_providers ;;
   audit)            shift; cmd_audit "$@" ;;

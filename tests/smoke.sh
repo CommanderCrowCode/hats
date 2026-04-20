@@ -1083,6 +1083,101 @@ EOF
   fi
 }
 
+test_verify_command() {
+  # `hats verify` (roadmap #3) — deep per-account semantic check that
+  # complements doctor's layout check. Exercises:
+  #   (a) --help prints usage (rc=0, mentions --all + "token internals").
+  #   (b) A well-formed + non-expired RC-scope token -> rc=0, no issues.
+  #   (c) An expired token with refreshToken -> WARN (not FAIL).
+  #   (d) A non-JSON credentials file -> FAIL (rc=1).
+  #   (e) Unknown flag -> non-zero rc + "Unknown verify flag" error.
+  #   (f) Nonexistent account name -> non-zero rc + "not found" error.
+
+  local future_ms past_ms
+  future_ms=$(python3 -c 'import time; print(int((time.time()+86400)*1000))')
+  past_ms=$(python3 -c 'import time; print(int((time.time()-86400)*1000))')
+
+  local ok_acct="$HATS_DIR/claude/verifyok"
+  local exp_acct="$HATS_DIR/claude/verifyexp"
+  local bad_acct="$HATS_DIR/claude/verifybad"
+  mkdir -p "$ok_acct" "$exp_acct" "$bad_acct"
+  cat > "$ok_acct/.credentials.json" <<EOF
+{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":$future_ms,"scopes":["user:sessions:claude_code"]}}
+EOF
+  chmod 600 "$ok_acct/.credentials.json"
+  cat > "$exp_acct/.credentials.json" <<EOF
+{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":$past_ms,"scopes":["user:sessions:claude_code"]}}
+EOF
+  chmod 600 "$exp_acct/.credentials.json"
+  echo "not json at all" > "$bad_acct/.credentials.json"
+  chmod 600 "$bad_acct/.credentials.json"
+
+  # (a) --help
+  local out rc
+  out=$("$HATS_SCRIPT" verify --help 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] || ! echo "$out" | grep -q -- '--all' \
+     || ! echo "$out" | grep -qi 'token internals'; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "verify --help missing usage or flag docs (rc=$rc)"
+    return
+  fi
+
+  # (b) healthy account -> rc=0, no FAIL lines
+  out=$("$HATS_SCRIPT" verify verifyok 2>&1) || true
+  if ! echo "$out" | grep -q 'PASS token expiry' \
+     || ! echo "$out" | grep -q 'PASS remote-control scope present' \
+     || ! echo "$out" | grep -q '0 issue'; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "verify healthy account did not pass cleanly"
+    return
+  fi
+
+  # (c) expired-with-refresh -> WARN (not FAIL), rc=0
+  rc=0
+  out=$("$HATS_SCRIPT" verify verifyexp 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ] \
+     || ! echo "$out" | grep -q 'WARN access token expired' \
+     || echo "$out" | grep -Eq '^\s+FAIL'; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "verify expired-with-refresh should WARN, not FAIL (rc=$rc)"
+    return
+  fi
+
+  # (d) non-JSON -> FAIL, rc=1
+  rc=0
+  out=$("$HATS_SCRIPT" verify verifybad 2>&1) || rc=$?
+  if [ "$rc" -eq 0 ] \
+     || ! echo "$out" | grep -q 'FAIL credentials file is not valid JSON'; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "verify on non-JSON credentials should FAIL (rc=$rc)"
+    return
+  fi
+
+  # (e) unknown flag
+  rc=0
+  out=$("$HATS_SCRIPT" verify --bogus 2>&1) || rc=$?
+  if [ "$rc" -eq 0 ] || ! echo "$out" | grep -qi 'Unknown verify flag'; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "verify --bogus should reject (rc=$rc)"
+    return
+  fi
+
+  # (f) nonexistent account
+  rc=0
+  out=$("$HATS_SCRIPT" verify does-not-exist 2>&1) || rc=$?
+  if [ "$rc" -eq 0 ] || ! echo "$out" | grep -q "not found"; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "verify on nonexistent account should reject (rc=$rc)"
+    return
+  fi
+
+  # Cleanup our staged verify accounts.
+  rm -rf "$ok_acct" "$exp_acct" "$bad_acct"
+
+  ok "verify deep-checks token semantics (JSON, expiry+refresh, scopes, unknown flag, missing account)"
+}
+
 test_export_import_roundtrip() {
   # `hats export` + `hats import` (roadmap #1 / MSH-11) — crypto-agnostic
   # scaffold. Verify the unencrypted path: export a staged account to a
@@ -1419,6 +1514,7 @@ test_install_check_gates_on_smoke
 test_install_is_idempotent_on_reinstall
 test_config_migration_is_idempotent
 test_doctor_metrics_flag
+test_verify_command
 test_export_import_roundtrip
 test_list_filter_flags
 test_fleet_symmetry_check_runs_clean
