@@ -1327,6 +1327,76 @@ PYEOF
   ok "export/import roundtrip preserves bytes + permissions; --as + --force guard; path-traversal rejected"
 }
 
+test_export_openssl_backend() {
+  # `--backend openssl` enables non-interactive AES-256-CBC + PBKDF2 export
+  # (passphrase from HATS_EXPORT_PASSWORD env). Verifies:
+  #   (a) round-trip via openssl backend reproduces credentials byte-equal
+  #   (b) encrypted file starts with "Salted__" (openssl enc -salt magic)
+  #   (c) missing HATS_EXPORT_PASSWORD on export → die with clear message
+  #   (d) --backend bogus → die with supported-list message
+  #   (e) --backend + --no-encrypt mutual-exclusion → die
+  # Skips if openssl isn't on PATH (extremely rare, but be portable).
+  command -v openssl >/dev/null 2>&1 \
+    || { ok "(skipped) openssl not on PATH — openssl-backend test"; return; }
+
+  local future_ms
+  future_ms=$(python3 -c 'import time; print(int((time.time()+86400)*1000))')
+
+  local src="$HATS_DIR/claude/opensslsrc"
+  mkdir -p "$src"
+  cat > "$src/.credentials.json" <<EOF
+{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":$future_ms,"scopes":["user:sessions:claude_code"]}}
+EOF
+  chmod 600 "$src/.credentials.json"
+  printf '{"smoke":"openssl"}' > "$src/.claude.json"
+
+  local bundle="$SANDBOX_ROOT/openssl.bundle"
+
+  # (c) export without password should die.
+  local rc=0
+  HATS_EXPORT_PASSWORD="" "$HATS_SCRIPT" export opensslsrc --backend openssl --out "$bundle" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    die "openssl backend without HATS_EXPORT_PASSWORD should refuse"
+    return
+  fi
+
+  # (a)+(b) export with password and verify magic + roundtrip.
+  HATS_EXPORT_PASSWORD="smoke-passphrase-not-secret" \
+    "$HATS_SCRIPT" export opensslsrc --backend openssl --out "$bundle" >/dev/null 2>&1 \
+    || { die "openssl-backed export failed"; return; }
+  [ -s "$bundle" ] || { die "openssl bundle is empty"; return; }
+  local magic
+  magic=$(head -c 8 "$bundle")
+  [ "$magic" = "Salted__" ] || { die "openssl bundle missing 'Salted__' magic (got: $magic)"; return; }
+
+  local target_root="$SANDBOX_ROOT/openssl-target"
+  local target_hats="$target_root/.hats"
+  local target_home="$target_root"
+  mkdir -p "$target_home"
+  env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" init >/dev/null 2>&1
+  env HATS_DIR="$target_hats" HOME="$target_home" \
+    HATS_EXPORT_PASSWORD="smoke-passphrase-not-secret" \
+    "$HATS_SCRIPT" import "$bundle" >/dev/null 2>&1 \
+    || { die "openssl-backed import failed"; return; }
+
+  cmp "$src/.credentials.json" "$target_hats/claude/opensslsrc/.credentials.json" \
+    || { die "openssl roundtrip credentials drift"; return; }
+
+  # (d) bogus backend
+  rc=0
+  "$HATS_SCRIPT" export opensslsrc --backend bogus --out "$bundle" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ne 0 ] || { die "--backend bogus should refuse"; return; }
+
+  # (e) --backend + --no-encrypt mutex
+  rc=0
+  "$HATS_SCRIPT" export opensslsrc --backend age --no-encrypt --out "$bundle" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ne 0 ] || { die "--backend + --no-encrypt should refuse"; return; }
+
+  rm -rf "$src"
+
+  ok "openssl backend roundtrips byte-equal + Salted__ magic + missing-pass + bogus-backend + mutex guards"
+}
+
 test_doctor_metrics_flag() {
   # `hats doctor --metrics` adds a per-account token-freshness section using
   # credential-file mtime as a "last activity" proxy (roadmap #8). Verify:
@@ -1585,6 +1655,7 @@ test_doctor_metrics_flag
 test_call_provider_variant_dispatch
 test_verify_command
 test_export_import_roundtrip
+test_export_openssl_backend
 test_list_filter_flags
 test_fleet_symmetry_check_runs_clean
 

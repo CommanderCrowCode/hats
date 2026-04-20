@@ -2133,16 +2133,21 @@ ZSH_COMPLETION
 _export_import_usage() {
   cat <<EOF
 Usage:
-  $(_hats_cmd_prefix) export <name> [--out <file>|-] [--no-encrypt] [--include-sessions]
+  $(_hats_cmd_prefix) export <name> [--out <file>|-] [--backend <auto|age|openssl|none>]
+                        [--no-encrypt] [--include-sessions]
   $(_hats_cmd_prefix) import <file> [--as <newname>] [--force]
 
 export
   --out <file>          Write to file instead of stdout. Default: stdout when
                         stdout is a pipe/file, else rejects for safety.
-  --no-encrypt          Emit raw tarball (UNSAFE — credentials in clear).
-                        Default: encrypt via 'age -p' (password-based) if age
-                        is on PATH; else refuses with guidance to install age
-                        or pass --no-encrypt explicitly.
+  --backend <name>      Encryption backend (default: auto).
+                          auto      — pick best available (age > openssl > none-with-error).
+                          age       — interactive 'age -p' (passphrase prompt).
+                          openssl   — non-interactive AES-256-CBC + PBKDF2,
+                                      passphrase from HATS_EXPORT_PASSWORD env.
+                          none      — raw tarball (alias for --no-encrypt).
+  --no-encrypt          Shorthand for --backend none. Emits raw tarball with
+                        a stderr warning.
   --include-sessions    Include sessions/ dir. Default: excluded (per-machine).
 
 import
@@ -2151,16 +2156,18 @@ import
                         refuse with a clear error.
 
 Environment:
-  HATS_EXPORT_PASSWORD  Non-interactive password for age-encrypted bundles.
-                        Ignored when --no-encrypt is set.
+  HATS_EXPORT_PASSWORD  Required for the openssl backend (passphrase). Used by
+                        both export-encrypt and import-decrypt. age-backed
+                        bundles ignore this — age always prompts.
 EOF
 }
 
 _hats_supported_export_backends() {
   # Echo the set of encryption backends this host can perform. Order is
   # priority-descending; the first available is preferred when the operator
-  # doesn't pick explicitly. 'none' is always listed (rawcase).
-  if command -v age >/dev/null 2>&1; then echo "age"; fi
+  # doesn't pick explicitly. 'none' is always listed (raw-tar fallback).
+  command -v age     >/dev/null 2>&1 && echo "age"
+  command -v openssl >/dev/null 2>&1 && echo "openssl"
   echo "none"
 }
 
@@ -2191,11 +2198,13 @@ PYEOF
 }
 
 cmd_export() {
-  local name="" out="" no_encrypt=0 include_sessions=0
+  local name="" out="" no_encrypt=0 include_sessions=0 requested_backend=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --out)            shift; [ $# -gt 0 ] || die "$(_export_import_usage)"; out="$1" ;;
       --out=*)          out="${1#--out=}" ;;
+      --backend)        shift; [ $# -gt 0 ] || die "$(_export_import_usage)"; requested_backend="$1" ;;
+      --backend=*)      requested_backend="${1#--backend=}" ;;
       --no-encrypt)     no_encrypt=1 ;;
       --include-sessions) include_sessions=1 ;;
       -h|--help)        _export_import_usage; return 0 ;;
@@ -2242,14 +2251,40 @@ cmd_export() {
     cp -a "$acct_dir/sessions" "$stage/sessions"
   fi
 
-  # Pick backend. `--no-encrypt` wins; otherwise prefer age; else error out
-  # with actionable guidance so operator isn't silently downgraded to raw.
-  local backend="age"
+  # Pick backend. Resolution order:
+  #   1. Explicit --backend wins (validated against the supported set + a
+  #      tooling availability check so operator gets a clear error rather
+  #      than a confusing downstream failure).
+  #   2. --no-encrypt is shorthand for --backend none.
+  #   3. Otherwise: auto — prefer age (if installed) for interactive use,
+  #      then openssl (if installed AND HATS_EXPORT_PASSWORD is set, since
+  #      openssl-without-pass would prompt anyway and we'd lose the
+  #      automation-friendly path), then refuse with guidance.
+  local backend=""
+  if [ -n "$requested_backend" ] && [ "$no_encrypt" = "1" ]; then
+    die "--backend and --no-encrypt are mutually exclusive."
+  fi
   if [ "$no_encrypt" = "1" ]; then
     backend="none"
+  elif [ -n "$requested_backend" ]; then
+    backend="$requested_backend"
+    case "$backend" in
+      age)     command -v age     >/dev/null 2>&1 || die "--backend age requested but 'age' not on PATH." ;;
+      openssl) command -v openssl >/dev/null 2>&1 || die "--backend openssl requested but 'openssl' not on PATH." ;;
+      none)    : ;;
+      *)       die "Unknown --backend '$backend'. Supported: auto, age, openssl, none." ;;
+    esac
+  else
+    if command -v age >/dev/null 2>&1; then
+      backend="age"
+    elif command -v openssl >/dev/null 2>&1 && [ -n "${HATS_EXPORT_PASSWORD:-}" ]; then
+      backend="openssl"
+    else
+      die "no encryption backend available — install 'age' (interactive) or set HATS_EXPORT_PASSWORD + ensure 'openssl' is on PATH (non-interactive). Or pass --no-encrypt explicitly."
+    fi
+  fi
+  if [ "$backend" = "none" ]; then
     echo "WARN: exporting credentials unencrypted. Anyone with this file can impersonate the account." >&2
-  elif ! command -v age >/dev/null 2>&1; then
-    die "age not on PATH — install 'age' or re-run with --no-encrypt (not recommended)."
   fi
 
   local out_target="$out"
@@ -2275,21 +2310,28 @@ cmd_export() {
       tar -cf - -C "$stage" "${entries[@]}" > "$out_target"
       ;;
     age)
-      # age -p reads passphrase interactively from /dev/tty (not stdin).
-      # Piping tar's bytes into age occupies stdin, so there's no reliable
-      # non-interactive-password path with stock `age -p` — an earlier
-      # `<<<"$HATS_EXPORT_PASSWORD"` attempt was a no-op because the pipe
-      # overrides the herestring on the same stdin. Honest behavior: always
-      # prompt. If HATS_EXPORT_PASSWORD is set in the env, we note that
-      # age will ignore it and prompt anyway — and encourage the operator
-      # to use `--no-encrypt` for automation (with the stderr WARN already
-      # in place) or pipe their own age invocation.
+      # age -p reads passphrase interactively from /dev/tty. Piping tar's
+      # bytes into age occupies stdin so there's no env-var override path
+      # for stock age — for automation the operator should pick the openssl
+      # backend (HATS_EXPORT_PASSWORD honored).
       if [ -n "${HATS_EXPORT_PASSWORD:-}" ]; then
-        echo "WARN: HATS_EXPORT_PASSWORD is set but age -p always prompts interactively; env var ignored." >&2
+        echo "WARN: HATS_EXPORT_PASSWORD is set but age -p always prompts interactively; use '--backend openssl' for non-interactive." >&2
       fi
       tar -cf - -C "$stage" "${entries[@]}" \
         | age -p -o "$out_target" \
         || die "age encryption failed"
+      ;;
+    openssl)
+      # AES-256-CBC + PBKDF2 (100k iterations, modern default in openssl 3+).
+      # Passphrase from HATS_EXPORT_PASSWORD env var via openssl's
+      # `-pass env:` so it never appears on the command line (C-6 compliance —
+      # bearer-token-in-argv antipattern).
+      [ -n "${HATS_EXPORT_PASSWORD:-}" ] \
+        || die "openssl backend requires HATS_EXPORT_PASSWORD env var for the passphrase."
+      tar -cf - -C "$stage" "${entries[@]}" \
+        | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt \
+            -pass env:HATS_EXPORT_PASSWORD -out "$out_target" \
+        || die "openssl encryption failed (check HATS_EXPORT_PASSWORD)."
       ;;
   esac
 
@@ -2340,20 +2382,29 @@ cmd_import() {
   stage=$(mktemp -d -t hats-import-XXXXXX) || die "mktemp failed"
   trap 'rm -rf "$stage"' RETURN
 
-  # Sniff: age magic starts "age-encryption.org/v1" in header. Any other
-  # non-tar prefix → error. Raw tarballs start with POSIX ustar header at
-  # offset 257, but the first 512 bytes contain the filename, so just
-  # attempt age-decrypt if magic matches, else treat as tarball.
+  # Sniff the file header to pick a decryption path:
+  #   - age      → first bytes are "age-encryption.org/v1"
+  #   - openssl  → first bytes are "Salted__" (openssl enc -salt magic)
+  #   - raw tar  → fallthrough; cp + extract.
   local decrypted="$stage/bundle.tar"
-  if head -c 64 "$in_file" 2>/dev/null | grep -q 'age-encryption.org'; then
+  local header
+  header=$(head -c 64 "$in_file" 2>/dev/null || true)
+  if printf '%s' "$header" | grep -q 'age-encryption.org'; then
     command -v age >/dev/null 2>&1 || die "archive is age-encrypted but 'age' is not on PATH."
+    # age herestring + pipe collision is the same as in cmd_export — leave
+    # age in interactive mode; no env-var path.
     if [ -n "${HATS_EXPORT_PASSWORD:-}" ]; then
-      age -d -o "$decrypted" "$in_file" <<<"$HATS_EXPORT_PASSWORD" 2>/dev/null \
-        || die "age decryption failed (check HATS_EXPORT_PASSWORD)"
-    else
-      age -d -o "$decrypted" "$in_file" \
-        || die "age decryption failed"
+      echo "WARN: HATS_EXPORT_PASSWORD is set but age -d prompts interactively; env var ignored." >&2
     fi
+    age -d -o "$decrypted" "$in_file" \
+      || die "age decryption failed"
+  elif printf '%s' "$header" | grep -q '^Salted__'; then
+    command -v openssl >/dev/null 2>&1 || die "archive is openssl-encrypted but 'openssl' is not on PATH."
+    [ -n "${HATS_EXPORT_PASSWORD:-}" ] \
+      || die "openssl-encrypted archive requires HATS_EXPORT_PASSWORD env var for decryption."
+    openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+        -pass env:HATS_EXPORT_PASSWORD -in "$in_file" -out "$decrypted" \
+      || die "openssl decryption failed (check HATS_EXPORT_PASSWORD or wrong-cipher archive)."
   else
     cp "$in_file" "$decrypted"
   fi
