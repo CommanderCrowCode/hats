@@ -14,6 +14,14 @@
 
 set -euo pipefail
 
+# SC2030/SC2031: test_export_import_roundtrip intentionally shadows
+# HATS_DIR + HOME inside a subshell to give the import-target a fresh
+# layout. shellcheck's tracking is global — once it sees the shadow, it
+# warns on every later HATS_DIR / HOME reference even though those refer
+# to the outer-scope values (which is exactly what the rest of the suite
+# wants). Disable file-wide; the shadow is intentional and documented.
+# shellcheck disable=SC2030,SC2031
+
 HATS_SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/hats"
 HATS_REPO="$(dirname "$HATS_SCRIPT")"
 [ -x "$HATS_SCRIPT" ] || { echo "missing or non-executable hats at $HATS_SCRIPT" >&2; exit 1; }
@@ -1263,9 +1271,8 @@ EOF
   local target_root="$SANDBOX_ROOT/import-target"
   mkdir -p "$target_root"
   # The subshell intentionally shadows HATS_DIR + HOME so it doesn't leak
-  # into the outer suite; later tests must see the ORIGINAL HATS_DIR, which
-  # is exactly shellcheck's SC2030/SC2031 warning inverted. Disable locally.
-  # shellcheck disable=SC2030
+  # into the outer suite; later tests must see the ORIGINAL HATS_DIR.
+  # File-level SC2030/SC2031 disable is at the top of this file.
   (
     export HATS_DIR="$target_root/.hats"
     export HOME="$target_root"

@@ -2256,9 +2256,9 @@ cmd_export() {
   [ "$out_target" = "-" ] && out_target=/dev/stdout
 
   # Build the tarball entry list from the actual stage/ contents (dotfiles
-  # included). Avoids `ls | grep` antipatterns + word-splitting issues that
-  # shellcheck flags at SC2010/SC2046; compgen-and-iterate captures names
-  # exactly without re-parsing ls output.
+  # included). Avoids ls-pipe-grep + word-splitting issues that the linter
+  # flags as SC2010/SC2046; the explicit-glob loop captures names exactly
+  # without re-parsing ls output.
   local -a entries=(MANIFEST.json)
   local bn
   for bn in "$stage"/.* "$stage"/*; do
