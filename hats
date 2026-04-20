@@ -830,7 +830,7 @@ _sync_new_account_defaults() {
   fi
 }
 
-_init_claude_provider() {
+_init_provider_claude() {
   local claude_dir="$RUNTIME_DIR"
 
   if [ -d "$claude_dir" ]; then
@@ -915,7 +915,7 @@ _init_claude_provider() {
   fi
 }
 
-_init_codex_provider() {
+_init_provider_codex() {
   local codex_dir="$RUNTIME_DIR"
   mkdir -p "$BASE_DIR"
   _ensure_codex_base_config
@@ -992,10 +992,7 @@ cmd_init() {
 
   mkdir -p "$PROVIDER_DIR"
 
-  case "$CURRENT_PROVIDER" in
-    claude) _init_claude_provider ;;
-    codex) _init_codex_provider ;;
-  esac
+  _call_provider_variant init_provider
 
   _config_set "version" "$VERSION"
 
