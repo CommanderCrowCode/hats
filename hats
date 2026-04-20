@@ -2200,7 +2200,13 @@ cmd_export() {
       --include-sessions) include_sessions=1 ;;
       -h|--help)        _export_import_usage; return 0 ;;
       --*)              die "Unknown export flag '$1'. See '$(_hats_cmd_prefix) export --help'." ;;
-      *)                [ -z "$name" ] && name="$1" || die "export takes exactly one account name" ;;
+      *)
+        if [ -z "$name" ]; then
+          name="$1"
+        else
+          die "export takes exactly one account name"
+        fi
+        ;;
     esac
     shift || true
   done
@@ -2249,21 +2255,41 @@ cmd_export() {
   local out_target="$out"
   [ "$out_target" = "-" ] && out_target=/dev/stdout
 
+  # Build the tarball entry list from the actual stage/ contents (dotfiles
+  # included). Avoids `ls | grep` antipatterns + word-splitting issues that
+  # shellcheck flags at SC2010/SC2046; compgen-and-iterate captures names
+  # exactly without re-parsing ls output.
+  local -a entries=(MANIFEST.json)
+  local bn
+  for bn in "$stage"/.* "$stage"/*; do
+    [ -e "$bn" ] || continue
+    bn=$(basename "$bn")
+    case "$bn" in
+      '.'|'..'|MANIFEST.json) continue ;;
+    esac
+    entries+=("$bn")
+  done
+
   case "$backend" in
     none)
-      tar -cf - -C "$stage" MANIFEST.json $(ls -A "$stage" | grep -v '^MANIFEST.json$') > "$out_target"
+      tar -cf - -C "$stage" "${entries[@]}" > "$out_target"
       ;;
     age)
-      # Password source: HATS_EXPORT_PASSWORD if set, else age prompts.
+      # age -p reads passphrase interactively from /dev/tty (not stdin).
+      # Piping tar's bytes into age occupies stdin, so there's no reliable
+      # non-interactive-password path with stock `age -p` — an earlier
+      # `<<<"$HATS_EXPORT_PASSWORD"` attempt was a no-op because the pipe
+      # overrides the herestring on the same stdin. Honest behavior: always
+      # prompt. If HATS_EXPORT_PASSWORD is set in the env, we note that
+      # age will ignore it and prompt anyway — and encourage the operator
+      # to use `--no-encrypt` for automation (with the stderr WARN already
+      # in place) or pipe their own age invocation.
       if [ -n "${HATS_EXPORT_PASSWORD:-}" ]; then
-        tar -cf - -C "$stage" MANIFEST.json $(ls "$stage" | grep -v '^MANIFEST.json$') \
-          | age -p -o "$out_target" <<<"$HATS_EXPORT_PASSWORD" 2>/dev/null \
-          || die "age encryption failed (check HATS_EXPORT_PASSWORD)"
-      else
-        tar -cf - -C "$stage" MANIFEST.json $(ls "$stage" | grep -v '^MANIFEST.json$') \
-          | age -p -o "$out_target" \
-          || die "age encryption failed"
+        echo "WARN: HATS_EXPORT_PASSWORD is set but age -p always prompts interactively; env var ignored." >&2
       fi
+      tar -cf - -C "$stage" "${entries[@]}" \
+        | age -p -o "$out_target" \
+        || die "age encryption failed"
       ;;
   esac
 
@@ -2296,7 +2322,13 @@ cmd_import() {
       --force) force=1 ;;
       -h|--help) _export_import_usage; return 0 ;;
       --*)     die "Unknown import flag '$1'. See '$(_hats_cmd_prefix) import --help'." ;;
-      *)       [ -z "$in_file" ] && in_file="$1" || die "import takes exactly one file path" ;;
+      *)
+        if [ -z "$in_file" ]; then
+          in_file="$1"
+        else
+          die "import takes exactly one file path"
+        fi
+        ;;
     esac
     shift || true
   done
@@ -2333,11 +2365,18 @@ cmd_import() {
   allowed=$(printf '%s\n' "$entries" | _validate_archive_entries) \
     || die "archive contains rejected entries; refusing to extract."
 
-  # Extract into stage/extracted/ using a safe flag set.
+  # Extract into stage/extracted/ using a safe flag set. Collect the allowed
+  # entries into an array so the tar call is word-splitting-safe even if an
+  # entry ever contains an unexpected character (defense-in-depth; the entry
+  # whitelist already normalizes names).
   mkdir -p "$stage/extracted"
+  local -a allowed_arr=()
+  while IFS= read -r _line; do
+    [ -n "$_line" ] && allowed_arr+=("$_line")
+  done <<< "$allowed"
   tar -xf "$decrypted" -C "$stage/extracted" \
       --no-same-owner --no-same-permissions \
-      $(printf '%s\n' "$allowed") \
+      "${allowed_arr[@]}" \
     || die "tar extraction failed."
 
   [ -f "$stage/extracted/MANIFEST.json" ] || die "MANIFEST.json missing from archive."
@@ -2610,7 +2649,13 @@ EOF
         return 0
         ;;
       --*)       die "Unknown verify flag '$1'. Try '$(_hats_cmd_prefix) verify --help'." ;;
-      *)         [ -z "$only" ] && only="$1" || die "verify takes at most one account name" ;;
+      *)
+        if [ -z "$only" ]; then
+          only="$1"
+        else
+          die "verify takes at most one account name"
+        fi
+        ;;
     esac
     shift || true
   done

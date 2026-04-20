@@ -1262,6 +1262,10 @@ EOF
   # Import into a fresh sandbox HATS_DIR so no staged fixture interferes.
   local target_root="$SANDBOX_ROOT/import-target"
   mkdir -p "$target_root"
+  # The subshell intentionally shadows HATS_DIR + HOME so it doesn't leak
+  # into the outer suite; later tests must see the ORIGINAL HATS_DIR, which
+  # is exactly shellcheck's SC2030/SC2031 warning inverted. Disable locally.
+  # shellcheck disable=SC2030
   (
     export HATS_DIR="$target_root/.hats"
     export HOME="$target_root"
@@ -1344,8 +1348,10 @@ EOF
     chmod 600 "$d/.credentials.json"
     echo '{}' > "$d/.claude.json"
   done
-  touch -d "45 days ago"  "$dormant/.credentials.json"
-  touch -d "120 days ago" "$ancient/.credentials.json"
+  # GNU `touch -d "N days ago"` is not portable to BSD touch on macOS —
+  # use python's os.utime for an OS-agnostic relative-mtime write.
+  python3 -c 'import os,sys,time; os.utime(sys.argv[1], (time.time()-45*86400,)*2)'  "$dormant/.credentials.json"
+  python3 -c 'import os,sys,time; os.utime(sys.argv[1], (time.time()-120*86400,)*2)' "$ancient/.credentials.json"
 
   # (a) bare doctor — no Metrics header in output.
   local plain
