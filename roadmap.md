@@ -41,10 +41,8 @@ nothing left to ship — hats is near that state.
 ### 8. Token refresh telemetry — `hats doctor --metrics`  ✅ SHIPPED 2026-04-19
 **Status:** landed. `hats doctor --metrics` adds a `Metrics — token freshness:` section under the existing health checks. Each account row shows `last refresh Nd ago (YYYY-MM-DD)`, derived from `.credentials.json` mtime (a strong "last activity" proxy because hats writes the refreshed token back at end-of-session). Dormancy WARNs: `WARN dormant` at >30d, `WARN very dormant` at >90d. Symmetric across claude + codex providers (both use the same mtime-based helper). Bare `hats doctor` is byte-identical to before — no behavior change without the flag. Smoke: `test_doctor_metrics_flag` covers (a) bare doctor doesn't emit the section, (b) section header + per-account lines render, (c) dormant + very-dormant tags fire on backdated accounts, (d) `--bogus` rejects with non-zero rc.
 
-### 9. macOS CI: pure-BSD userland lane
-**Why now:** current `macos-latest` GitHub Actions runners ship GNU grep + GNU coreutils by default; that masked the `grep -oP` BSD-incompatibility I caught in commit 48fc27e. A separate job that unsets Homebrew PATH prefixes and runs with pure BSD userland would catch the next portability regression at CI time instead of at user time.
-**Scope:** hours. Mostly a PATH-scrubbing step + shelling-out-guards in CI.
-**Blocker:** none. Low ROI unless another BSD-incompat is actually likely.
+### 9. macOS CI: pure-BSD userland lane  ✅ SHIPPED 2026-04-20
+**Status:** landed as a third job `smoke-macos-bsd` in `.github/workflows/smoke.yml`. Scrubs PATH to `/usr/bin:/bin:/usr/sbin:/sbin` before running syntax check, smoke suite, and basic surface probes — so tests run under the BSD versions of grep/sed/stat/awk that actual macOS users get, not the Homebrew-shadowed GNU versions the default runners use. Reports the active userland versions for visibility. The next BSD-incompat regression (see commit 48fc27e for the class) now fails at CI time instead of at user time.
 
 ### 10. Team credential sharing via encrypted git repo (from Future Ideas)
 **Why now:** aspirational v2.0+ feature. Depends on #1 + #7. Valuable for agencies / teams with multiple Claude Code subscriptions to share. Out of scope until crypto is settled.

@@ -54,3 +54,46 @@ jobs:
         run: |
           shellcheck --version
           shellcheck -S info hats install.sh tests/smoke.sh
+
+  smoke-macos-bsd:
+    # Pure-BSD userland lane. The default macos-latest runners ship
+    # /usr/local/bin + /opt/homebrew/bin ahead of /usr/bin on PATH, which
+    # means GNU coreutils / grep / sed shadow the BSD versions actual
+    # macOS users have. That masked the `grep -oP` BSD-incompat fixed in
+    # commit 48fc27e — the bug only surfaced at user-time. This job runs
+    # smoke under pure BSD tooling so the next such regression fails at
+    # CI time.
+    #
+    # Safe-by-construction: no github.event.* interpolation; all run:
+    # blocks operate on checked-out repo content + PATH-scoping only.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: scrub PATH of Homebrew / GNU prefixes
+        run: |
+          echo "PATH=/usr/bin:/bin:/usr/sbin:/sbin" >> "$GITHUB_ENV"
+
+      - name: report active userland
+        run: |
+          echo "PATH=$PATH"
+          command -v grep && grep --version 2>&1 | head -1 || true
+          command -v sed  && sed --version  2>&1 | head -1 || true
+          command -v bash && bash --version | head -1 || true
+
+      - name: shell syntax check (BSD bash)
+        run: |
+          bash -n hats
+          bash -n install.sh
+          bash -n tests/smoke.sh
+
+      - name: run smoke tests (BSD userland)
+        run: ./tests/smoke.sh
+
+      - name: surface commands (basic smoke, BSD userland)
+        run: |
+          chmod +x hats
+          ./hats help >/dev/null
+          ./hats version
+          ./hats completion bash | head -3
+          ./hats completion zsh  | head -3
