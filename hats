@@ -21,6 +21,22 @@ HATS_CONFIG="$HATS_DIR/config.toml"
 HATS_AUDIT="${HATS_AUDIT:-0}"
 HATS_AUDIT_LOG="${HATS_AUDIT_LOG:-$HATS_DIR/audit.log}"
 
+# ── Kimi backend-alias credential ────────────────────────────────────────────
+# Kimi (Moonshot) provides an Anthropic-compatible endpoint, so the stock
+# `claude` binary works against it via ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY.
+# hats treats `kimi` as a 4th credential slot (parallel to shannon/monet/
+# debussy) — same on-disk layout, different env-wiring on invocation.
+# Env-isolation is the critical invariant: NEVER export ANTHROPIC_BASE_URL or
+# ANTHROPIC_API_KEY globally; the shell function must inline-prefix them on
+# the `claude` command only. (Tanwa reports prior sessions were poisoned by
+# accidental `export` in .zshrc.)
+HATS_KIMI_ACCOUNT_NAME="kimi"
+HATS_KIMI_BASE_URL="${HATS_KIMI_BASE_URL:-https://api.moonshot.ai/anthropic}"
+HATS_KIMI_INFISICAL_SECRET_NAME="${HATS_KIMI_INFISICAL_SECRET_NAME:-KIMI_API_KEY}"
+HATS_KIMI_INFISICAL_PATH="${HATS_KIMI_INFISICAL_PATH:-/servers/tenacity}"
+HATS_KIMI_INFISICAL_PROJECT_ID="${HATS_KIMI_INFISICAL_PROJECT_ID:-635f03f1-ff77-445d-b352-5f1cd1f53ecc}"
+HATS_KIMI_ENV_FILE="${HATS_KIMI_ENV_FILE:-$HOME/.infisical.env}"
+
 CURRENT_PROVIDER="claude"
 PROVIDER_TITLE=""
 PROVIDER_DIR=""
@@ -1417,6 +1433,46 @@ HEADER
     [ "$CURRENT_PROVIDER" = "codex" ] && fn_name="codex_$name"
     if [ "$CURRENT_PROVIDER" = "codex" ]; then
       echo "${fn_name}() { $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND -c 'cli_auth_credentials_store=\"file\"' \"\$@\"; }"
+    elif [ "$CURRENT_PROVIDER" = "claude" ] && [ "$name" = "$HATS_KIMI_ACCOUNT_NAME" ]; then
+      # Kimi is API-key-backed, not OAuth — emit the specialized env-isolated
+      # function instead of the generic CLAUDE_CONFIG_DIR-swap one-liner. The
+      # env vars are inline-prefixed on the claude command (never exported)
+      # so the parent shell and subsequent sessions stay clean. Key is
+      # fetched from Infisical per-invocation via _kimi_fetch_api_key.
+      cat <<KIMIFN
+
+# Kimi backend-alias function — see 'hats kimi --help'.
+# Critical safety: ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY are inlined on the
+# claude invocation, NEVER exported. Verified by 'hats kimi doctor'.
+${fn_name}() {
+  local _kimi_key
+  _kimi_key=\$(
+    set +u
+    . "$HATS_KIMI_ENV_FILE" 2>/dev/null
+    _tok=\$(infisical login --method=universal-auth \\
+      --client-id="\$INFISICAL_UNIVERSAL_AUTH_CLIENT_ID" \\
+      --client-secret="\$INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET" \\
+      --silent --plain 2>/dev/null) || exit 1
+    [ -n "\$_tok" ] || exit 1
+    infisical secrets get "$HATS_KIMI_INFISICAL_SECRET_NAME" \\
+      --path "$HATS_KIMI_INFISICAL_PATH" \\
+      --projectId="$HATS_KIMI_INFISICAL_PROJECT_ID" \\
+      --plain --silent --token="\$_tok" 2>/dev/null
+  )
+  if [ -z "\$_kimi_key" ] || ! printf '%s' "\$_kimi_key" | head -c 3 | grep -q '^sk-'; then
+    echo "kimi: failed to fetch KIMI_API_KEY from Infisical — run 'hats kimi doctor'" >&2
+    unset _kimi_key
+    return 1
+  fi
+  ANTHROPIC_BASE_URL="$HATS_KIMI_BASE_URL" \\
+  ANTHROPIC_API_KEY="\$_kimi_key" \\
+  CLAUDE_CONFIG_DIR="$acct_dir" \\
+    $RUNTIME_COMMAND --dangerously-skip-permissions "\$@"
+  local _rc=\$?
+  unset _kimi_key
+  return \$_rc
+}
+KIMIFN
     else
       echo "${fn_name}() { $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND${extra_args} \"\$@\"; }"
     fi
@@ -2764,6 +2820,172 @@ EOF
   [ "$issues" -eq 0 ]
 }
 
+_kimi_fetch_api_key() {
+  # Fetch the Kimi API key from Infisical. Never prints the key; stdout is
+  # the key itself so callers can capture via `$(_kimi_fetch_api_key)`.
+  # On any failure path (auth, missing secret, CLI error) returns non-zero
+  # with a diagnostic on stderr; stdout stays empty rather than leaking
+  # partial output.
+  command -v infisical >/dev/null 2>&1 \
+    || { echo "kimi: 'infisical' CLI not on PATH; install + configure machine-identity auth." >&2; return 1; }
+  [ -f "$HATS_KIMI_ENV_FILE" ] \
+    || { echo "kimi: $HATS_KIMI_ENV_FILE missing — need INFISICAL_UNIVERSAL_AUTH_CLIENT_ID + _SECRET." >&2; return 1; }
+
+  # Subshell so the env-file sourcing doesn't leak into the caller's shell,
+  # and the token captured inside never escapes. All stdout from infisical's
+  # "new release available" banner goes to /dev/null; only the raw value
+  # reaches the outer capture.
+  (
+    # shellcheck disable=SC1090
+    set +u
+    . "$HATS_KIMI_ENV_FILE" 2>/dev/null
+    : "${INFISICAL_UNIVERSAL_AUTH_CLIENT_ID:?}" "${INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET:?}"
+    _tok=$(infisical login \
+      --method=universal-auth \
+      --client-id="$INFISICAL_UNIVERSAL_AUTH_CLIENT_ID" \
+      --client-secret="$INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET" \
+      --silent --plain 2>/dev/null) || exit 1
+    [ -n "$_tok" ] || exit 1
+    infisical secrets get "$HATS_KIMI_INFISICAL_SECRET_NAME" \
+      --path "$HATS_KIMI_INFISICAL_PATH" \
+      --projectId="$HATS_KIMI_INFISICAL_PROJECT_ID" \
+      --plain --silent --token="$_tok" 2>/dev/null
+  ) 2>/dev/null
+}
+
+_ensure_kimi_account_dir() {
+  # Create ~/.hats/claude/kimi/ with the standard claude-config skeleton.
+  # Unlike the OAuth-backed accounts, kimi has NO .credentials.json — the
+  # backend API key is fetched fresh from Infisical on every invocation.
+  # Shared base symlinks are wired via _setup_account_dir so the kimi
+  # session sees the same hooks/settings/agents tree as the other creds.
+  local acct_dir
+  acct_dir=$(_account_dir "$HATS_KIMI_ACCOUNT_NAME")
+  if [ -d "$acct_dir" ]; then
+    return 0
+  fi
+  [ -d "$PROVIDER_DIR" ] || die "hats not initialized. Run 'hats init' first."
+
+  mkdir -p "$acct_dir"
+  echo '{}' > "$acct_dir/.claude.json"
+  _setup_account_dir "$HATS_KIMI_ACCOUNT_NAME"
+  _audit_log "kimi-init" "account" "$HATS_KIMI_ACCOUNT_NAME"
+}
+
+cmd_kimi() {
+  # `hats kimi <subcmd>` — Kimi-specific operations that don't fit the
+  # generic add/remove flow (Kimi is API-key-backed, not OAuth).
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    init)
+      _ensure_kimi_account_dir
+      cat <<EOF
+Kimi account ready at $(_account_dir "$HATS_KIMI_ACCOUNT_NAME").
+
+Shell function is emitted by 'hats shell-init' — re-run:
+    eval "\$(hats shell-init)"
+
+Verify end-to-end with: hats kimi doctor
+EOF
+      ;;
+    doctor)
+      cmd_kimi_doctor
+      ;;
+    fetch-key)
+      # Dev convenience: print the key length + first 6 chars so operator
+      # can sanity-check the Infisical path without leaking the full secret.
+      local _k
+      _k=$(_kimi_fetch_api_key) || return 1
+      [ -n "$_k" ] || { echo "kimi: fetched an empty value" >&2; return 1; }
+      echo "kimi api key fetched: prefix=$(printf '%s' "$_k" | cut -c1-6)... length=${#_k}"
+      ;;
+    ''|-h|--help)
+      cat <<EOF
+Usage: hats kimi <subcommand>
+
+Subcommands:
+  init        Provision ~/.hats/claude/kimi/ directory for Kimi-backed sessions.
+  doctor      Verify Infisical fetch, endpoint reachability, env-isolation.
+  fetch-key   Fetch + print a key-prefix summary (no secret leaked).
+
+The 'kimi' shell function (emitted by 'hats shell-init') inlines
+ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY + CLAUDE_CONFIG_DIR on the
+\`claude --dangerously-skip-permissions\` invocation — env vars never
+leak to the parent shell or subsequent sessions.
+
+Infisical path: $HATS_KIMI_INFISICAL_PATH/$HATS_KIMI_INFISICAL_SECRET_NAME
+Base URL:       $HATS_KIMI_BASE_URL
+EOF
+      ;;
+    *)
+      die "Unknown 'hats kimi' subcommand: $sub. Try 'hats kimi --help'."
+      ;;
+  esac
+}
+
+cmd_kimi_doctor() {
+  # Four-point verification of the Kimi backend wiring. Each check is
+  # independent so a partial failure still reports the others.
+  echo "Running hats kimi doctor..."
+  local issues=0
+
+  # 1. Account dir present.
+  local acct_dir
+  acct_dir=$(_account_dir "$HATS_KIMI_ACCOUNT_NAME")
+  if [ -d "$acct_dir" ]; then
+    echo "  OK   account dir $acct_dir"
+  else
+    echo "  FAIL account dir missing — run 'hats kimi init'"
+    issues=$((issues + 1))
+  fi
+
+  # 2. Infisical auth + fetch succeeds (key prefix looks Kimi-ish).
+  local _kimi_key
+  _kimi_key=$(_kimi_fetch_api_key 2>/dev/null) || true
+  if [ -n "$_kimi_key" ] && printf '%s' "$_kimi_key" | head -c 6 | grep -q '^sk-'; then
+    echo "  OK   Infisical fetch (key prefix sk-..., len ${#_kimi_key})"
+  else
+    echo "  FAIL Infisical fetch — check $HATS_KIMI_ENV_FILE + path $HATS_KIMI_INFISICAL_PATH/$HATS_KIMI_INFISICAL_SECRET_NAME"
+    issues=$((issues + 1))
+  fi
+
+  # 3. Endpoint reachability: HEAD on the Anthropic-compatible base URL.
+  # Kimi's endpoint responds to /v1/messages; HEAD without auth returns
+  # 401/405 which is fine — we only need "the host answers HTTP".
+  if command -v curl >/dev/null 2>&1; then
+    local _http_status
+    _http_status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+      "$HATS_KIMI_BASE_URL/v1/messages" 2>/dev/null || echo "000")
+    case "$_http_status" in
+      401|403|405|4??) echo "  OK   endpoint $HATS_KIMI_BASE_URL responds (HTTP $_http_status)" ;;
+      000)             echo "  FAIL endpoint $HATS_KIMI_BASE_URL unreachable (network?)" ; issues=$((issues + 1)) ;;
+      *)               echo "  WARN endpoint $HATS_KIMI_BASE_URL returned HTTP $_http_status (unexpected but host is up)" ;;
+    esac
+  else
+    echo "  WARN curl not on PATH — skipping endpoint reachability probe"
+  fi
+
+  # 4. Env-isolation regression. Spawn a subshell that evaluates the kimi
+  # function and exits immediately; then check the CURRENT shell's env
+  # for ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY leakage. Since this is
+  # inside a bash process already, we just check `${var:-}` directly —
+  # if the operator's parent shell has those set, that's what poisoned
+  # previous Claude sessions and doctor must flag it.
+  local _leaked=0
+  [ -n "${ANTHROPIC_BASE_URL:-}" ] && { echo "  FAIL ANTHROPIC_BASE_URL leaked into parent shell (value: ${ANTHROPIC_BASE_URL})" >&2; _leaked=1; }
+  [ -n "${ANTHROPIC_API_KEY:-}" ]  && { echo "  FAIL ANTHROPIC_API_KEY set in parent shell — poisoning risk" >&2; _leaked=1; }
+  if [ "$_leaked" = "0" ]; then
+    echo "  OK   env-isolation: ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY unset in parent shell"
+  else
+    issues=$((issues + 1))
+  fi
+
+  echo ""
+  echo "Done. $issues issue(s)."
+  [ "$issues" -eq 0 ]
+}
+
 cmd_providers() {
   echo "Supported providers:"
   echo "  claude"
@@ -2903,6 +3125,12 @@ Portability:
                        raw with --no-encrypt). Pipe to stdout or --out.
   import <file>        Import an account bundle; --as renames, --force
                        overwrites. age-decrypts automatically.
+
+Backends:
+  kimi <subcmd>        Kimi (Moonshot) Anthropic-compatible endpoint.
+                       Subcommands: init | doctor | fetch-key.
+                       Shell function (from 'hats shell-init') inlines
+                       ANTHROPIC_BASE_URL + API key — env never leaks.
   completion <shell>   Emit tab-completion script for bash or zsh
   providers            Show supported providers
   audit [-n N] [--raw] Read the hats audit log (opt-in via HATS_AUDIT=1)
@@ -2986,6 +3214,7 @@ case "${1:-}" in
   audit)            shift; cmd_audit "$@" ;;
   export)           shift; cmd_export "$@" ;;
   import)           shift; cmd_import "$@" ;;
+  kimi)             shift; cmd_kimi "$@" ;;
   version|-v|--version) cmd_version ;;
   help|-h|--help|"") cmd_help ;;
   *)

@@ -1588,6 +1588,104 @@ EOF
   ok "hats list filters (--rc-only --expired --provider --help) work + AND-composition + bogus-flag rejection"
 }
 
+test_kimi_env_isolation() {
+  # Kimi shell function must NOT leak ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY
+  # into the parent shell after the function returns. Tanwa's operator
+  # directive 2026-04-20 09:34Z named this as the critical invariant —
+  # prior Claude sessions were poisoned by accidental `export` of these
+  # vars in .zshrc.
+  #
+  # Test plan:
+  #   1. Provision kimi dir in the sandbox (mkdir + stub .claude.json).
+  #   2. Emit shell-init + source into this shell.
+  #   3. Stub `claude` so the function doesn't try to launch a real session;
+  #      stub just echoes the env it saw so we can assert kimi DID set the
+  #      env vars for the inner call.
+  #   4. Stub `infisical` so no real network/auth happens. Return a
+  #      fake sk-kimi-smoke key so the fetch-and-validate path passes.
+  #   5. Call `kimi stub-prompt` and verify:
+  #        (a) the stubbed claude saw ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY
+  #            (prefix sk-), and CLAUDE_CONFIG_DIR=<sandbox>/.hats/claude/kimi
+  #        (b) after kimi returns, the parent shell has no ANTHROPIC_BASE_URL
+  #            and no ANTHROPIC_API_KEY, and CLAUDE_CONFIG_DIR is unchanged
+  #            from its pre-call value.
+
+  # Stage a minimal ~/.infisical.env so the kimi function's env-sourcing
+  # line doesn't die on `set +u` + missing variable.
+  mkdir -p "$SANDBOX_ROOT/.hats/claude/kimi"
+  echo '{}' > "$SANDBOX_ROOT/.hats/claude/kimi/.claude.json"
+
+  local fake_env="$SANDBOX_ROOT/.infisical.env"
+  cat > "$fake_env" <<EOF
+INFISICAL_UNIVERSAL_AUTH_CLIENT_ID=smoke-client-id
+INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=smoke-client-secret
+EOF
+
+  # Shell-init reads HATS_KIMI_ENV_FILE env var override at emission time.
+  local emitted
+  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" shell-init 2>/dev/null)
+
+  # Source + stub infisical + stub claude, inside a bash -c so we can
+  # inspect the post-call env without contaminating the smoke suite.
+  local probe_out probe_rc
+  probe_out=$(bash -c '
+    set +e
+    eval "$1"
+
+    # Stub infisical to return a deterministic fake key, irrespective of args.
+    infisical() {
+      case "$1" in
+        login)  echo "smoke-token" ;;
+        secrets) echo "sk-kimi-smoke-$(printf '%.0s0' {1..50})" ;;
+        *)       return 0 ;;
+      esac
+    }
+    export -f infisical
+
+    # Stub claude: echo the env it sees so the outer check can verify the
+    # inner call received the correct inline-prefixed env vars.
+    claude() {
+      echo "INNER BASE=${ANTHROPIC_BASE_URL:-UNSET}"
+      echo "INNER KEY_PREFIX=$(printf %s "${ANTHROPIC_API_KEY:-}" | cut -c1-3)"
+      echo "INNER CFG=${CLAUDE_CONFIG_DIR:-UNSET}"
+    }
+    export -f claude
+
+    # Pre-call state: CLAUDE_CONFIG_DIR should carry whatever the suite
+    # exports (the sandbox HATS_DIR-derived path).
+    pre_cfg="${CLAUDE_CONFIG_DIR:-UNSET}"
+
+    kimi stub-prompt
+
+    echo "AFTER BASE=${ANTHROPIC_BASE_URL:-UNSET}"
+    echo "AFTER KEY=${ANTHROPIC_API_KEY:-UNSET}"
+    echo "AFTER CFG=${CLAUDE_CONFIG_DIR:-UNSET} (pre=$pre_cfg)"
+  ' _ "$emitted" 2>&1)
+  probe_rc=$?
+
+  if [ "$probe_rc" -ne 0 ]; then
+    printf 'got:\n%s\n' "$probe_out" >&2
+    die "kimi env-isolation probe exited non-zero (rc=$probe_rc)"
+    return
+  fi
+
+  # Inner call received the kimi env vars.
+  echo "$probe_out" | grep -q 'INNER BASE=https://api.moonshot.ai/anthropic' \
+    || { printf 'got:\n%s\n' "$probe_out" >&2; die "kimi did not set ANTHROPIC_BASE_URL for inner claude call"; return; }
+  echo "$probe_out" | grep -q 'INNER KEY_PREFIX=sk-' \
+    || { printf 'got:\n%s\n' "$probe_out" >&2; die "kimi did not pass API key with sk- prefix to inner claude"; return; }
+  echo "$probe_out" | grep -q 'INNER CFG=.*/.hats/claude/kimi' \
+    || { printf 'got:\n%s\n' "$probe_out" >&2; die "kimi did not set CLAUDE_CONFIG_DIR to kimi dir for inner call"; return; }
+
+  # Parent shell is clean after the call.
+  echo "$probe_out" | grep -q 'AFTER BASE=UNSET' \
+    || { printf 'got:\n%s\n' "$probe_out" >&2; die "kimi LEAKED ANTHROPIC_BASE_URL into parent shell"; return; }
+  echo "$probe_out" | grep -q 'AFTER KEY=UNSET' \
+    || { printf 'got:\n%s\n' "$probe_out" >&2; die "kimi LEAKED ANTHROPIC_API_KEY into parent shell"; return; }
+
+  ok "kimi shell function inline-sets env for inner claude + cleans parent shell (env-isolation regression fence)"
+}
+
 test_fleet_symmetry_check_runs_clean() {
   # The cross-provider symmetry audit (scripts/hats-fleet-symmetry-check,
   # roadmap #4) mechanizes case-law B-11/A-28 — flag any `case
@@ -1656,6 +1754,7 @@ test_call_provider_variant_dispatch
 test_verify_command
 test_export_import_roundtrip
 test_export_openssl_backend
+test_kimi_env_isolation
 test_list_filter_flags
 test_fleet_symmetry_check_runs_clean
 
