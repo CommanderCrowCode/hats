@@ -28,9 +28,10 @@ nothing left to ship — hats is near that state.
 ### 5. `hats list` filters (`--rc-only`, `--expired`, `--provider claude`)  ✅ SHIPPED 2026-04-19
 **Status:** landed. `hats list` accepts `--rc-only` (RC-scope claude tokens), `--expired` (past-expiry), `--provider <claude|codex>` (reroute the listing tree), plus `--help`. Filters compose with AND semantics; the output renders a `Filters: --flag1 --flag2` header and an `X of Y account(s) matched` summary when any predicate is active. Unknown flags fail fast with `Error: Unknown list flag '--foo'` + usage. Implementation: `_account_passes_list_filters` helper parses the existing `_token_info` key=value stream; zero regressions on the 39-test smoke suite. New coverage `test_list_filter_flags` exercises --help, each predicate, AND-composition, bogus-flag rejection, and --provider codex reroute.
 
-### 6. Provider abstraction refactor — groundwork for v2.0 (cursor, windsurf)
-**Why now:** v2.0 goal is multi-provider beyond claude+codex. The current `case "$CURRENT_PROVIDER" in` branches are scattered through `hats`; pulling them into a provider-descriptor table (auth file, runtime env var, runtime command, base config template, auth flow) would make adding cursor or windsurf a data change rather than a code change. Low risk if kept internal + behind the same external API.
-**Scope:** days.
+### 6. Provider abstraction refactor — groundwork for v2.0 (cursor, windsurf)  🚧 PHASE 1 SHIPPED 2026-04-20
+**Status:** Phase 1 slice landed — `_call_provider_variant <base-func> [args...]` generic-dispatch helper centralizes the per-provider-function-name convention so callers don't need a case statement for each dispatch site. First migration: `_token_info` collapses from a case-on-provider block to a single line. Missing-variant path dies loudly so the fleet-symmetry-check script still mechanizes the coverage rule at commit time. Symmetry audit drops from 22 → 21 checks (one case block eliminated); everything still green.
+**Phase 2 (future):** migrate the remaining 8 per-provider case blocks (login hints, add-failure hints, provider login, provider command, init, _show_account_status, _ensure_account_defaults, _configure_provider's scalar-field setup) onto the same helper. Each migration is a ~5-line refactor. Adding a new provider (cursor, windsurf) after Phase 2 collapses to: (a) add to `_is_supported_provider`, (b) write `_<hook>_<newprovider>` functions. No touching dispatch sites.
+**Scope remaining:** days for full Phase 2.
 **Blocker:** none conceptually; would benefit from operator feedback on which third provider matters most.
 
 ### 7. Encrypted credential backend (age, gpg, OS keychain) — v2.0 foundation

@@ -76,6 +76,31 @@ _is_supported_provider() {
   esac
 }
 
+# Generic provider-aware dispatch. Given a base function name, look up and
+# invoke `_<base>_<provider>` with the remaining args. Centralizes the
+# per-provider-function naming convention so callers don't need a case
+# statement for each dispatch site. Caller guarantees coverage at source
+# time — missing variants fail loudly via die, and the fleet-symmetry-check
+# script mechanizes the coverage rule at commit time.
+#
+# Example:
+#   _token_info() { _call_provider_variant token_info "$@"; }
+# resolves to _token_info_claude or _token_info_codex per CURRENT_PROVIDER.
+#
+# This is Phase 1 of roadmap #6 provider-abstraction work — introduces the
+# dispatch primitive without mass-migrating the existing case statements.
+# Future Phase 2 work can collapse additional per-provider case blocks
+# onto this helper as the naming convention gets adopted project-wide.
+_call_provider_variant() {
+  local base="$1"; shift
+  local fn="_${base}_${CURRENT_PROVIDER}"
+  if declare -f "$fn" >/dev/null 2>&1; then
+    "$fn" "$@"
+  else
+    die "no ${CURRENT_PROVIDER} implementation registered for ${base} (expected function ${fn})"
+  fi
+}
+
 _hats_cmd_prefix() {
   if [ "$CURRENT_PROVIDER" = "claude" ]; then
     echo "hats"
@@ -625,10 +650,11 @@ PYEOF
 }
 
 _token_info() {
-  case "$CURRENT_PROVIDER" in
-    claude) _token_info_claude "$1" ;;
-    codex) _token_info_codex "$1" ;;
-  esac
+  # Dispatches to `_token_info_<provider>` via the generic helper — see
+  # _call_provider_variant for the convention. Replaces an explicit case
+  # statement; adding a new provider now only requires writing the
+  # provider-suffixed helper, not touching this dispatch site.
+  _call_provider_variant token_info "$@"
 }
 
 _show_account_status() {

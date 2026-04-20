@@ -1083,6 +1083,63 @@ EOF
   fi
 }
 
+test_call_provider_variant_dispatch() {
+  # `_call_provider_variant` (roadmap #6 Phase 1) centralizes the
+  # per-provider function-naming convention. Verify both the happy path
+  # (existing _token_info_claude gets called) and the failure path
+  # (missing handler → die + non-zero rc). Uses a throwaway wrapper shell
+  # that sources `hats` as a library to avoid disturbing sandbox state.
+
+  local probe; probe=$(mktemp "${TMPDIR:-/tmp}/hats-variant-probe-XXXXXX.sh")
+  cat > "$probe" <<'PROBE'
+#!/usr/bin/env bash
+# Source hats as a library. hats resolves commands via its own trailing
+# dispatch block which exits; we guard by calling the helper BEFORE the
+# dispatch runs. Instead, we extract the helper body by invoking a
+# dedicated probe command.
+set -euo pipefail
+HATS_SCRIPT="$1"
+PROVIDER="$2"
+FUNC_NAME="$3"
+# Manually craft a _configure_provider + helper-call using the real hats
+# definitions. We grep the helper + _configure_provider + _is_supported_provider
+# + die out of hats and eval them — fast + doesn't risk touching real state.
+bash -c "
+  $(awk '/^_is_supported_provider\(\)/,/^}/' "$HATS_SCRIPT")
+  $(awk '/^_call_provider_variant\(\)/,/^}/' "$HATS_SCRIPT")
+  die() { echo \"Error: \$*\" >&2; exit 1; }
+  HATS_DIR=/tmp
+  CURRENT_PROVIDER='$PROVIDER'
+  # Register a dummy handler for 'claude' only.
+  _dummy_probe_claude() { echo \"dummy_claude_called:\$1\"; }
+  _call_provider_variant dummy_probe 'arg-ok'
+"
+PROBE
+  chmod +x "$probe"
+
+  local out rc
+  # Happy path: provider=claude, handler exists → echoes expected string.
+  out=$("$probe" "$HATS_SCRIPT" claude dummy_probe 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ "$out" != "dummy_claude_called:arg-ok" ]; then
+    printf 'got rc=%s out=%s\n' "$rc" "$out" >&2
+    die "_call_provider_variant happy-path dispatch broken"
+    return
+  fi
+
+  # Failure path: provider=codex, handler NOT registered → die + rc!=0.
+  rc=0
+  out=$("$probe" "$HATS_SCRIPT" codex dummy_probe 2>&1) || rc=$?
+  if [ "$rc" -eq 0 ] || ! echo "$out" | grep -q "no codex implementation registered for dummy_probe"; then
+    printf 'got rc=%s out=%s\n' "$rc" "$out" >&2
+    die "_call_provider_variant failure path did not die with expected message"
+    return
+  fi
+
+  rm -f "$probe"
+  ok "_call_provider_variant dispatches to _<base>_<provider> + fails loud when variant missing"
+}
+
 test_verify_command() {
   # `hats verify` (roadmap #3) — deep per-account semantic check that
   # complements doctor's layout check. Exercises:
@@ -1514,6 +1571,7 @@ test_install_check_gates_on_smoke
 test_install_is_idempotent_on_reinstall
 test_config_migration_is_idempotent
 test_doctor_metrics_flag
+test_call_provider_variant_dispatch
 test_verify_command
 test_export_import_roundtrip
 test_list_filter_flags
