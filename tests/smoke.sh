@@ -14,14 +14,6 @@
 
 set -euo pipefail
 
-# SC2030/SC2031: test_export_import_roundtrip intentionally shadows
-# HATS_DIR + HOME inside a subshell to give the import-target a fresh
-# layout. shellcheck's tracking is global — once it sees the shadow, it
-# warns on every later HATS_DIR / HOME reference even though those refer
-# to the outer-scope values (which is exactly what the rest of the suite
-# wants). Disable file-wide; the shadow is intentional and documented.
-# shellcheck disable=SC2030,SC2031
-
 HATS_SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/hats"
 HATS_REPO="$(dirname "$HATS_SCRIPT")"
 [ -x "$HATS_SCRIPT" ] || { echo "missing or non-executable hats at $HATS_SCRIPT" >&2; exit 1; }
@@ -1268,37 +1260,36 @@ EOF
   [ -s "$bundle" ] || { die "exported tarball is empty"; return; }
 
   # Import into a fresh sandbox HATS_DIR so no staged fixture interferes.
+  # Pass HATS_DIR + HOME per-call via `env` instead of shadowing them in a
+  # subshell — keeps shellcheck happy (no SC2030/SC2031) and avoids the
+  # subshell-scope cleanup gotcha for downstream tests.
   local target_root="$SANDBOX_ROOT/import-target"
-  mkdir -p "$target_root"
-  # The subshell intentionally shadows HATS_DIR + HOME so it doesn't leak
-  # into the outer suite; later tests must see the ORIGINAL HATS_DIR.
-  # File-level SC2030/SC2031 disable is at the top of this file.
-  (
-    export HATS_DIR="$target_root/.hats"
-    export HOME="$target_root"
-    mkdir -p "$HOME"
-    "$HATS_SCRIPT" init >/dev/null 2>&1
-    "$HATS_SCRIPT" import "$bundle" >/dev/null 2>&1 \
-      || { printf 'import-base rc=%s\n' "$?" >&2; exit 1; }
-    local imp="$HATS_DIR/claude/exptest"
-    cmp "$src/.credentials.json" "$imp/.credentials.json" \
-      || { echo "credentials drift after roundtrip" >&2; exit 1; }
-    cmp "$src/.claude.json" "$imp/.claude.json" \
-      || { echo ".claude.json drift after roundtrip" >&2; exit 1; }
-    local mode
-    mode=$(stat -c '%a' "$imp/.credentials.json" 2>/dev/null || stat -f '%Lp' "$imp/.credentials.json")
-    [ "$mode" = "600" ] || { echo "credentials mode after import = $mode (expected 600)" >&2; exit 1; }
+  local target_hats="$target_root/.hats"
+  local target_home="$target_root"
+  mkdir -p "$target_home"
 
-    # --as rename
-    "$HATS_SCRIPT" import "$bundle" --as renamed >/dev/null 2>&1 \
-      || { echo "import --as failed" >&2; exit 1; }
-    [ -d "$HATS_DIR/claude/renamed" ] || { echo "--as did not create renamed dir" >&2; exit 1; }
+  env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" init >/dev/null 2>&1
+  env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" import "$bundle" >/dev/null 2>&1 \
+    || { die "import-base failed"; return; }
 
-    # --force guard
-    local rc=0
-    "$HATS_SCRIPT" import "$bundle" >/dev/null 2>&1 || rc=$?
-    [ "$rc" -ne 0 ] || { echo "import without --force did not refuse existing account" >&2; exit 1; }
-  ) || { die "export/import roundtrip or rename/force guard broken (see stderr above)"; return; }
+  local imp="$target_hats/claude/exptest"
+  cmp "$src/.credentials.json" "$imp/.credentials.json" \
+    || { die "credentials drift after roundtrip"; return; }
+  cmp "$src/.claude.json" "$imp/.claude.json" \
+    || { die ".claude.json drift after roundtrip"; return; }
+  local mode
+  mode=$(stat -c '%a' "$imp/.credentials.json" 2>/dev/null || stat -f '%Lp' "$imp/.credentials.json")
+  [ "$mode" = "600" ] || { die "credentials mode after import = $mode (expected 600)"; return; }
+
+  # --as rename
+  env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" import "$bundle" --as renamed >/dev/null 2>&1 \
+    || { die "import --as failed"; return; }
+  [ -d "$target_hats/claude/renamed" ] || { die "--as did not create renamed dir"; return; }
+
+  # --force guard
+  local rc=0
+  env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" import "$bundle" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ne 0 ] || { die "import without --force did not refuse existing account"; return; }
 
   # Path-traversal rejection: craft a malicious tarball and confirm refusal.
   # Use python's tarfile so the entry name (`../../etc/passwd`) is embedded
