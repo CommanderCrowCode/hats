@@ -702,6 +702,12 @@ _show_account_status() {
     return
   fi
 
+  # Genuine data asymmetry, not dispatch asymmetry — each arm reads a
+  # different set of _token_info fields (claude: expired/has_refresh/has_rc/
+  # exp_date; codex: store/account_id). Not migrated onto
+  # _call_provider_variant because a shared dispatch signature would force a
+  # heterogeneous arg list across providers. See commit 529b6bb for the full
+  # Phase 2 rationale.
   case "$CURRENT_PROVIDER" in
     claude)
       local status=""
@@ -2452,7 +2458,12 @@ _verify_one_account() {
     *)       echo "    WARN credentials mode=$mode (expected 600 or 400)"; _warnings=$((_warnings + 1)) ;;
   esac
 
-  # 3. Provider-specific token semantics.
+  # 3. Provider-specific token semantics. Genuine data asymmetry — claude
+  # parses claudeAiOauth (expiresAt/refreshToken/scopes); codex parses
+  # tokens.account_id + reads config.toml. Each provider has its own
+  # inline python probe + its own checks derived from it. Shared dispatch
+  # doesn't fit; the provider-specific bodies are where the interesting
+  # differences live. Symmetry-check still enforces both-arms-present.
   case "$CURRENT_PROVIDER" in
     claude)
       local probe
