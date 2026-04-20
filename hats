@@ -2387,8 +2387,9 @@ cmd_import() {
   #   - openssl  → first bytes are "Salted__" (openssl enc -salt magic)
   #   - raw tar  → fallthrough; cp + extract.
   local decrypted="$stage/bundle.tar"
-  local header
+  local header magic8
   header=$(head -c 64 "$in_file" 2>/dev/null || true)
+  magic8=$(head -c 8 "$in_file" 2>/dev/null || true)
   if printf '%s' "$header" | grep -q 'age-encryption.org'; then
     command -v age >/dev/null 2>&1 || die "archive is age-encrypted but 'age' is not on PATH."
     # age herestring + pipe collision is the same as in cmd_export — leave
@@ -2398,7 +2399,9 @@ cmd_import() {
     fi
     age -d -o "$decrypted" "$in_file" \
       || die "age decryption failed"
-  elif printf '%s' "$header" | grep -q '^Salted__'; then
+  elif [ "$magic8" = "Salted__" ]; then
+    # BSD grep refuses to match binary input (openssl salt bytes follow "Salted__"),
+    # so compare the 8-byte magic directly via shell string equality.
     command -v openssl >/dev/null 2>&1 || die "archive is openssl-encrypted but 'openssl' is not on PATH."
     [ -n "${HATS_EXPORT_PASSWORD:-}" ] \
       || die "openssl-encrypted archive requires HATS_EXPORT_PASSWORD env var for decryption."
