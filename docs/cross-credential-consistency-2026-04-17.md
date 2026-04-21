@@ -414,3 +414,9 @@ done
 diff /home/tanwa/.hats/claude/base/settings.json \
      /home/tanwa/.hats/claude/shannon/settings.json
 ```
+
+---
+
+## Footnotes (post-publication)
+
+- **2026-04-21** — codex account labels `tanwa` and `scb10x` (referenced at §3 line ~384) were renamed to `astartes` and `slaanesh` respectively per praetor directive msg-efd95a3f63ce2c50. The `scb10x config.toml locally overridden` finding still holds; only the label has changed. Historical audit text preserved in place for trail integrity.

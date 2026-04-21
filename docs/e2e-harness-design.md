@@ -11,7 +11,7 @@
 
 hats has three reliability surfaces today — `tests/smoke.sh` (96 sandboxed unit-style tests), `scripts/hats-fleet-symmetry-check` (cross-provider static + sandboxed runtime audits), and `scripts/hats-consistency-smoke` (cross-credential layout checks on the real `~/.hats`). All three run **hermetically** or on **layout-only** signal.
 
-What's missing is a **fleet-wide live probe layer**: does each real credential (claude-shannon/monet/debussy + codex-scb10x + kimi) actually invoke its provider end-to-end? The current reliability stack tells us the bytes are well-formed; it doesn't tell us the token still authenticates against the live API.
+What's missing is a **fleet-wide live probe layer**: does each real credential (claude-shannon/monet/debussy + codex-slaanesh + kimi) actually invoke its provider end-to-end? The current reliability stack tells us the bytes are well-formed; it doesn't tell us the token still authenticates against the live API.
 
 This note proposes `scripts/hats-e2e-probe` + a one-command runner `scripts/hats-ship-gate` that chains smoke + symmetry + consistency + e2e into a single regression check. Bounded-time, deterministic, network-failure = WARN (kimi doctor §3 convention from 8746d5a).
 
@@ -39,7 +39,7 @@ One-shot invocation against each registered credential, comparing outputs for pa
 
 **Probe contract:**
 - **Task:** a minimal deterministic-ish prompt. Candidate: "Reply with exactly the three characters: ok.`" (no newlines, no model-version commentary). Tolerates per-model formatting variance.
-- **Scope:** per `HATS_E2E_SCOPE` env var — `claude` (shannon/monet/debussy), `codex` (scb10x), `kimi` (both claude-kimi and codex-kimi wrappers), or `all` (default).
+- **Scope:** per `HATS_E2E_SCOPE` env var — `claude` (shannon/monet/debussy), `codex` (astartes/slaanesh), `kimi` (both claude-kimi and codex-kimi wrappers), or `all` (default).
 - **Bounded time:** per-probe default timeout = 30s (env `HATS_E2E_PROBE_TIMEOUT`). Fleet-wide ceiling = `probes × timeout` with explicit wall-clock cap = 180s (env `HATS_E2E_WALL_TIMEOUT`).
 - **Determinism:** the probe's only PASS condition is (a) exit 0 AND (b) output contains the literal 2-char token `ok`. It does NOT compare outputs for byte-equality across models — that would false-positive on formatting variance.
 - **Network-failure policy:** rc=000/timeout/DNS-fail = **WARN**, not FAIL. Matches kimi doctor §3 (8746d5a) + codex verify G2 (160ff35). Offline-tolerant.
@@ -184,7 +184,7 @@ Silence = proceed with proposed defaults per §6.
   "probe_timeout_sec": 30,
   "results": [
     {"provider": "claude", "account": "shannon", "status": "pass", "rc": 0, "duration_ms": 2103, "probe_token_hit": true},
-    {"provider": "codex",  "account": "scb10x",  "status": "warn", "rc": 0, "duration_ms": 29987, "err_excerpt": "timeout after 30s"},
+    {"provider": "codex",  "account": "slaanesh", "status": "warn", "rc": 0, "duration_ms": 29987, "err_excerpt": "timeout after 30s"},
     {"provider": "kimi",   "account": "claude-kimi", "status": "pass", "rc": 0, "duration_ms": 1820, "probe_token_hit": true}
   ],
   "summary": {"pass": 5, "warn": 1, "fail": 0, "skipped": 0}

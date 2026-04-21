@@ -136,7 +136,7 @@ git commits, not cleanly partitioned:
   (auth_mode sanity cross-check)** — landed as its own commit
   `160ff35 feat(verify): codex id_token JWT expiry + auth_mode sanity
   (G1+G3)`. Authored by hats-codex-engineer. Body carries first-cycle
-  B-9 evidence: debussy `tanwa` account pre-commit silent PASS,
+  B-9 evidence: debussy `astartes` account (renamed from `tanwa` 2026-04-21 per praetor directive msg-efd95a3f63ce2c50) pre-commit silent PASS,
   post-commit WARN `id_token expired (-322.39h), last_refresh 13.5d
   ago, will auto-refresh`.
 
