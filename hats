@@ -3406,8 +3406,8 @@ _kimi_fetch_api_key() {
   # "new release available" banner goes to /dev/null; only the raw value
   # reaches the outer capture.
   (
-    # shellcheck disable=SC1090
     set +u
+    # shellcheck disable=SC1090  # env-file path is runtime-overridable via HATS_KIMI_ENV_FILE
     . "$HATS_KIMI_ENV_FILE" 2>/dev/null
     : "${INFISICAL_UNIVERSAL_AUTH_CLIENT_ID:?}" "${INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET:?}"
     _tok=$(infisical login \
@@ -3797,6 +3797,7 @@ _ensure_kimi_account_dir_codex() {
   _ensure_kimi_codex_config_toml "$acct_dir"
 }
 
+# shellcheck disable=SC2120  # dispatch helper; args forwarded via _call_provider_variant
 _ensure_kimi_account_dir() {
   _call_provider_variant ensure_kimi_account_dir "$@"
 }
@@ -3808,6 +3809,7 @@ cmd_kimi() {
   shift || true
   case "$sub" in
     init)
+      # shellcheck disable=SC2119  # dispatch helper; args forwarded via _call_provider_variant
       _ensure_kimi_account_dir
       local _shell_cmd="hats"
       [ "$CURRENT_PROVIDER" = "codex" ] && _shell_cmd="hats codex"
@@ -3934,6 +3936,7 @@ cmd_kimi_doctor() {
 
   # 4. Env-isolation regression (provider-variant): check for leakage of
   # ANTHROPIC_* (claude) or OPENAI_*/CODEX_* (codex) into the parent shell.
+  # shellcheck disable=SC2119  # dispatch helper; args forwarded via _call_provider_variant
   if _kimi_doctor_env_isolation; then :; else issues=$((issues + 1)); fi
 
   # 5. First-run-gate bypass (provider-variant): hasCompletedOnboarding
@@ -4026,6 +4029,7 @@ _kimi_doctor_env_isolation_codex() {
   return 1
 }
 
+# shellcheck disable=SC2120  # dispatch helper; args forwarded via _call_provider_variant
 _kimi_doctor_env_isolation() { _call_provider_variant kimi_doctor_env_isolation "$@"; }
 
 _kimi_doctor_onboarding_bypass_claude() {
