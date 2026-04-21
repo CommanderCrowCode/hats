@@ -1250,6 +1250,34 @@ test_codex_verify_command() {
   # don't collide with existing codex fixtures staged by other tests.
   "$HATS_SCRIPT" codex init >/dev/null 2>&1 || true
 
+  # Stub codex binary for G2 (codex login status liveness probe). Shadowing
+  # the real codex keeps the smoke suite deterministic + offline, so probe
+  # behavior is exercised without depending on whether codex is installed
+  # on the host and without hitting the network. Stub accepts arbitrary
+  # args, responds to `login status` with the real success string, and
+  # exits 0 otherwise — which also satisfies verify's preflight tooling
+  # check (`OK codex found`).
+  local stub_bin="$SANDBOX_ROOT/stub-bin"
+  mkdir -p "$stub_bin"
+  cat > "$stub_bin/codex" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "login status"*)
+    echo "Logged in using ChatGPT"
+    exit 0
+    ;;
+  "--version"*)
+    echo "codex-cli 0.0.0-stub"
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+STUB
+  chmod +x "$stub_bin/codex"
+  local codex_path_prefix="PATH=$stub_bin:$PATH"
+
   # JWT forger: header.payload.sig where payload has a controlled exp.
   # Signature is "x" — our probe only base64url-decodes the middle segment.
   _mint_codex_jwt() {
@@ -1305,12 +1333,14 @@ PYEOF
   stage_cv cv_legacy \
 "{\"tokens\":{\"id_token\":\"$jwt_future\",\"access_token\":\"a\",\"refresh_token\":\"r\",\"account_id\":\"acc-legacy\"},\"last_refresh\":\"$recent_lr\"}"
 
-  # (1) healthy chatgpt: PASS id_token expiry, PASS auth_mode, no FAIL
+  # (1) healthy chatgpt: PASS id_token expiry, PASS auth_mode, PASS
+  # codex login status liveness (G2, stub replies 0), no FAIL.
   rc=0
-  out=$("$HATS_SCRIPT" codex verify cv_ok 2>&1) || rc=$?
+  out=$(env "$codex_path_prefix" "$HATS_SCRIPT" codex verify cv_ok 2>&1) || rc=$?
   if [ "$rc" -ne 0 ] \
      || ! echo "$out" | grep -q 'PASS auth_mode=chatgpt with tokens present' \
      || ! echo "$out" | grep -q 'PASS id_token expiry' \
+     || ! echo "$out" | grep -q 'PASS codex login status' \
      || echo "$out" | grep -Eq '^ {4}FAIL'; then
     printf 'got (cv_ok):\n%s\n' "$out" >&2
     die "codex verify cv_ok should pass cleanly (rc=$rc)"
@@ -1319,7 +1349,7 @@ PYEOF
 
   # (2) expired + refresh + recent last_refresh: WARN, rc=0
   rc=0
-  out=$("$HATS_SCRIPT" codex verify cv_exp 2>&1) || rc=$?
+  out=$(env "$codex_path_prefix" "$HATS_SCRIPT" codex verify cv_exp 2>&1) || rc=$?
   if [ "$rc" -ne 0 ] \
      || ! echo "$out" | grep -q 'WARN id_token expired.*will auto-refresh' \
      || echo "$out" | grep -Eq '^ {4}FAIL'; then
@@ -1330,7 +1360,7 @@ PYEOF
 
   # (3) expired + no refresh: FAIL, rc=1
   rc=0
-  out=$("$HATS_SCRIPT" codex verify cv_norefresh 2>&1) || rc=$?
+  out=$(env "$codex_path_prefix" "$HATS_SCRIPT" codex verify cv_norefresh 2>&1) || rc=$?
   if [ "$rc" -eq 0 ] \
      || ! echo "$out" | grep -q 'FAIL id_token expired.*no refresh_token'; then
     printf 'got (cv_norefresh):\n%s\n' "$out" >&2
@@ -1340,7 +1370,7 @@ PYEOF
 
   # (4) expired + refresh + stale last_refresh (>90d): FAIL, rc=1
   rc=0
-  out=$("$HATS_SCRIPT" codex verify cv_staleref 2>&1) || rc=$?
+  out=$(env "$codex_path_prefix" "$HATS_SCRIPT" codex verify cv_staleref 2>&1) || rc=$?
   if [ "$rc" -eq 0 ] \
      || ! echo "$out" | grep -q 'FAIL id_token expired.*last_refresh.*likely invalidated'; then
     printf 'got (cv_staleref):\n%s\n' "$out" >&2
@@ -1350,7 +1380,7 @@ PYEOF
 
   # (5) api_key mode + OPENAI_API_KEY set: PASS, rc=0
   rc=0
-  out=$("$HATS_SCRIPT" codex verify cv_apikey 2>&1) || rc=$?
+  out=$(env "$codex_path_prefix" "$HATS_SCRIPT" codex verify cv_apikey 2>&1) || rc=$?
   if [ "$rc" -ne 0 ] \
      || ! echo "$out" | grep -q 'PASS auth_mode=api_key with OPENAI_API_KEY set' \
      || echo "$out" | grep -q 'id_token expiry'; then
@@ -1361,7 +1391,7 @@ PYEOF
 
   # (6) api_key mode + OPENAI_API_KEY null: FAIL, rc=1
   rc=0
-  out=$("$HATS_SCRIPT" codex verify cv_apikey_nokey 2>&1) || rc=$?
+  out=$(env "$codex_path_prefix" "$HATS_SCRIPT" codex verify cv_apikey_nokey 2>&1) || rc=$?
   if [ "$rc" -eq 0 ] \
      || ! echo "$out" | grep -q 'FAIL auth_mode=api_key but OPENAI_API_KEY null'; then
     printf 'got (cv_apikey_nokey):\n%s\n' "$out" >&2
@@ -1372,7 +1402,7 @@ PYEOF
   # (7) legacy file (no auth_mode) with future-exp tokens: WARN on mode,
   # PASS on id_token expiry, rc=0.
   rc=0
-  out=$("$HATS_SCRIPT" codex verify cv_legacy 2>&1) || rc=$?
+  out=$(env "$codex_path_prefix" "$HATS_SCRIPT" codex verify cv_legacy 2>&1) || rc=$?
   if [ "$rc" -ne 0 ] \
      || ! echo "$out" | grep -q 'WARN auth_mode missing (legacy)' \
      || ! echo "$out" | grep -q 'PASS id_token expiry' \
@@ -1382,10 +1412,26 @@ PYEOF
     return
   fi
 
+  # (8) G2 network-failure policy: codex missing from PATH entirely. The
+  # probe must emit WARN ("skipping liveness probe") and the overall rc
+  # must stay 0 — doctor-exit semantics must not flip on a transient
+  # offline / uninstalled CLI.
+  rc=0
+  # Minimal PATH with no codex — keep /usr/bin for coreutils (grep, awk,
+  # python3). Deliberately exclude /usr/local/bin and the stub dir.
+  out=$(env -i HOME="$HOME" HATS_DIR="$HATS_DIR" PATH="/usr/bin:/bin" "$HATS_SCRIPT" codex verify cv_ok 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ] \
+     || ! echo "$out" | grep -q 'WARN codex not on PATH' \
+     || echo "$out" | grep -Eq '^ {4}FAIL'; then
+    printf 'got (cv_ok no-codex):\n%s\n' "$out" >&2
+    die "codex verify with codex absent from PATH should WARN not FAIL (rc=$rc)"
+    return
+  fi
+
   rm -rf "$base/cv_ok" "$base/cv_exp" "$base/cv_norefresh" "$base/cv_staleref" \
          "$base/cv_apikey" "$base/cv_apikey_nokey" "$base/cv_legacy"
 
-  ok "codex verify checks id_token JWT expiry + refresh freshness + auth_mode sanity (G1+G3)"
+  ok "codex verify checks id_token JWT expiry + refresh freshness + auth_mode sanity + login-status liveness (G1+G2+G3)"
 }
 
 test_export_import_roundtrip() {
@@ -1923,6 +1969,180 @@ EOF
   ok "hats kimi init + shell-function guard set/merge/auto-restore hasCompletedOnboarding idempotently"
 }
 
+test_codex_kimi_env_isolation() {
+  # codex-kimi shell function must NOT leak OPENAI_API_KEY / CODEX_API_KEY
+  # into the parent shell after the function returns. Mirror of the
+  # claude-kimi env-isolation fence, adapted to codex's OpenAI-compat
+  # env shape. Deliberate variance: codex does NOT honor OPENAI_BASE_URL
+  # (verified by strings-grep of the codex binary — 0 hits), so the inner
+  # call is NOT expected to see OPENAI_BASE_URL; the base URL lives in
+  # the account's config.toml instead.
+
+  "$HATS_SCRIPT" codex init >/dev/null 2>&1 || true
+  "$HATS_SCRIPT" codex kimi init >/dev/null 2>&1 \
+    || { die "hats codex kimi init rc!=0 on fresh sandbox"; return; }
+
+  local fake_env="$SANDBOX_ROOT/.infisical.env"
+  cat > "$fake_env" <<EOF
+INFISICAL_UNIVERSAL_AUTH_CLIENT_ID=smoke-client-id
+INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=smoke-client-secret
+EOF
+
+  # Emit codex shell-init (which in the codex provider mode includes the
+  # codex_kimi function). Re-reads HATS_KIMI_ENV_FILE at emit time.
+  local emitted
+  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" codex shell-init 2>/dev/null)
+
+  local probe_out probe_rc
+  probe_out=$(bash -c '
+    set +e
+    eval "$1"
+
+    # Stub infisical + codex identically to claude-kimi test pattern.
+    infisical() {
+      case "$1" in
+        login)   echo "smoke-token" ;;
+        secrets) echo "sk-kimi-smoke-$(printf '%.0s0' {1..50})" ;;
+        *)       return 0 ;;
+      esac
+    }
+    export -f infisical
+
+    codex() {
+      echo "INNER CODEX_HOME=${CODEX_HOME:-UNSET}"
+      echo "INNER OPENAI_KEY_PREFIX=$(printf %s "${OPENAI_API_KEY:-}" | cut -c1-3)"
+      echo "INNER OPENAI_BASE_URL=${OPENAI_BASE_URL:-UNSET}"
+    }
+    export -f codex
+
+    codex_kimi stub-prompt
+
+    echo "AFTER OPENAI_API_KEY=${OPENAI_API_KEY:-UNSET}"
+    echo "AFTER CODEX_API_KEY=${CODEX_API_KEY:-UNSET}"
+    echo "AFTER CODEX_HOME=${CODEX_HOME:-UNSET}"
+  ' _ "$emitted" 2>&1)
+  probe_rc=$?
+
+  if [ "$probe_rc" -ne 0 ]; then
+    printf 'got:\n%s\n' "$probe_out" >&2
+    die "codex-kimi env-isolation probe exited non-zero (rc=$probe_rc)"
+    return
+  fi
+
+  # Inner codex call received CODEX_HOME + OPENAI_API_KEY; OPENAI_BASE_URL
+  # correctly NOT set (documented variance — codex ignores it).
+  echo "$probe_out" | grep -q 'INNER CODEX_HOME=.*/\.hats/codex/kimi' \
+    || { printf 'got:\n%s\n' "$probe_out" >&2; die "codex-kimi did not set CODEX_HOME to kimi dir for inner call"; return; }
+  echo "$probe_out" | grep -q 'INNER OPENAI_KEY_PREFIX=sk-' \
+    || { printf 'got:\n%s\n' "$probe_out" >&2; die "codex-kimi did not pass OPENAI_API_KEY with sk- prefix to inner codex"; return; }
+  echo "$probe_out" | grep -q 'INNER OPENAI_BASE_URL=UNSET' \
+    || { printf 'got:\n%s\n' "$probe_out" >&2; die "codex-kimi unexpectedly set OPENAI_BASE_URL (codex ignores it — base URL lives in config.toml)"; return; }
+
+  # Parent shell is clean after the call.
+  echo "$probe_out" | grep -q 'AFTER OPENAI_API_KEY=UNSET' \
+    || { printf 'got:\n%s\n' "$probe_out" >&2; die "codex-kimi LEAKED OPENAI_API_KEY into parent shell"; return; }
+  echo "$probe_out" | grep -q 'AFTER CODEX_API_KEY=UNSET' \
+    || { printf 'got:\n%s\n' "$probe_out" >&2; die "codex-kimi LEAKED CODEX_API_KEY into parent shell"; return; }
+  echo "$probe_out" | grep -q 'AFTER CODEX_HOME=UNSET' \
+    || { printf 'got:\n%s\n' "$probe_out" >&2; die "codex-kimi LEAKED CODEX_HOME into parent shell"; return; }
+
+  ok "codex_kimi shell function inline-sets env for inner codex + cleans parent shell (env-isolation regression fence)"
+}
+
+test_codex_kimi_config_toml_idempotent() {
+  # `hats codex kimi init` writes the [model_providers.kimi] block into the
+  # account's config.toml. The block is the codex analog of claude-kimi's
+  # hasCompletedOnboarding flag — it's the first-run-gate bypass. Must be
+  # idempotent across: (a) fresh init, (b) re-init over hats-written file,
+  # (c) re-init over operator-seeded file (preserves operator keys), (d)
+  # shell-function auto-restore after the block is wiped.
+
+  local acct_dir="$HATS_DIR/codex/kimi"
+  local cfg="$acct_dir/config.toml"
+
+  # (a) Fresh init.
+  rm -rf "$acct_dir"
+  "$HATS_SCRIPT" codex init >/dev/null 2>&1 || true
+  "$HATS_SCRIPT" codex kimi init >/dev/null 2>&1 \
+    || { die "hats codex kimi init rc!=0 on fresh sandbox"; return; }
+  [ -f "$cfg" ] || { die "hats codex kimi init did not create $cfg"; return; }
+  grep -q '^model_provider[[:space:]]*=[[:space:]]*"kimi"' "$cfg" \
+    || { printf 'got:\n%s\n' "$(cat "$cfg")" >&2; die "model_provider=\"kimi\" not set after fresh init"; return; }
+  grep -q '^\[model_providers\.kimi\]' "$cfg" \
+    || { printf 'got:\n%s\n' "$(cat "$cfg")" >&2; die "[model_providers.kimi] block missing after fresh init"; return; }
+  grep -q 'base_url[[:space:]]*=[[:space:]]*"https://api\.kimi\.com/coding/v1"' "$cfg" \
+    || { printf 'got:\n%s\n' "$(cat "$cfg")" >&2; die "base_url not set to api.kimi.com/coding/v1"; return; }
+
+  # (b) Re-init: no duplication of the model_provider line or stanza header.
+  "$HATS_SCRIPT" codex kimi init >/dev/null 2>&1 \
+    || { die "hats codex kimi init rc!=0 on re-run"; return; }
+  local mp_count stanza_count
+  mp_count=$(grep -c '^model_provider[[:space:]]*=[[:space:]]*"kimi"' "$cfg")
+  stanza_count=$(grep -c '^\[model_providers\.kimi\]' "$cfg")
+  [ "$mp_count" = "1" ] || { printf 'got:\n%s\n' "$(cat "$cfg")" >&2; die "re-init duplicated model_provider line (count=$mp_count)"; return; }
+  [ "$stanza_count" = "1" ] || { printf 'got:\n%s\n' "$(cat "$cfg")" >&2; die "re-init duplicated [model_providers.kimi] stanza (count=$stanza_count)"; return; }
+
+  # (c) Merge over operator-seeded keys — must survive re-init.
+  cat >> "$cfg" <<'EOF'
+
+[projects."/my/trusted/project"]
+trust_level = "trusted"
+EOF
+  "$HATS_SCRIPT" codex kimi init >/dev/null 2>&1 \
+    || { die "hats codex kimi init rc!=0 on operator-seeded file"; return; }
+  grep -q '^model_provider[[:space:]]*=[[:space:]]*"kimi"' "$cfg" \
+    || { printf 'got:\n%s\n' "$(cat "$cfg")" >&2; die "merge dropped model_provider=\"kimi\""; return; }
+  grep -q 'trust_level[[:space:]]*=[[:space:]]*"trusted"' "$cfg" \
+    || { printf 'got:\n%s\n' "$(cat "$cfg")" >&2; die "merge clobbered operator [projects.\"/my/trusted/project\"] block"; return; }
+
+  # (d) Shell-function auto-restore: wipe the provider block, invoke
+  # codex_kimi, verify the block is restored before the inner codex stub
+  # runs. PATH contract (feedback_shell_function_path_contract.md):
+  # auto-restore calls `hats codex kimi init` by bare name; probe subshell
+  # must export PATH=$HATS_REPO:$PATH or the guard silently no-ops.
+  cat > "$cfg" <<'EOF'
+# Wiped by operator — auto-restore should rebuild the provider block
+cli_auth_credentials_store = "file"
+EOF
+
+  local fake_env="$SANDBOX_ROOT/.infisical.env"
+  cat > "$fake_env" <<EOF
+INFISICAL_UNIVERSAL_AUTH_CLIENT_ID=smoke-client-id
+INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=smoke-client-secret
+EOF
+  local emitted
+  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" codex shell-init 2>/dev/null)
+
+  local probe_out probe_rc
+  probe_out=$(PATH="$HATS_REPO:$PATH" bash -c '
+    set +e
+    eval "$1"
+    infisical() {
+      case "$1" in
+        login)   echo "smoke-token" ;;
+        secrets) echo "sk-kimi-smoke-$(printf '%.0s0' {1..50})" ;;
+        *)       return 0 ;;
+      esac
+    }
+    export -f infisical
+    codex() { :; }
+    export -f codex
+    codex_kimi stub-prompt
+  ' _ "$emitted" 2>&1)
+  probe_rc=$?
+  if [ "$probe_rc" -ne 0 ]; then
+    printf 'got:\n%s\n' "$probe_out" >&2
+    die "codex-kimi auto-restore probe exited non-zero (rc=$probe_rc)"
+    return
+  fi
+  grep -q '^model_provider[[:space:]]*=[[:space:]]*"kimi"' "$cfg" \
+    || { printf 'config.toml now:\n%s\n' "$(cat "$cfg")" >&2; die "shell-function guard did not auto-restore model_provider=\"kimi\""; return; }
+  grep -q '^\[model_providers\.kimi\]' "$cfg" \
+    || { printf 'config.toml now:\n%s\n' "$(cat "$cfg")" >&2; die "shell-function guard did not auto-restore [model_providers.kimi] stanza"; return; }
+
+  ok "hats codex kimi init + shell-function guard set/merge/auto-restore model_providers.kimi block idempotently"
+}
+
 test_fleet_symmetry_check_runs_clean() {
   # The cross-provider symmetry audit (scripts/hats-fleet-symmetry-check,
   # roadmap #4) mechanizes case-law B-11/A-28 — flag any `case
@@ -1994,6 +2214,8 @@ test_export_import_roundtrip
 test_export_openssl_backend
 test_kimi_env_isolation
 test_kimi_onboarding_flag_idempotent
+test_codex_kimi_env_isolation
+test_codex_kimi_config_toml_idempotent
 test_list_filter_flags
 test_fleet_symmetry_check_runs_clean
 

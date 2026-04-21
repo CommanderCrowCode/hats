@@ -37,6 +37,15 @@ HATS_KIMI_ACCOUNT_NAME="kimi"
 # canary because it doesn't host the coding-agent-specific routes. See
 # https://www.kimi.com/code/docs/en/more/third-party-agents.html.
 HATS_KIMI_BASE_URL="${HATS_KIMI_BASE_URL:-https://api.kimi.com/coding/}"
+# Kimi's OpenAI-compatible endpoint for codex (OPENAI-compat sibling to the
+# Anthropic-compat /coding/ path used by claude). Kimi's Roo Code recipe in
+# the same third-party-agents doc points at /coding/v1 on the same host;
+# operators can override to api.moonshot.ai/v1 if their subscription routes
+# differently.
+HATS_KIMI_CODEX_BASE_URL="${HATS_KIMI_CODEX_BASE_URL:-https://api.kimi.com/coding/v1}"
+# Default model for the codex-kimi provider block. Operators override via
+# HATS_KIMI_CODEX_MODEL or at call time with `codex -m <name>`.
+HATS_KIMI_CODEX_MODEL="${HATS_KIMI_CODEX_MODEL:-kimi-k2-turbo-preview}"
 HATS_KIMI_INFISICAL_SECRET_NAME="${HATS_KIMI_INFISICAL_SECRET_NAME:-KIMI_API_KEY}"
 HATS_KIMI_INFISICAL_PATH="${HATS_KIMI_INFISICAL_PATH:-/servers/tenacity}"
 HATS_KIMI_INFISICAL_PROJECT_ID="${HATS_KIMI_INFISICAL_PROJECT_ID:-635f03f1-ff77-445d-b352-5f1cd1f53ecc}"
@@ -1436,7 +1445,58 @@ HEADER
     acct_dir=$(_account_dir "$name")
     local fn_name="$name"
     [ "$CURRENT_PROVIDER" = "codex" ] && fn_name="codex_$name"
-    if [ "$CURRENT_PROVIDER" = "codex" ]; then
+    if [ "$CURRENT_PROVIDER" = "codex" ] && [ "$name" = "$HATS_KIMI_ACCOUNT_NAME" ]; then
+      # Kimi codex backend-alias — OpenAI-compatible endpoint. Unlike
+      # claude-kimi, codex does NOT honor OPENAI_BASE_URL env var
+      # (verified by strings-grep of the codex binary — 0 hits); the
+      # base URL lives in $acct_dir/config.toml under
+      # [model_providers.kimi]. Only the API key is inline-prefixed on
+      # the codex invocation. Do NOT "fix" this by adding a spurious
+      # OPENAI_BASE_URL export — codex will ignore it.
+      cat <<KIMICODEXFN
+
+# Kimi codex backend-alias function — see 'hats codex kimi --help'.
+# Critical safety: OPENAI_API_KEY + CODEX_HOME are inlined on the codex
+# invocation, NEVER exported. Verified by 'hats codex kimi doctor'.
+${fn_name}() {
+  # Auto-restore the codex-kimi config.toml provider block if absent.
+  # Covers operator cleanup / reinstall / manual edits that wiped the
+  # model_providers.kimi stanza. Contract: hats must be on PATH (install.sh
+  # guarantees this; test probes must mirror via PATH=\$HATS_REPO:\$PATH).
+  if ! grep -q '^model_provider[[:space:]]*=[[:space:]]*"kimi"' "$acct_dir/config.toml" 2>/dev/null \\
+     || ! grep -q '^\\[model_providers\\.kimi\\]' "$acct_dir/config.toml" 2>/dev/null; then
+    $(_hats_cmd_prefix_of "codex") kimi init >/dev/null 2>&1 || {
+      echo "kimi: hats codex kimi init failed — codex may not pick up the kimi provider" >&2
+    }
+  fi
+  local _kimi_key
+  _kimi_key=\$(
+    set +u
+    . "$HATS_KIMI_ENV_FILE" 2>/dev/null
+    _tok=\$(infisical login --method=universal-auth \\
+      --client-id="\$INFISICAL_UNIVERSAL_AUTH_CLIENT_ID" \\
+      --client-secret="\$INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET" \\
+      --silent --plain 2>/dev/null) || exit 1
+    [ -n "\$_tok" ] || exit 1
+    infisical secrets get "$HATS_KIMI_INFISICAL_SECRET_NAME" \\
+      --path "$HATS_KIMI_INFISICAL_PATH" \\
+      --projectId="$HATS_KIMI_INFISICAL_PROJECT_ID" \\
+      --plain --silent --token="\$_tok" 2>/dev/null
+  )
+  if [ -z "\$_kimi_key" ] || ! printf '%s' "\$_kimi_key" | head -c 3 | grep -q '^sk-'; then
+    echo "kimi: failed to fetch KIMI_API_KEY from Infisical — run 'hats codex kimi doctor'" >&2
+    unset _kimi_key
+    return 1
+  fi
+  CODEX_HOME="$acct_dir" \\
+  OPENAI_API_KEY="\$_kimi_key" \\
+    $RUNTIME_COMMAND -c 'cli_auth_credentials_store="file"' "\$@"
+  local _rc=\$?
+  unset _kimi_key
+  return \$_rc
+}
+KIMICODEXFN
+    elif [ "$CURRENT_PROVIDER" = "codex" ]; then
       echo "${fn_name}() { $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND -c 'cli_auth_credentials_store=\"file\"' \"\$@\"; }"
     elif [ "$CURRENT_PROVIDER" = "claude" ] && [ "$name" = "$HATS_KIMI_ACCOUNT_NAME" ]; then
       # Kimi is API-key-backed, not OAuth — emit the specialized env-isolated
@@ -2840,6 +2900,33 @@ PYEOF
           *)     echo "    FAIL config.toml cli_auth_credentials_store=$store (hats requires 'file')" ;;
         esac
       fi
+
+      # Server-side liveness probe — `codex login status` hits OpenAI's auth
+      # endpoint with the stored tokens and is the only non-billing E2E
+      # signal that the full auth chain works. Respects CODEX_HOME, so per-
+      # account. Separate line from the auth-semantics checks above so
+      # operators can distinguish "my creds are fine, network blipped" from
+      # "my creds are broken." Missing CLI or network failure is WARN, never
+      # FAIL — doctor-exit semantics must not flip on a transient offline.
+      if command -v "$RUNTIME_COMMAND" >/dev/null 2>&1; then
+        local _probe_out _probe_rc=0
+        _probe_out=$(CODEX_HOME="$acct_dir" timeout 5 "$RUNTIME_COMMAND" login status 2>&1) || _probe_rc=$?
+        if [ "$_probe_rc" -eq 0 ]; then
+          echo "    PASS codex login status: $(printf '%s' "$_probe_out" | head -1)"
+        elif [ "$_probe_rc" -eq 124 ]; then
+          echo "    WARN codex login status timed out (>5s) — network or daemon offline"
+        else
+          # codex login exits nonzero when the server rejects the stored
+          # tokens (true creds-broken signal) OR when the binary can't reach
+          # the network (transient). We can't cleanly distinguish, so WARN
+          # rather than FAIL per the doctor-exit-stability policy — the
+          # auth-semantics checks above already catch expired/missing tokens
+          # as FAIL where appropriate.
+          echo "    WARN codex login status failed (rc=$_probe_rc) — check network or re-run 'codex login': $(printf '%s' "$_probe_out" | head -1)"
+        fi
+      else
+        echo "    WARN codex not on PATH — skipping liveness probe"
+      fi
       ;;
   esac
 }
@@ -2970,7 +3057,7 @@ _kimi_fetch_api_key() {
   ) 2>/dev/null
 }
 
-_ensure_kimi_onboarding_flag() {
+_ensure_kimi_onboarding_flag_claude() {
   # Write (or merge-in) hasCompletedOnboarding:true into $acct_dir/.claude.json.
   # Kimi's docs prescribe this flag so a fresh CLAUDE_CONFIG_DIR skips the
   # platform.claude.com OAuth wall on first launch — OAuth is irrelevant for
@@ -3013,7 +3100,141 @@ PY
   fi
 }
 
-_ensure_kimi_account_dir() {
+_ensure_kimi_onboarding_flag_codex() {
+  # Genuine variance (B-11/A-28): codex has NO analog to claude-code's
+  # platform.claude.com OAuth wall for api-key auth. A valid config.toml
+  # with model_provider="kimi" + a [model_providers.kimi] block satisfies
+  # auth directly — no bypass flag needed. The config.toml itself IS the
+  # onboarding bypass; it's written by _ensure_kimi_account_dir_codex.
+  # Kept as an explicit no-op so _call_provider_variant's missing-variant
+  # guard stays meaningful and the mirror symmetry is visible in the grep.
+  :
+}
+
+_ensure_kimi_onboarding_flag() {
+  _call_provider_variant ensure_kimi_onboarding_flag "$@"
+}
+
+_ensure_kimi_codex_config_toml() {
+  # Write (or merge-in) the codex model-provider block that points codex
+  # at Kimi's OpenAI-compat endpoint. Genuine variance vs claude-kimi
+  # (B-11/A-28): codex does NOT honor OPENAI_BASE_URL env var (verified by
+  # strings-grep of the codex-linux-x64 binary — 0 hits). Base URL is
+  # TOML-only; only the API key can be inline-prefixed on the codex
+  # invocation via the env_key this block names. Do not "fix" this by
+  # adding a spurious OPENAI_BASE_URL inline-prefix to the shell function.
+  # Idempotent: preserves any other keys the operator set (e.g. approval
+  # policy overrides, mcp servers, trusted projects).
+  local acct_dir="$1"
+  local target="$acct_dir/config.toml"
+  [ -d "$acct_dir" ] || return 0
+
+  command -v python3 >/dev/null 2>&1 \
+    || { echo "kimi: python3 missing — cannot write $target. Install python3." >&2; return 1; }
+
+  python3 - "$target" "$HATS_KIMI_CODEX_BASE_URL" "$HATS_KIMI_CODEX_MODEL" <<'PY' || return 1
+import os, sys, tempfile
+path, base_url, model = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path) as f:
+        existing = f.read()
+except (FileNotFoundError, OSError):
+    existing = ""
+
+# tomllib is stdlib since 3.11; fall back to a text-level merge if
+# unavailable. Both paths converge on the same invariants:
+#   cli_auth_credentials_store = "file"
+#   model_provider = "kimi"
+#   model = "$HATS_KIMI_CODEX_MODEL"  (only if operator hasn't set one)
+#   [model_providers.kimi] block with name/base_url/env_key/wire_api
+try:
+    import tomllib
+    data = tomllib.loads(existing) if existing.strip() else {}
+except (ImportError, Exception):
+    data = None
+
+def write_text(text):
+    tmp = tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path) or ".", delete=False)
+    tmp.write(text)
+    tmp.flush(); os.fsync(tmp.fileno()); tmp.close()
+    os.replace(tmp.name, path)
+
+if data is None:
+    # Fallback path: raw append of any missing stanzas. Coarse but safe.
+    needed = []
+    if 'cli_auth_credentials_store' not in existing:
+        needed.append('cli_auth_credentials_store = "file"')
+    if 'model_provider ' not in existing and 'model_provider=' not in existing:
+        needed.append(f'model_provider = "kimi"')
+    if '[model_providers.kimi]' not in existing:
+        needed.append(
+            '\n[model_providers.kimi]\n'
+            'name = "Kimi"\n'
+            f'base_url = "{base_url}"\n'
+            'env_key = "OPENAI_API_KEY"\n'
+            'wire_api = "chat"\n'
+            'requires_openai_auth = false\n'
+        )
+    if not needed:
+        sys.exit(0)
+    sep = "" if existing.endswith("\n") or not existing else "\n"
+    write_text(existing + sep + "\n".join(needed) + "\n")
+    sys.exit(0)
+
+# Structured merge path.
+changed = False
+if data.get("cli_auth_credentials_store") != "file":
+    data["cli_auth_credentials_store"] = "file"
+    changed = True
+if data.get("model_provider") != "kimi":
+    data["model_provider"] = "kimi"
+    changed = True
+if "model" not in data:
+    data["model"] = model
+    changed = True
+mp = data.setdefault("model_providers", {})
+kimi_block = mp.get("kimi") if isinstance(mp, dict) else None
+desired_block = {
+    "name": "Kimi",
+    "base_url": base_url,
+    "env_key": "OPENAI_API_KEY",
+    "wire_api": "chat",
+    "requires_openai_auth": False,
+}
+if not isinstance(kimi_block, dict) or any(kimi_block.get(k) != v for k, v in desired_block.items()):
+    mp["kimi"] = {**(kimi_block if isinstance(kimi_block, dict) else {}), **desired_block}
+    changed = True
+if not changed:
+    sys.exit(0)
+
+# Re-serialize as TOML. tomllib is read-only; use a small hand-rolled
+# emitter that handles scalars + nested dicts (enough for codex config).
+def emit(d, prefix=""):
+    lines = []
+    scalars = {k: v for k, v in d.items() if not isinstance(v, dict)}
+    tables = {k: v for k, v in d.items() if isinstance(v, dict)}
+    for k, v in scalars.items():
+        if isinstance(v, bool):
+            lines.append(f'{k} = {"true" if v else "false"}')
+        elif isinstance(v, (int, float)):
+            lines.append(f'{k} = {v}')
+        else:
+            s = str(v).replace('\\', '\\\\').replace('"', '\\"')
+            lines.append(f'{k} = "{s}"')
+    if lines:
+        lines.append("")
+    for k, v in tables.items():
+        header = f"{prefix}{k}" if prefix else k
+        lines.append(f"[{header}]")
+        sub = emit(v, header + ".")
+        lines.extend(sub if sub else [""])
+    return lines
+
+write_text("\n".join(emit(data)).rstrip() + "\n")
+PY
+}
+
+_ensure_kimi_account_dir_claude() {
   # Create ~/.hats/claude/kimi/ with the standard claude-config skeleton.
   # Unlike the OAuth-backed accounts, kimi has NO .credentials.json — the
   # backend API key is fetched fresh from Infisical on every invocation.
@@ -3030,7 +3251,29 @@ _ensure_kimi_account_dir() {
   fi
   # Always (re-)ensure the OAuth-bypass flag is set, even when the acct_dir
   # pre-existed — upgrades from pre-fix hats need the flag too.
-  _ensure_kimi_onboarding_flag "$acct_dir"
+  _ensure_kimi_onboarding_flag_claude "$acct_dir"
+}
+
+_ensure_kimi_account_dir_codex() {
+  # Create ~/.hats/codex/kimi/ with a codex-specific skeleton. The base-URL
+  # cannot be env-injected (codex ignores OPENAI_BASE_URL); it lives in
+  # config.toml as a [model_providers.kimi] block.
+  local acct_dir
+  acct_dir=$(_account_dir "$HATS_KIMI_ACCOUNT_NAME")
+  if [ ! -d "$acct_dir" ]; then
+    [ -d "$PROVIDER_DIR" ] || die "hats not initialized for codex. Run 'hats codex init' first."
+    mkdir -p "$acct_dir"
+    _setup_account_dir "$HATS_KIMI_ACCOUNT_NAME"
+    _audit_log "kimi-init" "account" "$HATS_KIMI_ACCOUNT_NAME"
+  fi
+  # Always (re-)write the provider block. Idempotent merge preserves any
+  # operator-added keys (mcp servers, trusted projects) in the account's
+  # config.toml.
+  _ensure_kimi_codex_config_toml "$acct_dir"
+}
+
+_ensure_kimi_account_dir() {
+  _call_provider_variant ensure_kimi_account_dir "$@"
 }
 
 cmd_kimi() {
@@ -3041,13 +3284,15 @@ cmd_kimi() {
   case "$sub" in
     init)
       _ensure_kimi_account_dir
+      local _shell_cmd="hats"
+      [ "$CURRENT_PROVIDER" = "codex" ] && _shell_cmd="hats codex"
       cat <<EOF
 Kimi account ready at $(_account_dir "$HATS_KIMI_ACCOUNT_NAME").
 
-Shell function is emitted by 'hats shell-init' — re-run:
-    eval "\$(hats shell-init)"
+Shell function is emitted by '$_shell_cmd shell-init' — re-run:
+    eval "\$($_shell_cmd shell-init)"
 
-Verify end-to-end with: hats kimi doctor
+Verify end-to-end with: $_shell_cmd kimi doctor
 EOF
       ;;
     doctor)
@@ -3062,7 +3307,28 @@ EOF
       echo "kimi api key fetched: prefix=$(printf '%s' "$_k" | cut -c1-6)... length=${#_k}"
       ;;
     ''|-h|--help)
-      cat <<EOF
+      if [ "$CURRENT_PROVIDER" = "codex" ]; then
+        cat <<EOF
+Usage: hats codex kimi <subcommand>
+
+Subcommands:
+  init        Provision ~/.hats/codex/kimi/ with config.toml model_provider block.
+  doctor      Verify Infisical fetch, endpoint reachability, env-isolation,
+              config.toml provider stanza.
+  fetch-key   Fetch + print a key-prefix summary (no secret leaked).
+
+The 'codex_kimi' shell function (emitted by 'hats codex shell-init')
+inlines CODEX_HOME + OPENAI_API_KEY on the \`codex\` invocation — env
+vars never leak to the parent shell or subsequent sessions. Base URL
+lives in config.toml (codex does NOT honor OPENAI_BASE_URL env var).
+
+Infisical path: $HATS_KIMI_INFISICAL_PATH/$HATS_KIMI_INFISICAL_SECRET_NAME
+Base URL:       $HATS_KIMI_CODEX_BASE_URL
+Model default:  $HATS_KIMI_CODEX_MODEL
+Overrides:      HATS_KIMI_CODEX_BASE_URL, HATS_KIMI_CODEX_MODEL
+EOF
+      else
+        cat <<EOF
 Usage: hats kimi <subcommand>
 
 Subcommands:
@@ -3078,6 +3344,7 @@ leak to the parent shell or subsequent sessions.
 Infisical path: $HATS_KIMI_INFISICAL_PATH/$HATS_KIMI_INFISICAL_SECRET_NAME
 Base URL:       $HATS_KIMI_BASE_URL
 EOF
+      fi
       ;;
     *)
       die "Unknown 'hats kimi' subcommand: $sub. Try 'hats kimi --help'."
@@ -3111,53 +3378,122 @@ cmd_kimi_doctor() {
     issues=$((issues + 1))
   fi
 
-  # 3. Endpoint reachability: HEAD on the Anthropic-compatible base URL.
-  # Kimi's endpoint responds to /v1/messages; HEAD without auth returns
-  # 401/405 which is fine — we only need "the host answers HTTP".
-  if command -v curl >/dev/null 2>&1; then
-    local _http_status
-    _http_status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
-      "$HATS_KIMI_BASE_URL/v1/messages" 2>/dev/null || echo "000")
-    case "$_http_status" in
-      401|403|405|4??) echo "  OK   endpoint $HATS_KIMI_BASE_URL responds (HTTP $_http_status)" ;;
-      000)             echo "  FAIL endpoint $HATS_KIMI_BASE_URL unreachable (network?)" ; issues=$((issues + 1)) ;;
-      *)               echo "  WARN endpoint $HATS_KIMI_BASE_URL returned HTTP $_http_status (unexpected but host is up)" ;;
-    esac
-  else
-    echo "  WARN curl not on PATH — skipping endpoint reachability probe"
-  fi
+  # 3. Endpoint reachability (provider-variant).
+  if _kimi_doctor_endpoint "$acct_dir"; then :; else issues=$((issues + 1)); fi
 
-  # 4. Env-isolation regression. Spawn a subshell that evaluates the kimi
-  # function and exits immediately; then check the CURRENT shell's env
-  # for ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY leakage. Since this is
-  # inside a bash process already, we just check `${var:-}` directly —
-  # if the operator's parent shell has those set, that's what poisoned
-  # previous Claude sessions and doctor must flag it.
-  local _leaked=0
-  [ -n "${ANTHROPIC_BASE_URL:-}" ] && { echo "  FAIL ANTHROPIC_BASE_URL leaked into parent shell (value: ${ANTHROPIC_BASE_URL})" >&2; _leaked=1; }
-  [ -n "${ANTHROPIC_API_KEY:-}" ]  && { echo "  FAIL ANTHROPIC_API_KEY set in parent shell — poisoning risk" >&2; _leaked=1; }
-  if [ "$_leaked" = "0" ]; then
-    echo "  OK   env-isolation: ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY unset in parent shell"
-  else
-    issues=$((issues + 1))
-  fi
+  # 4. Env-isolation regression (provider-variant): check for leakage of
+  # ANTHROPIC_* (claude) or OPENAI_*/CODEX_* (codex) into the parent shell.
+  if _kimi_doctor_env_isolation; then :; else issues=$((issues + 1)); fi
 
-  # 5. hasCompletedOnboarding flag present. Without this, a fresh kimi
-  # session hits the platform.claude.com OAuth wall even though the
-  # API-key backend doesn't need OAuth. `hats kimi init` provisions it;
-  # the shell function auto-restores it if wiped.
-  local _flag_file="$acct_dir/.claude.json"
-  if [ -f "$_flag_file" ] && grep -q '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$_flag_file" 2>/dev/null; then
-    echo "  OK   hasCompletedOnboarding:true in $_flag_file"
-  else
-    echo "  FAIL hasCompletedOnboarding flag missing in $_flag_file — OAuth wall will fire. Run 'hats kimi init'."
-    issues=$((issues + 1))
-  fi
+  # 5. First-run-gate bypass (provider-variant): hasCompletedOnboarding
+  # flag for claude, model_provider=kimi stanza in config.toml for codex.
+  if _kimi_doctor_onboarding_bypass "$acct_dir"; then :; else issues=$((issues + 1)); fi
 
   echo ""
   echo "Done. $issues issue(s)."
   [ "$issues" -eq 0 ]
 }
+
+_kimi_doctor_endpoint_claude() {
+  # HEAD on the Anthropic-compatible base URL. Kimi's endpoint responds to
+  # /v1/messages; HEAD without auth returns 401/405 which is fine — we only
+  # need "the host answers HTTP".
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "  WARN curl not on PATH — skipping endpoint reachability probe"
+    return 0
+  fi
+  local _http_status
+  _http_status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+    "$HATS_KIMI_BASE_URL/v1/messages" 2>/dev/null || echo "000")
+  case "$_http_status" in
+    401|403|405|4??) echo "  OK   endpoint $HATS_KIMI_BASE_URL responds (HTTP $_http_status)"; return 0 ;;
+    000)             echo "  FAIL endpoint $HATS_KIMI_BASE_URL unreachable (network?)"; return 1 ;;
+    *)               echo "  WARN endpoint $HATS_KIMI_BASE_URL returned HTTP $_http_status (unexpected but host is up)"; return 0 ;;
+  esac
+}
+
+_kimi_doctor_endpoint_codex() {
+  # HEAD on the OpenAI-compatible base URL. Kimi's coding-agent host
+  # answers /chat/completions; without auth it returns 401/404 which
+  # confirms the host is up.
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "  WARN curl not on PATH — skipping endpoint reachability probe"
+    return 0
+  fi
+  local _http_status
+  _http_status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+    "$HATS_KIMI_CODEX_BASE_URL/chat/completions" 2>/dev/null || echo "000")
+  case "$_http_status" in
+    401|403|404|405|4??) echo "  OK   endpoint $HATS_KIMI_CODEX_BASE_URL responds (HTTP $_http_status)"; return 0 ;;
+    000)                 echo "  FAIL endpoint $HATS_KIMI_CODEX_BASE_URL unreachable (network?). Fallback: set HATS_KIMI_CODEX_BASE_URL=https://api.moonshot.ai/v1"; return 1 ;;
+    *)                   echo "  WARN endpoint $HATS_KIMI_CODEX_BASE_URL returned HTTP $_http_status (unexpected but host is up)"; return 0 ;;
+  esac
+}
+
+_kimi_doctor_endpoint() { _call_provider_variant kimi_doctor_endpoint "$@"; }
+
+_kimi_doctor_env_isolation_claude() {
+  local _leaked=0
+  [ -n "${ANTHROPIC_BASE_URL:-}" ] && { echo "  FAIL ANTHROPIC_BASE_URL leaked into parent shell (value: ${ANTHROPIC_BASE_URL})" >&2; _leaked=1; }
+  [ -n "${ANTHROPIC_API_KEY:-}" ]  && { echo "  FAIL ANTHROPIC_API_KEY set in parent shell — poisoning risk" >&2; _leaked=1; }
+  if [ "$_leaked" = "0" ]; then
+    echo "  OK   env-isolation: ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY unset in parent shell"
+    return 0
+  fi
+  return 1
+}
+
+_kimi_doctor_env_isolation_codex() {
+  # OPENAI_BASE_URL is NOT honored by codex (documented variance) so its
+  # presence in the parent shell is harmless for codex-kimi — but a leaked
+  # OPENAI_API_KEY or CODEX_API_KEY WOULD poison a subsequent `hats codex
+  # swap` into a non-kimi account. Flag both.
+  local _leaked=0
+  [ -n "${OPENAI_API_KEY:-}" ] && { echo "  FAIL OPENAI_API_KEY set in parent shell — poisoning risk for non-kimi codex accounts" >&2; _leaked=1; }
+  [ -n "${CODEX_API_KEY:-}" ]  && { echo "  FAIL CODEX_API_KEY set in parent shell — poisoning risk for non-kimi codex accounts" >&2; _leaked=1; }
+  if [ "$_leaked" = "0" ]; then
+    echo "  OK   env-isolation: OPENAI_API_KEY + CODEX_API_KEY unset in parent shell"
+    return 0
+  fi
+  return 1
+}
+
+_kimi_doctor_env_isolation() { _call_provider_variant kimi_doctor_env_isolation "$@"; }
+
+_kimi_doctor_onboarding_bypass_claude() {
+  local acct_dir="$1"
+  local _flag_file="$acct_dir/.claude.json"
+  if [ -f "$_flag_file" ] && grep -q '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$_flag_file" 2>/dev/null; then
+    echo "  OK   hasCompletedOnboarding:true in $_flag_file"
+    return 0
+  fi
+  echo "  FAIL hasCompletedOnboarding flag missing in $_flag_file — OAuth wall will fire. Run 'hats kimi init'."
+  return 1
+}
+
+_kimi_doctor_onboarding_bypass_codex() {
+  # Codex has no OAuth-wall analog for api-key auth; the config.toml
+  # provider block IS the bypass. Check the block is present + names
+  # model_provider="kimi" so codex will pick it up at invocation.
+  local acct_dir="$1"
+  local _cfg="$acct_dir/config.toml"
+  if [ ! -f "$_cfg" ]; then
+    echo "  FAIL config.toml missing at $_cfg — run 'hats codex kimi init'."
+    return 1
+  fi
+  if ! grep -q '^model_provider[[:space:]]*=[[:space:]]*"kimi"' "$_cfg" 2>/dev/null; then
+    echo "  FAIL model_provider=\"kimi\" not set in $_cfg — run 'hats codex kimi init'."
+    return 1
+  fi
+  if ! grep -q '^\[model_providers\.kimi\]' "$_cfg" 2>/dev/null; then
+    echo "  FAIL [model_providers.kimi] block missing in $_cfg — run 'hats codex kimi init'."
+    return 1
+  fi
+  echo "  OK   config.toml has model_provider=\"kimi\" + [model_providers.kimi] block"
+  return 0
+}
+
+_kimi_doctor_onboarding_bypass() { _call_provider_variant kimi_doctor_onboarding_bypass "$@"; }
 
 cmd_providers() {
   echo "Supported providers:"
@@ -3304,6 +3640,10 @@ Backends:
                        Subcommands: init | doctor | fetch-key.
                        Shell function (from 'hats shell-init') inlines
                        ANTHROPIC_BASE_URL + API key — env never leaks.
+  codex kimi <subcmd>  Kimi OpenAI-compatible endpoint for codex.
+                       Base URL lives in config.toml (codex ignores
+                       OPENAI_BASE_URL env); only API key inline-prefixed.
+                       'codex_kimi' shell function from 'hats codex shell-init'.
   completion <shell>   Emit tab-completion script for bash or zsh
   providers            Show supported providers
   audit [-n N] [--raw] Read the hats audit log (opt-in via HATS_AUDIT=1)
@@ -3319,6 +3659,8 @@ Examples:
   hats codex add headless --api-key
   hats codex add remote --device-auth
   hats codex swap personal -- exec "summarize this repo"
+  hats codex kimi init
+  hats codex kimi doctor
 
 Directory Structure:
   ~/.hats/claude/base/     Shared Claude resources
