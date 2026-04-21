@@ -122,3 +122,38 @@ Multi-provider support and encrypted storage.
 
 - Team credential sharing via encrypted git repos
 - Audit logging with timestamps
+
+---
+
+## Shipped attribution corrections
+
+### 2026-04-21 — codex verify G1+G2+G3 (codex-provider parity surge)
+
+The codex-side verify hardening shipped as two logical pieces across two
+git commits, not cleanly partitioned:
+
+- **G1 (id_token JWT expiry horizon + refresh_token freshness) + G3
+  (auth_mode sanity cross-check)** — landed as its own commit
+  `160ff35 feat(verify): codex id_token JWT expiry + auth_mode sanity
+  (G1+G3)`. Authored by hats-codex-engineer. Body carries first-cycle
+  B-9 evidence: debussy `tanwa` account pre-commit silent PASS,
+  post-commit WARN `id_token expired (-322.39h), last_refresh 13.5d
+  ago, will auto-refresh`.
+
+- **G2 (`codex login status` server-side liveness probe, WARN-on-network-
+  failure policy)** — landed atomically inside `fbe77ed
+  feat(codex-kimi): add OpenAI-compat Kimi wrapper for codex`. Shared-
+  working-tree coordination with hats-kimi-engineer resulted in G2's
+  in-flight edits being picked up by their concurrent `git commit`.
+  G2 code (probe + smoke stub-bin + runner entries) is correct and
+  live; attribution was not partitioned. Code-wise equivalent to a
+  separate commit; history-wise blended. Choice to accept-as-shipped
+  rather than force-push a revert: blast radius of rewriting main with
+  a peer's work mid-flight is not justified when the code itself is
+  correct and pushed.
+
+Lesson for shared-tree coordination: when two engineers share a working
+tree on the same host, the committer should `git status` before `git
+commit -a` and stage explicit files rather than swallow unstaged edits
+authored by the other engineer. Documented here so future sessions can
+reference the pattern.
