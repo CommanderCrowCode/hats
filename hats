@@ -43,9 +43,14 @@ HATS_KIMI_BASE_URL="${HATS_KIMI_BASE_URL:-https://api.kimi.com/coding/}"
 # operators can override to api.moonshot.ai/v1 if their subscription routes
 # differently.
 HATS_KIMI_CODEX_BASE_URL="${HATS_KIMI_CODEX_BASE_URL:-https://api.kimi.com/coding/v1}"
-# Default model for the codex-kimi provider block. Operators override via
-# HATS_KIMI_CODEX_MODEL or at call time with `codex -m <name>`.
-HATS_KIMI_CODEX_MODEL="${HATS_KIMI_CODEX_MODEL:-kimi-k2-turbo-preview}"
+# Default model for the codex-kimi provider block. INTENTIONALLY EMPTY:
+# Kimi's release cadence (K2 → K2.5 → K2.6 in a few months) makes any hardcoded
+# model default a staleness liability. hats owns credential + transport; the
+# provider owns model selection. When empty, _ensure_kimi_codex_config_toml
+# omits the `model` field entirely so codex routes to the endpoint's provider
+# default. Operators override explicitly via HATS_KIMI_CODEX_MODEL or at call
+# time with `codex -m <name>`.
+HATS_KIMI_CODEX_MODEL="${HATS_KIMI_CODEX_MODEL:-}"
 HATS_KIMI_INFISICAL_SECRET_NAME="${HATS_KIMI_INFISICAL_SECRET_NAME:-KIMI_API_KEY}"
 HATS_KIMI_INFISICAL_PATH="${HATS_KIMI_INFISICAL_PATH:-/servers/tenacity}"
 HATS_KIMI_INFISICAL_PROJECT_ID="${HATS_KIMI_INFISICAL_PROJECT_ID:-635f03f1-ff77-445d-b352-5f1cd1f53ecc}"
@@ -3263,8 +3268,12 @@ except (FileNotFoundError, OSError):
 # unavailable. Both paths converge on the same invariants:
 #   cli_auth_credentials_store = "file"
 #   model_provider = "kimi"
-#   model = "$HATS_KIMI_CODEX_MODEL"  (only if operator hasn't set one)
+#   model = "$HATS_KIMI_CODEX_MODEL"  (ONLY when operator set it non-empty;
+#                                     empty → omit entirely so codex routes
+#                                     to the endpoint's provider default)
 #   [model_providers.kimi] block with name/base_url/env_key/wire_api
+model_stripped = (model or "").strip()
+
 try:
     import tomllib
     data = tomllib.loads(existing) if existing.strip() else {}
@@ -3284,6 +3293,8 @@ if data is None:
         needed.append('cli_auth_credentials_store = "file"')
     if 'model_provider ' not in existing and 'model_provider=' not in existing:
         needed.append(f'model_provider = "kimi"')
+    if model_stripped and 'model ' not in existing and 'model=' not in existing:
+        needed.append(f'model = "{model_stripped}"')
     if '[model_providers.kimi]' not in existing:
         needed.append(
             '\n[model_providers.kimi]\n'
@@ -3307,9 +3318,22 @@ if data.get("cli_auth_credentials_store") != "file":
 if data.get("model_provider") != "kimi":
     data["model_provider"] = "kimi"
     changed = True
-if "model" not in data:
-    data["model"] = model
+# Model handling: only write `model = "..."` when HATS_KIMI_CODEX_MODEL is
+# non-empty AND the file doesn't already pin one. Empty default → drop any
+# stale hats-written model line so codex falls back to the endpoint's
+# provider-default routing. Preserve an operator-set model across re-init:
+# if data["model"] is already set and HATS_KIMI_CODEX_MODEL is empty, leave
+# the existing value alone (operator intent wins over hats' empty default).
+existing_model = data.get("model")
+if model_stripped:
+    if existing_model != model_stripped:
+        data["model"] = model_stripped
+        changed = True
+elif existing_model is not None and existing_model == "":
+    # Drop a stale empty-string model line written by an older hats version.
+    del data["model"]
     changed = True
+# (operator-set non-empty model preserved: no action)
 mp = data.setdefault("model_providers", {})
 kimi_block = mp.get("kimi") if isinstance(mp, dict) else None
 desired_block = {
@@ -3459,7 +3483,7 @@ lives in config.toml (codex does NOT honor OPENAI_BASE_URL env var).
 
 Infisical path: $HATS_KIMI_INFISICAL_PATH/$HATS_KIMI_INFISICAL_SECRET_NAME
 Base URL:       $HATS_KIMI_CODEX_BASE_URL
-Model default:  $HATS_KIMI_CODEX_MODEL
+Model default:  ${HATS_KIMI_CODEX_MODEL:-(unset — codex routes to endpoint's provider default)}
 Overrides:      HATS_KIMI_CODEX_BASE_URL, HATS_KIMI_CODEX_MODEL
 EOF
       else
@@ -3642,6 +3666,26 @@ _kimi_doctor_onboarding_bypass_codex() {
     return 1
   fi
   echo "  OK   config.toml has model_provider=\"kimi\" + [model_providers.kimi] block"
+
+  # Model-pin state (info-grade, not err-grade per Tanwa directive 2026-04-21):
+  # Kimi's release cadence (K2 → K2.5 → K2.6 in months) makes hardcoded
+  # defaults stale; endpoint-default routing is the intended quieter state.
+  # err only when HATS_KIMI_CODEX_MODEL is set but MALFORMED (whitespace-only
+  # or otherwise non-actionable) — that's a config bug, not an intent.
+  local _model_env="${HATS_KIMI_CODEX_MODEL-}"
+  local _model_env_stripped
+  _model_env_stripped=$(printf '%s' "$_model_env" | tr -d '[:space:]')
+  if [ -n "$_model_env" ] && [ -z "$_model_env_stripped" ]; then
+    echo "  FAIL HATS_KIMI_CODEX_MODEL is set to whitespace-only value — unset it or supply a real model name"
+    return 1
+  fi
+  local _model_line
+  _model_line=$(grep -E '^model[[:space:]]*=' "$_cfg" 2>/dev/null | head -1)
+  if [ -n "$_model_line" ]; then
+    echo "  info model pinned in $_cfg: $_model_line"
+  else
+    echo "  info no model pinned — codex routes to endpoint's provider default (override via HATS_KIMI_CODEX_MODEL or 'codex -m <name>')"
+  fi
   return 0
 }
 

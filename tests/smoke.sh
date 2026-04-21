@@ -2443,6 +2443,71 @@ EOF
   ok "hats codex kimi init + shell-function guard set/merge/auto-restore model_providers.kimi block idempotently"
 }
 
+test_codex_kimi_unset_model_emits_no_stanza() {
+  # Tanwa directive 2026-04-21 via praetor: HATS_KIMI_CODEX_MODEL default
+  # must be empty so codex routes to the endpoint's provider default.
+  # Kimi's release cadence (K2 → K2.5 → K2.6 in months) makes any pinned
+  # default a staleness liability. Verifies four branches:
+  #   (a) env unset  → config.toml has NO `model =` line (endpoint decides)
+  #   (b) env set    → config.toml has exactly one `model = "<val>"` line
+  #   (c) re-init env-unset over an operator-set model PRESERVES operator intent
+  #   (d) doctor reports info (not err) when no model is pinned, and err when
+  #       HATS_KIMI_CODEX_MODEL is set to whitespace-only (malformed).
+
+  local acct_dir="$HATS_DIR/codex/kimi"
+  local cfg="$acct_dir/config.toml"
+
+  # (a) Default: env var unset → no `model =` line.
+  rm -rf "$acct_dir"
+  "$HATS_SCRIPT" codex init >/dev/null 2>&1 || true
+  "$HATS_SCRIPT" codex kimi init >/dev/null 2>&1 \
+    || { die "hats codex kimi init rc!=0 on fresh sandbox (env unset)"; return; }
+  [ -f "$cfg" ] || { die "hats codex kimi init did not create $cfg (env unset)"; return; }
+  if grep -qE '^model[[:space:]]*=' "$cfg"; then
+    printf 'got:\n%s\n' "$(cat "$cfg")" >&2
+    die "config.toml has a model line when HATS_KIMI_CODEX_MODEL is unset — should omit entirely so codex routes to endpoint default"
+    return
+  fi
+
+  # (b) Explicit override: env var set → exactly one model line.
+  rm -rf "$acct_dir"
+  HATS_KIMI_CODEX_MODEL="kimi-k2.6-preview" "$HATS_SCRIPT" codex kimi init >/dev/null 2>&1 \
+    || { die "hats codex kimi init rc!=0 with HATS_KIMI_CODEX_MODEL=kimi-k2.6-preview"; return; }
+  local model_count
+  model_count=$(grep -cE '^model[[:space:]]*=' "$cfg")
+  [ "$model_count" = "1" ] || { printf 'got:\n%s\n' "$(cat "$cfg")" >&2; die "explicit override should emit exactly 1 model line (got $model_count)"; return; }
+  grep -qE '^model[[:space:]]*=[[:space:]]*"kimi-k2\.6-preview"' "$cfg" \
+    || { printf 'got:\n%s\n' "$(cat "$cfg")" >&2; die "override value not written correctly"; return; }
+
+  # (c) Re-init with env unset MUST preserve the operator-pinned model.
+  # Operator intent wins over hats' empty default.
+  "$HATS_SCRIPT" codex kimi init >/dev/null 2>&1 \
+    || { die "hats codex kimi init rc!=0 on re-init"; return; }
+  grep -qE '^model[[:space:]]*=[[:space:]]*"kimi-k2\.6-preview"' "$cfg" \
+    || { printf 'got:\n%s\n' "$(cat "$cfg")" >&2; die "re-init with env-unset clobbered operator-pinned model — should preserve"; return; }
+
+  # (d) Doctor: info (not err) when no model is pinned; err when env var is
+  # set to a whitespace-only value. Provision a fresh env-unset dir first.
+  # Capture with `|| rc=$?` so set -e doesn't trip on doctor's non-zero exit
+  # (sandbox has no real Infisical → doctor rc=1 is expected; we care about
+  # the model-line output, not the overall doctor pass/fail).
+  rm -rf "$acct_dir"
+  "$HATS_SCRIPT" codex kimi init >/dev/null 2>&1
+  local doctor_unset doctor_unset_rc=0
+  doctor_unset=$("$HATS_SCRIPT" codex kimi doctor 2>&1) || doctor_unset_rc=$?
+  echo "$doctor_unset" | grep -q 'info no model pinned' \
+    || { printf 'got:\n%s\n' "$doctor_unset" >&2; die "doctor should emit 'info no model pinned' when env unset"; return; }
+  echo "$doctor_unset" | grep -qE 'FAIL (model|HATS_KIMI_CODEX_MODEL)' \
+    && { printf 'got:\n%s\n' "$doctor_unset" >&2; die "doctor should NOT err when env unset — that is the intended quieter default"; return; }
+
+  local doctor_malformed doctor_malformed_rc=0
+  doctor_malformed=$(HATS_KIMI_CODEX_MODEL="   " "$HATS_SCRIPT" codex kimi doctor 2>&1) || doctor_malformed_rc=$?
+  echo "$doctor_malformed" | grep -q 'FAIL HATS_KIMI_CODEX_MODEL is set to whitespace-only' \
+    || { printf 'got:\n%s\n' "$doctor_malformed" >&2; die "doctor should err on whitespace-only HATS_KIMI_CODEX_MODEL"; return; }
+
+  ok "codex-kimi model-unpin: unset→no stanza, explicit→written, re-init preserves operator pin, doctor info/err split correct"
+}
+
 test_fleet_symmetry_check_runs_clean() {
   # The cross-provider symmetry audit (scripts/hats-fleet-symmetry-check,
   # roadmap #4) mechanizes case-law B-11/A-28 — flag any `case
@@ -2520,6 +2585,7 @@ test_kimi_onboarding_flag_idempotent
 test_kimi_interactive_bypass_full_seed
 test_codex_kimi_env_isolation
 test_codex_kimi_config_toml_idempotent
+test_codex_kimi_unset_model_emits_no_stanza
 test_list_filter_flags
 test_fleet_symmetry_check_runs_clean
 
