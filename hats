@@ -610,6 +610,8 @@ _seed_claude_oauth_account_from_status() {
       [ -f "$_d/.claude.json" ] && _donors+=("$_d/.claude.json")
     done
   fi
+  # Global Claude Code config (relay-mesh install-all writes here).
+  [ -f "$HOME/.claude.json" ] && _donors+=("$HOME/.claude.json")
 
   python3 - "$acct_dir/.claude.json" "$status" "${_donors[@]}" <<'PYEOF' 2>/dev/null || true
 import json, os, sys, tempfile
@@ -3480,6 +3482,8 @@ _seed_kimi_claude_config_from_donor() {
       [ -f "$d/.claude.json" ] && _donors+=("$d/.claude.json")
     done
   fi
+  # Global Claude Code config (relay-mesh install-all writes here).
+  [ -f "$HOME/.claude.json" ] && _donors+=("$HOME/.claude.json")
 
   python3 - "$target" "$suffix" "${_donors[@]}" <<'PY' || return 1
 import json, os, sys, tempfile
