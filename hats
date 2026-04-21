@@ -72,6 +72,15 @@ SHARED_ALLOWLIST=()
 
 die() { echo "Error: $*" >&2; exit 1; }
 
+_is_macos() {
+  [ "$(uname -s 2>/dev/null || echo unknown)" = "Darwin" ]
+}
+
+_claude_uses_oauth_token_file() {
+  [ "$CURRENT_PROVIDER" = "claude" ] || return 1
+  _is_macos
+}
+
 # Append one JSON line to the audit log. No-op unless HATS_AUDIT=1. Keys
 # are passed as alternating name/value args after the event string. Values
 # are shell-escaped by python3 (same argv-via-stdin pattern as _token_info_*
@@ -159,8 +168,12 @@ _configure_provider() {
       RUNTIME_COMMAND="claude"
       RUNTIME_ENV_VAR="CLAUDE_CONFIG_DIR"
       DEFAULT_KEY="default_claude"
-      PRIMARY_AUTH_FILE=".credentials.json"
-      ISOLATED_PATTERNS=(".credentials.json" ".claude.json")
+      if _claude_uses_oauth_token_file; then
+        PRIMARY_AUTH_FILE=".oauth-token"
+      else
+        PRIMARY_AUTH_FILE=".credentials.json"
+      fi
+      ISOLATED_PATTERNS=(".credentials.json" ".claude.json" ".oauth-token")
       SHARED_ALLOWLIST=()
       ;;
     codex)
@@ -530,8 +543,12 @@ PY
 }
 
 _provider_login_hint_claude() {
-  # auth_mode arg ignored — claude login is single-flow.
-  echo "Run /login inside the session to authenticate, then /exit when done."
+  # auth_mode arg ignored — claude login is single-flow on Linux/Windows.
+  if _claude_uses_oauth_token_file; then
+    echo "macOS uses Keychain-backed Claude auth. hats will mint a per-account token via 'claude setup-token', then prompt you to paste it."
+  else
+    echo "Run /login inside the session to authenticate, then /exit when done."
+  fi
 }
 
 _provider_login_hint_codex() {
@@ -554,6 +571,102 @@ _provider_add_failure_hint() { _call_provider_variant provider_add_failure_hint 
 
 _credential_file() {
   echo "$(_account_dir "$1")/$PRIMARY_AUTH_FILE"
+}
+
+_claude_auth_status_with_token_file() {
+  local token_file="$1" acct_dir="$2"
+  [ -f "$token_file" ] || return 1
+  local token
+  token=$(cat "$token_file" 2>/dev/null || true)
+  [ -n "$token" ] || return 1
+  CLAUDE_CODE_OAUTH_TOKEN="$token" CLAUDE_CONFIG_DIR="$acct_dir" claude auth status 2>/dev/null
+}
+
+_seed_claude_oauth_account_from_status() {
+  local acct_dir="$1"
+  [ "$CURRENT_PROVIDER" = "claude" ] || return 0
+  _claude_uses_oauth_token_file || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  local token_file="$acct_dir/$PRIMARY_AUTH_FILE"
+  [ -f "$token_file" ] || return 0
+
+  local status
+  status=$(_claude_auth_status_with_token_file "$token_file" "$acct_dir") || return 0
+
+  python3 - "$acct_dir/.claude.json" "$status" <<'PYEOF' 2>/dev/null || true
+import json, os, sys, tempfile
+
+target = sys.argv[1]
+try:
+    status = json.loads(sys.argv[2])
+except Exception:
+    sys.exit(0)
+if not status.get("loggedIn"):
+    sys.exit(0)
+
+try:
+    with open(target) as f:
+        data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+except Exception:
+    data = {}
+
+changed = False
+if data.get("hasCompletedOnboarding") is not True:
+    data["hasCompletedOnboarding"] = True
+    changed = True
+
+oa = data.get("oauthAccount")
+if not isinstance(oa, dict) or not oa.get("accountUuid"):
+    email = status.get("email") or ""
+    org_id = status.get("orgId") or ""
+    org_name = status.get("orgName") or ""
+    sub = status.get("subscriptionType") or ""
+    account_uuid = org_id or email or "macos-oauth-token"
+    data["oauthAccount"] = {
+        "accountUuid": account_uuid,
+        "emailAddress": email,
+        "organizationUuid": org_id,
+        "billingType": sub,
+        "displayName": email,
+        "organizationName": org_name,
+        "organizationRole": "member",
+        "workspaceRole": "member",
+        "hasExtraUsageEnabled": False,
+        "accountCreatedAt": "",
+        "subscriptionCreatedAt": "",
+    }
+    changed = True
+
+for key, value in (
+    ("migrationVersion", 11),
+    ("opusProMigrationComplete", True),
+    ("sonnet1m45MigrationComplete", True),
+):
+    if data.get(key) != value:
+        data[key] = value
+        changed = True
+
+if not changed:
+    sys.exit(0)
+
+dirn = os.path.dirname(target) or "."
+tmp = tempfile.NamedTemporaryFile("w", dir=dirn, delete=False)
+try:
+    json.dump(data, tmp, indent=2, sort_keys=True)
+    tmp.write("\n")
+    tmp.flush()
+    os.fsync(tmp.fileno())
+    tmp.close()
+    os.replace(tmp.name, target)
+except Exception:
+    try:
+        os.unlink(tmp.name)
+    except Exception:
+        pass
+PYEOF
 }
 
 _setup_account_dir() {
@@ -636,6 +749,52 @@ _unlink_resource() {
 
 _token_info_claude() {
   local file="$1"
+  if _claude_uses_oauth_token_file; then
+    local acct_dir
+    acct_dir=$(dirname "$file")
+    python3 - "$file" "$acct_dir" <<'PYEOF' 2>/dev/null
+import json, os, subprocess, sys
+token_path, acct_dir = sys.argv[1], sys.argv[2]
+try:
+    token = open(token_path).read().strip()
+except Exception as e:
+    print(f'error={e}')
+    sys.exit(0)
+if not token:
+    print('error=empty oauth token')
+    sys.exit(0)
+env = os.environ.copy()
+env['CLAUDE_CODE_OAUTH_TOKEN'] = token
+env['CLAUDE_CONFIG_DIR'] = acct_dir
+try:
+    proc = subprocess.run(
+        ['claude', 'auth', 'status'],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+except Exception as e:
+    print(f'error={e}')
+    sys.exit(0)
+raw = (proc.stdout or '').strip()
+if not raw:
+    err = (proc.stderr or '').strip().replace('\n', ' ')[:160]
+    print(f'error={err or ("claude auth status rc=%d with empty output" % proc.returncode)}')
+    sys.exit(0)
+try:
+    data = json.loads(raw)
+except Exception as e:
+    print(f'error=invalid auth status JSON: {e}')
+    sys.exit(0)
+print(f'logged_in={bool(data.get("loggedIn"))}')
+print(f'auth_method={data.get("authMethod", "unknown")}')
+print(f'api_provider={data.get("apiProvider", "unknown")}')
+print(f'email={data.get("email", "")}')
+print('remote_control=False')
+print('expired=False')
+PYEOF
+    return
+  fi
   # File path passed via argv, not string-interpolated into the python source,
   # so a path containing quotes / shell metacharacters cannot break out into
   # Python code execution.
@@ -719,6 +878,7 @@ _show_account_status() {
   # parsing portable while preserving existing semantics (exp_date keeps the
   # date portion only, matching the old `[^ ]+` boundary).
   local expired="" has_refresh="" has_rc="" exp_date="" store="" account_id="" error=""
+  local logged_in="" auth_method="" api_provider="" email=""
   local _key _val
   while IFS='=' read -r _key _val; do
     case "$_key" in
@@ -729,6 +889,10 @@ _show_account_status() {
       expires)         exp_date="${_val%% *}" ;;
       store)           store="$_val" ;;
       account_id)      account_id="$_val" ;;
+      logged_in)       logged_in="$_val" ;;
+      auth_method)     auth_method="$_val" ;;
+      api_provider)    api_provider="$_val" ;;
+      email)           email="$_val" ;;
     esac
   done <<< "$info"
 
@@ -745,6 +909,18 @@ _show_account_status() {
   # Phase 2 rationale.
   case "$CURRENT_PROVIDER" in
     claude)
+      if _claude_uses_oauth_token_file; then
+        local status=""
+        if [ "$logged_in" = "True" ]; then
+          status="ok (oauth token; ${auth_method:-unknown}; ${api_provider:-unknown}"
+          [ -n "$email" ] && status="$status; $email"
+          status="$status) [no-rc]"
+        else
+          status="INVALID OAUTH TOKEN (run '$(_hats_cmd_prefix) add $name' to mint a new token)"
+        fi
+        echo "$status"
+        return
+      fi
       local status=""
       if [ "$expired" = "True" ]; then
         if [ "$has_refresh" = "True" ]; then
@@ -821,6 +997,38 @@ _choose_codex_auth_mode() {
 
 _run_provider_login_claude() {
   local acct_dir="$1"
+  local acct_name="${3:-$(basename "$acct_dir")}"
+  if _claude_uses_oauth_token_file; then
+    local token="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+    if [ -z "$token" ]; then
+      echo "Launching 'claude setup-token' for macOS account '$acct_name'..."
+      echo "Copy the printed token, then paste it below."
+      echo ""
+      claude setup-token || true
+      echo ""
+      printf "Paste CLAUDE_CODE_OAUTH_TOKEN for '%s' (leave blank to cancel): " "$acct_name" > /dev/tty
+      IFS= read -r token < /dev/tty || true
+    fi
+
+    [ -n "$token" ] || return 0
+
+    local auth_status
+    if ! auth_status=$(CLAUDE_CODE_OAUTH_TOKEN="$token" CLAUDE_CONFIG_DIR="$acct_dir" claude auth status 2>/dev/null); then
+      echo "Claude rejected the pasted token for '$acct_name'." >&2
+      return 0
+    fi
+
+    if ! printf '%s' "$auth_status" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("loggedIn") else 1)' 2>/dev/null; then
+      echo "Claude auth status did not accept the pasted token for '$acct_name'." >&2
+      return 0
+    fi
+
+    printf '%s\n' "$token" > "$acct_dir/$PRIMARY_AUTH_FILE"
+    chmod 600 "$acct_dir/$PRIMARY_AUTH_FILE" 2>/dev/null || true
+    _seed_claude_oauth_account_from_status "$acct_dir"
+    return 0
+  fi
+
   # auth_mode unused for claude — single-flow /login.
   CLAUDE_CONFIG_DIR="$acct_dir" claude || true
 }
@@ -851,6 +1059,15 @@ _run_provider_login() {
 
 _run_provider_command_claude() {
   local acct_dir="$1"; shift
+  if _claude_uses_oauth_token_file; then
+    local token_file="$acct_dir/$PRIMARY_AUTH_FILE"
+    [ -f "$token_file" ] || die "Account '$(basename "$acct_dir")' has no token file. $(_provider_add_failure_hint "$(basename "$acct_dir")")"
+    local token
+    token=$(cat "$token_file" 2>/dev/null || true)
+    [ -n "$token" ] || die "Account '$(basename "$acct_dir")' has an empty token file. Re-run: $(_provider_add_failure_hint "$(basename "$acct_dir")")"
+    CLAUDE_CODE_OAUTH_TOKEN="$token" CLAUDE_CONFIG_DIR="$acct_dir" claude "$@"
+    return
+  fi
   CLAUDE_CONFIG_DIR="$acct_dir" claude "$@"
 }
 
@@ -1094,7 +1311,7 @@ cmd_add() {
   echo "Starting $PROVIDER_TITLE for authentication..."
   echo "$(_provider_login_hint "$auth_mode")"
   echo ""
-  _run_provider_login "$acct_dir" "$auth_mode"
+  _run_provider_login "$acct_dir" "$auth_mode" "$name"
 
   if [ -f "$(_credential_file "$name")" ]; then
     chmod 600 "$(_credential_file "$name")" 2>/dev/null || true
@@ -1105,7 +1322,11 @@ cmd_add() {
     _audit_log "add" "account" "$name"
   else
     rm -rf "$acct_dir"
-    die "No credentials found after session. Account removed."
+    if [ "$CURRENT_PROVIDER" = "claude" ] && _claude_uses_oauth_token_file; then
+      die "No OAuth token captured for '$name'. Account removed."
+    else
+      die "No credentials found after session. Account removed."
+    fi
   fi
 }
 
@@ -1549,6 +1770,22 @@ ${fn_name}() {
   return \$_rc
 }
 KIMIFN
+    elif [ "$CURRENT_PROVIDER" = "claude" ] && _claude_uses_oauth_token_file; then
+      cat <<CLAUDEOAUTHFN
+${fn_name}() {
+  local _hats_token_file="$acct_dir/$PRIMARY_AUTH_FILE"
+  [ -f "\$_hats_token_file" ] || { echo "hats: missing token file for '$name' (\$_hats_token_file)" >&2; return 1; }
+  local _hats_token
+  _hats_token=\$(cat "\$_hats_token_file" 2>/dev/null)
+  [ -n "\$_hats_token" ] || { echo "hats: empty token file for '$name' (\$_hats_token_file)" >&2; unset _hats_token _hats_token_file; return 1; }
+  CLAUDE_CODE_OAUTH_TOKEN="\$_hats_token" \\
+  CLAUDE_CONFIG_DIR="$acct_dir" \\
+    $RUNTIME_COMMAND${extra_args} "\$@"
+  local _rc=\$?
+  unset _hats_token _hats_token_file
+  return \$_rc
+}
+CLAUDEOAUTHFN
     else
       echo "${fn_name}() { $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND${extra_args} \"\$@\"; }"
     fi
@@ -1969,7 +2206,11 @@ for event_name, event_items in (d.get("hooks") or {}).items():
     # 4a. Primary auth file presence + permissions.
     local auth_file="$acct_dir/$PRIMARY_AUTH_FILE"
     if [ ! -f "$auth_file" ]; then
-      echo "    FAIL $PRIMARY_AUTH_FILE missing (run '$(_hats_cmd_prefix) add $name' or '/login')"
+      if _claude_uses_oauth_token_file; then
+        echo "    FAIL $PRIMARY_AUTH_FILE missing (run '$(_hats_cmd_prefix) add $name' to mint a token)"
+      else
+        echo "    FAIL $PRIMARY_AUTH_FILE missing (run '$(_hats_cmd_prefix) add $name' or '/login')"
+      fi
       issues=$((issues + 1))
     else
       local mode
@@ -2311,7 +2552,7 @@ _build_export_manifest() {
   local name="$1" acct_dir="$2" include_sessions="$3"
   local -a isolated=()
   local f
-  for f in .credentials.json .claude.json auth.json config.toml; do
+  for f in .credentials.json .oauth-token .claude.json auth.json config.toml; do
     [ -e "$acct_dir/$f" ] && [ ! -L "$acct_dir/$f" ] && isolated+=("$f")
   done
   [ "$include_sessions" = "1" ] && [ -d "$acct_dir/sessions" ] && isolated+=("sessions")
@@ -2376,7 +2617,7 @@ cmd_export() {
   _build_export_manifest "$name" "$acct_dir" "$include_sessions" > "$stage/MANIFEST.json"
 
   local f
-  for f in .credentials.json .claude.json auth.json config.toml; do
+  for f in .credentials.json .oauth-token .claude.json auth.json config.toml; do
     [ -e "$acct_dir/$f" ] && [ ! -L "$acct_dir/$f" ] && cp -p "$acct_dir/$f" "$stage/$f"
   done
   if [ "$include_sessions" = "1" ] && [ -d "$acct_dir/sessions" ]; then
@@ -2479,7 +2720,7 @@ _validate_archive_entries() {
   while IFS= read -r line; do
     case "$line" in
       /*|*..*|*$'\n'*) echo "rejected archive entry: $line" >&2; bad=1 ;;
-      MANIFEST.json|.credentials.json|.claude.json|auth.json|config.toml) echo "$line" ;;
+      MANIFEST.json|.credentials.json|.oauth-token|.claude.json|auth.json|config.toml) echo "$line" ;;
       sessions/*)      echo "$line" ;;
       *)               echo "rejected unexpected archive entry: $line" >&2; bad=1 ;;
     esac
@@ -2617,11 +2858,11 @@ PYEOF
   # Copy staged files into the account dir. Preserve mode 600 for credential
   # files since tar --no-same-permissions stripped it.
   local f
-  for f in .credentials.json .claude.json auth.json config.toml; do
+  for f in .credentials.json .oauth-token .claude.json auth.json config.toml; do
     if [ -e "$stage/extracted/$f" ]; then
       cp -p "$stage/extracted/$f" "$target_dir/$f"
       case "$f" in
-        .credentials.json|auth.json) chmod 600 "$target_dir/$f" 2>/dev/null || true ;;
+        .credentials.json|.oauth-token|auth.json) chmod 600 "$target_dir/$f" 2>/dev/null || true ;;
       esac
     fi
   done
@@ -2661,6 +2902,86 @@ _verify_one_account() {
 
   if [ ! -f "$cfile" ]; then
     echo "    FAIL credentials file missing: $(basename "$cfile")"
+    return
+  fi
+
+  if [ "$CURRENT_PROVIDER" = "claude" ] && _claude_uses_oauth_token_file; then
+    local mode
+    mode=$(stat -c '%a' "$cfile" 2>/dev/null || stat -f '%Lp' "$cfile" 2>/dev/null || echo "?")
+    case "$mode" in
+      600|400) echo "    PASS oauth token mode=$mode" ;;
+      *)       echo "    WARN oauth token mode=$mode (expected 600 or 400)" ;;
+    esac
+
+    if [ ! -s "$cfile" ]; then
+      echo "    FAIL oauth token file is empty"
+      return
+    fi
+    echo "    PASS oauth token file is non-empty"
+
+    local probe
+    probe=$(python3 - "$cfile" "$acct_dir" <<'PYEOF' 2>/dev/null
+import json, os, subprocess, sys
+token_path, acct_dir = sys.argv[1], sys.argv[2]
+try:
+    token = open(token_path).read().strip()
+except Exception as e:
+    print(f'error={e}')
+    sys.exit(0)
+if not token:
+    print('error=empty oauth token')
+    sys.exit(0)
+env = os.environ.copy()
+env['CLAUDE_CODE_OAUTH_TOKEN'] = token
+env['CLAUDE_CONFIG_DIR'] = acct_dir
+try:
+    proc = subprocess.run(
+        ['claude', 'auth', 'status'],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+except Exception as e:
+    print(f'error={e}')
+    sys.exit(0)
+raw = (proc.stdout or '').strip()
+if not raw:
+    err = (proc.stderr or '').strip().replace('\n', ' ')[:160]
+    print(f'error={err or ("claude auth status rc=%d with empty output" % proc.returncode)}')
+    sys.exit(0)
+try:
+    data = json.loads(raw)
+except Exception as e:
+    print(f'error=invalid auth status JSON: {e}')
+    sys.exit(0)
+print(f'logged_in={bool(data.get("loggedIn"))}')
+print(f'auth_method={data.get("authMethod", "unknown")}')
+print(f'api_provider={data.get("apiProvider", "unknown")}')
+print(f'email={data.get("email", "")}')
+PYEOF
+)
+    local err="" logged_in="" auth_method="" api_provider="" email=""
+    local _k _v
+    while IFS='=' read -r _k _v; do
+      case "$_k" in
+        error)        err="$_v" ;;
+        logged_in)    logged_in="$_v" ;;
+        auth_method)  auth_method="$_v" ;;
+        api_provider) api_provider="$_v" ;;
+        email)        email="$_v" ;;
+      esac
+    done <<< "$probe"
+
+    if [ -n "$err" ]; then
+      echo "    FAIL oauth token status: $err"
+      return
+    fi
+    if [ "$logged_in" = "True" ]; then
+      echo "    PASS token accepted by claude auth status (${auth_method}; ${api_provider}${email:+; $email})"
+    else
+      echo "    FAIL token not accepted by claude auth status"
+    fi
+    echo "    WARN remote-control unavailable with setup-token / CLAUDE_CODE_OAUTH_TOKEN on macOS"
     return
   fi
 
@@ -3395,6 +3716,11 @@ _ensure_kimi_account_dir_claude() {
   # backend API key is fetched fresh from Infisical on every invocation.
   # Shared base symlinks are wired via _setup_account_dir so the kimi
   # session sees the same hooks/settings/agents tree as the other creds.
+  local donor_name
+  for donor_name in $(_accounts); do
+    [ "$donor_name" = "$HATS_KIMI_ACCOUNT_NAME" ] && continue
+    _seed_claude_oauth_account_from_status "$(_account_dir "$donor_name")"
+  done
   local acct_dir
   acct_dir=$(_account_dir "$HATS_KIMI_ACCOUNT_NAME")
   if [ ! -d "$acct_dir" ]; then
