@@ -31,7 +31,12 @@ HATS_AUDIT_LOG="${HATS_AUDIT_LOG:-$HATS_DIR/audit.log}"
 # the `claude` command only. (Tanwa reports prior sessions were poisoned by
 # accidental `export` in .zshrc.)
 HATS_KIMI_ACCOUNT_NAME="kimi"
-HATS_KIMI_BASE_URL="${HATS_KIMI_BASE_URL:-https://api.moonshot.ai/anthropic}"
+# Kimi's official third-party-agents doc prescribes api.kimi.com/coding/ as
+# the Anthropic-compatible endpoint. The prior default (api.moonshot.ai/
+# anthropic) is Moonshot's general-purpose inference endpoint and fails the
+# canary because it doesn't host the coding-agent-specific routes. See
+# https://www.kimi.com/code/docs/en/more/third-party-agents.html.
+HATS_KIMI_BASE_URL="${HATS_KIMI_BASE_URL:-https://api.kimi.com/coding/}"
 HATS_KIMI_INFISICAL_SECRET_NAME="${HATS_KIMI_INFISICAL_SECRET_NAME:-KIMI_API_KEY}"
 HATS_KIMI_INFISICAL_PATH="${HATS_KIMI_INFISICAL_PATH:-/servers/tenacity}"
 HATS_KIMI_INFISICAL_PROJECT_ID="${HATS_KIMI_INFISICAL_PROJECT_ID:-635f03f1-ff77-445d-b352-5f1cd1f53ecc}"
@@ -1445,6 +1450,14 @@ HEADER
 # Critical safety: ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY are inlined on the
 # claude invocation, NEVER exported. Verified by 'hats kimi doctor'.
 ${fn_name}() {
+  # Auto-restore the hasCompletedOnboarding flag if absent. Prevents the
+  # platform.claude.com OAuth wall from firing on a kimi session after the
+  # operator (or a reinstall) wipes ~/.hats/claude/kimi/.claude.json.
+  if ! grep -q '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$acct_dir/.claude.json" 2>/dev/null; then
+    $(_hats_cmd_prefix) kimi init >/dev/null 2>&1 || {
+      echo "kimi: hats kimi init failed — OAuth wall may block this session" >&2
+    }
+  fi
   local _kimi_key
   _kimi_key=\$(
     set +u
@@ -2853,6 +2866,49 @@ _kimi_fetch_api_key() {
   ) 2>/dev/null
 }
 
+_ensure_kimi_onboarding_flag() {
+  # Write (or merge-in) hasCompletedOnboarding:true into $acct_dir/.claude.json.
+  # Kimi's docs prescribe this flag so a fresh CLAUDE_CONFIG_DIR skips the
+  # platform.claude.com OAuth wall on first launch — OAuth is irrelevant for
+  # an API-key-backed backend and the wall otherwise blocks the kimi flow.
+  # Idempotent: preserves every other key already in the file.
+  local acct_dir="$1"
+  local target="$acct_dir/.claude.json"
+  [ -d "$acct_dir" ] || return 0
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$target" <<'PY' || return 1
+import json, os, sys, tempfile
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        d = {}
+except FileNotFoundError:
+    d = {}
+except (json.JSONDecodeError, OSError):
+    d = {}
+if d.get("hasCompletedOnboarding") is True:
+    sys.exit(0)
+d["hasCompletedOnboarding"] = True
+tmp = tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path) or ".", delete=False)
+json.dump(d, tmp, indent=2, sort_keys=True)
+tmp.flush(); os.fsync(tmp.fileno()); tmp.close()
+os.replace(tmp.name, path)
+PY
+  else
+    # Pure-bash fallback: safe only when file is absent or is the canonical
+    # empty '{}' — anything else risks clobbering keys we can't parse.
+    if [ ! -s "$target" ] || [ "$(tr -d ' \n\t' < "$target")" = '{}' ]; then
+      printf '{"hasCompletedOnboarding": true}\n' > "$target"
+    else
+      echo "kimi: python3 missing — cannot merge hasCompletedOnboarding into existing $target. Install python3 or edit manually." >&2
+      return 1
+    fi
+  fi
+}
+
 _ensure_kimi_account_dir() {
   # Create ~/.hats/claude/kimi/ with the standard claude-config skeleton.
   # Unlike the OAuth-backed accounts, kimi has NO .credentials.json — the
@@ -2861,15 +2917,16 @@ _ensure_kimi_account_dir() {
   # session sees the same hooks/settings/agents tree as the other creds.
   local acct_dir
   acct_dir=$(_account_dir "$HATS_KIMI_ACCOUNT_NAME")
-  if [ -d "$acct_dir" ]; then
-    return 0
+  if [ ! -d "$acct_dir" ]; then
+    [ -d "$PROVIDER_DIR" ] || die "hats not initialized. Run 'hats init' first."
+    mkdir -p "$acct_dir"
+    echo '{}' > "$acct_dir/.claude.json"
+    _setup_account_dir "$HATS_KIMI_ACCOUNT_NAME"
+    _audit_log "kimi-init" "account" "$HATS_KIMI_ACCOUNT_NAME"
   fi
-  [ -d "$PROVIDER_DIR" ] || die "hats not initialized. Run 'hats init' first."
-
-  mkdir -p "$acct_dir"
-  echo '{}' > "$acct_dir/.claude.json"
-  _setup_account_dir "$HATS_KIMI_ACCOUNT_NAME"
-  _audit_log "kimi-init" "account" "$HATS_KIMI_ACCOUNT_NAME"
+  # Always (re-)ensure the OAuth-bypass flag is set, even when the acct_dir
+  # pre-existed — upgrades from pre-fix hats need the flag too.
+  _ensure_kimi_onboarding_flag "$acct_dir"
 }
 
 cmd_kimi() {
@@ -2978,6 +3035,18 @@ cmd_kimi_doctor() {
   if [ "$_leaked" = "0" ]; then
     echo "  OK   env-isolation: ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY unset in parent shell"
   else
+    issues=$((issues + 1))
+  fi
+
+  # 5. hasCompletedOnboarding flag present. Without this, a fresh kimi
+  # session hits the platform.claude.com OAuth wall even though the
+  # API-key backend doesn't need OAuth. `hats kimi init` provisions it;
+  # the shell function auto-restores it if wiped.
+  local _flag_file="$acct_dir/.claude.json"
+  if [ -f "$_flag_file" ] && grep -q '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$_flag_file" 2>/dev/null; then
+    echo "  OK   hasCompletedOnboarding:true in $_flag_file"
+  else
+    echo "  FAIL hasCompletedOnboarding flag missing in $_flag_file — OAuth wall will fire. Run 'hats kimi init'."
     issues=$((issues + 1))
   fi
 

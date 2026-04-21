@@ -1670,7 +1670,7 @@ EOF
   fi
 
   # Inner call received the kimi env vars.
-  echo "$probe_out" | grep -q 'INNER BASE=https://api.moonshot.ai/anthropic' \
+  echo "$probe_out" | grep -q 'INNER BASE=https://api.kimi.com/coding/' \
     || { printf 'got:\n%s\n' "$probe_out" >&2; die "kimi did not set ANTHROPIC_BASE_URL for inner claude call"; return; }
   echo "$probe_out" | grep -q 'INNER KEY_PREFIX=sk-' \
     || { printf 'got:\n%s\n' "$probe_out" >&2; die "kimi did not pass API key with sk- prefix to inner claude"; return; }
@@ -1684,6 +1684,90 @@ EOF
     || { printf 'got:\n%s\n' "$probe_out" >&2; die "kimi LEAKED ANTHROPIC_API_KEY into parent shell"; return; }
 
   ok "kimi shell function inline-sets env for inner claude + cleans parent shell (env-isolation regression fence)"
+}
+
+test_kimi_onboarding_flag_idempotent() {
+  # hats kimi init MUST write hasCompletedOnboarding:true into the kimi
+  # account's .claude.json so a fresh CLAUDE_CONFIG_DIR skips the
+  # platform.claude.com OAuth wall on first launch. Idempotent across:
+  #   (a) a brand-new init (no file yet),
+  #   (b) re-init over the '{}' skeleton hats writes internally,
+  #   (c) re-init over a file already carrying other operator keys —
+  #       those keys must be preserved.
+  # Also exercises the shell-function auto-init guard: if the flag is
+  # stripped, calling the kimi function must restore it before the inner
+  # claude invocation.
+
+  local acct_dir="$HATS_DIR/claude/kimi"
+  local flag_file="$acct_dir/.claude.json"
+
+  # (a) Fresh init from no kimi dir.
+  rm -rf "$acct_dir"
+  "$HATS_SCRIPT" kimi init >/dev/null 2>&1 || { die "hats kimi init rc!=0 on fresh sandbox"; return; }
+  [ -f "$flag_file" ] || { die "hats kimi init did not create $flag_file"; return; }
+  grep -q '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$flag_file" \
+    || { printf 'got:\n%s\n' "$(cat "$flag_file")" >&2; die "hasCompletedOnboarding not set after fresh init"; return; }
+
+  # (b) Re-init: still green, no duplication.
+  "$HATS_SCRIPT" kimi init >/dev/null 2>&1 || { die "hats kimi init rc!=0 on re-run"; return; }
+  local true_count
+  true_count=$(grep -c '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$flag_file")
+  [ "$true_count" = "1" ] || { printf 'got:\n%s\n' "$(cat "$flag_file")" >&2; die "re-init duplicated hasCompletedOnboarding (count=$true_count)"; return; }
+
+  # (c) Merge into pre-seeded keys — those keys must survive.
+  cat > "$flag_file" <<'EOF'
+{"operator_custom_key": "preserve-me", "tool_trust_root": "/some/path"}
+EOF
+  "$HATS_SCRIPT" kimi init >/dev/null 2>&1 || { die "hats kimi init rc!=0 on pre-seeded file"; return; }
+  grep -q '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$flag_file" \
+    || { printf 'got:\n%s\n' "$(cat "$flag_file")" >&2; die "merge did not add hasCompletedOnboarding"; return; }
+  grep -q '"operator_custom_key"[[:space:]]*:[[:space:]]*"preserve-me"' "$flag_file" \
+    || { printf 'got:\n%s\n' "$(cat "$flag_file")" >&2; die "merge clobbered operator_custom_key"; return; }
+  grep -q '"tool_trust_root"' "$flag_file" \
+    || { printf 'got:\n%s\n' "$(cat "$flag_file")" >&2; die "merge clobbered tool_trust_root"; return; }
+
+  # (d) Shell-function auto-init: strip the flag, invoke kimi, verify the
+  # flag is restored before the inner claude stub runs.
+  echo '{}' > "$flag_file"
+
+  local fake_env="$SANDBOX_ROOT/.infisical.env"
+  cat > "$fake_env" <<EOF
+INFISICAL_UNIVERSAL_AUTH_CLIENT_ID=smoke-client-id
+INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=smoke-client-secret
+EOF
+  local emitted
+  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" shell-init 2>/dev/null)
+
+  # In production the emitted kimi function calls bare `hats kimi init` via
+  # the auto-init guard, and operators have hats on PATH (install.sh ships it
+  # to a PATH-visible prefix). The sandbox doesn't, so put HATS_REPO on PATH
+  # for the probe. This also documents the PATH contract the guard depends on.
+  local probe_out probe_rc
+  probe_out=$(PATH="$HATS_REPO:$PATH" bash -c '
+    set +e
+    eval "$1"
+    infisical() {
+      case "$1" in
+        login)  echo "smoke-token" ;;
+        secrets) echo "sk-kimi-smoke-$(printf '%.0s0' {1..50})" ;;
+        *)       return 0 ;;
+      esac
+    }
+    export -f infisical
+    claude() { :; }
+    export -f claude
+    kimi stub-prompt
+  ' _ "$emitted" 2>&1)
+  probe_rc=$?
+  if [ "$probe_rc" -ne 0 ]; then
+    printf 'got:\n%s\n' "$probe_out" >&2
+    die "kimi auto-init probe exited non-zero (rc=$probe_rc)"
+    return
+  fi
+  grep -q '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$flag_file" \
+    || { printf 'flag file now:\n%s\n' "$(cat "$flag_file")" >&2; die "shell-function guard did not auto-restore hasCompletedOnboarding"; return; }
+
+  ok "hats kimi init + shell-function guard set/merge/auto-restore hasCompletedOnboarding idempotently"
 }
 
 test_fleet_symmetry_check_runs_clean() {
@@ -1755,6 +1839,7 @@ test_verify_command
 test_export_import_roundtrip
 test_export_openssl_backend
 test_kimi_env_isolation
+test_kimi_onboarding_flag_idempotent
 test_list_filter_flags
 test_fleet_symmetry_check_runs_clean
 
