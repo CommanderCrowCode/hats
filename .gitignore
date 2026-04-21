@@ -4,6 +4,8 @@
 
 # Exceptions — rollback backups for documented config mitigations
 !docs/backups/*.json
+# Exceptions — provider-rules lint data for AGENTS.md mirror tooling
+!docs/provider-rules/*.json
 
 # Claude Code session scratch — per-workdir, not source
 .claude/

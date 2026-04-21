@@ -1,0 +1,134 @@
+{
+  "provider": "codex",
+  "source_url": "https://developers.openai.com/codex/guides/agents-md",
+  "schema_version": "1",
+  "notes": "Rules for AGENTS.md content when read by OpenAI codex CLI. POSIX ERE only (BSD-compatible: no \\d \\w \\s \\b). ID namespace is shared across provider files and describes WHAT is caught (claude-CLI feature vs anthropic-model assumption), not the reader. Co-authored with hats-mirror-engineer (ag-1016b6fbf869d5c2): IDs CLAUDE-CLI-001/003/004/005/006 + ANTHROPIC-MODEL-001/002/003 adopted from their design-doc §3 sketch (minor tightening); CLAUDE-CLI-002 regex rewritten for BSD compat (was `\\b`-dependent); mirror's sketched CLAUDE-CLI-007 (`MCP__*`) was DROPPED — codex has full relay-mesh MCP parity per hats-codex-engineer's canary (msg-4586c680 2026-04-21), so MCP tool-name refs are NOT codex-incompatible. IDs CLAUDE-CLI-007..009 + ANTHROPIC-MODEL-004..005 added by hats-e2e-engineer. All patterns default warn; err-class reserved for hard-provably-wrong content that would produce actionable miswiring (not just misleading text). Author: hats-e2e-engineer 2026-04-21. Version: 1.",
+  "patterns": [
+    {
+      "id": "CLAUDE-CLI-001",
+      "regex": "(^|[^A-Za-z_-])(subagent_type|Task tool)([^A-Za-z_-]|$)",
+      "severity": "err",
+      "category": "strip-from-agents",
+      "rationale": "The 'Task tool' and 'subagent_type' idiom are claude-code harness primitives for spawning subagents. Codex has Agent SDK + codex exec, not a tool-calling Task primitive. Instructions like 'use the Task tool with subagent_type=qa-tester' are actionable-wrong under codex.",
+      "citation": "https://developers.openai.com/codex/guides/agents-sdk — codex agent spawning uses Agent SDK, not a 'Task tool'.",
+      "action": "strip"
+    },
+    {
+      "id": "CLAUDE-CLI-002",
+      "regex": "(^|[^A-Za-z_-])slash commands?([^A-Za-z_-]|$)",
+      "severity": "warn",
+      "category": "strip-from-agents",
+      "rationale": "'Slash command' is claude-code-specific terminology for the /skill-name invocation surface. Codex has its own CLI-command convention but no '/foo' slash-command mechanism in the same sense. Flagged as warn (not err) because the phrase 'slash command' occasionally appears in non-claude contexts; maintainer should clarify which system.",
+      "citation": "https://developers.openai.com/codex/cli/reference — codex uses subcommands (exec, login, etc.), not in-chat slash commands.",
+      "action": "warn"
+    },
+    {
+      "id": "CLAUDE-CLI-003",
+      "regex": "(^|[^A-Za-z_-])(PostToolUse|PreToolUse|SessionStart|UserPromptSubmit|Stop)(Hook)?([^A-Za-z_-]|$)",
+      "severity": "err",
+      "category": "strip-from-agents",
+      "rationale": "These are claude-code hook event names (from settings.json hooks config). Codex has no event-hook mechanism at the CLI layer; references to these hook types are actionable-wrong when read by codex.",
+      "citation": "claude-code hooks docs (internal); codex config.toml has no hook event vocabulary.",
+      "action": "strip"
+    },
+    {
+      "id": "CLAUDE-CLI-004",
+      "regex": "(^|[^A-Za-z_-])claude\\.ai/code([^A-Za-z_-]|$)",
+      "severity": "err",
+      "category": "strip-from-agents",
+      "rationale": "Product URL specific to Claude Code web app. No codex equivalent; this URL is a hard-claude reference that cannot be followed by a codex-bound agent.",
+      "citation": "Anthropic product URL (claude.ai/code is Claude Code's web surface).",
+      "action": "strip"
+    },
+    {
+      "id": "CLAUDE-CLI-005",
+      "regex": "(^|[^A-Za-z_-])(CLAUDE_CONFIG_DIR|CLAUDE_PROJECT_DIR|CLAUDE_CODE_[A-Z_]+|~/\\.claude(/|$))",
+      "severity": "err",
+      "category": "strip-from-agents",
+      "rationale": "CLAUDE_* env vars and the ~/.claude path anchor guidance to claude-code's config tree. Codex uses CODEX_HOME (default ~/.codex); guidance pointing at ~/.claude or setting CLAUDE_* will misdirect codex-bound agents. Err-class because these are concrete, actionable references.",
+      "citation": "https://developers.openai.com/codex/guides/agents-md — global scope uses CODEX_HOME (~/.codex default); https://docs.anthropic.com/ for CLAUDE_* env vars.",
+      "action": "replace:~/.codex or $CODEX_HOME"
+    },
+    {
+      "id": "CLAUDE-CLI-006",
+      "regex": "(^|[^A-Za-z_-])(TaskCreate|TaskUpdate|TaskList|TaskGet|TaskOutput|TaskStop|TeamCreate|TeamDelete|teammateMode|CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS)([^A-Za-z_-]|$)",
+      "severity": "err",
+      "category": "strip-from-agents",
+      "rationale": "These are claude-code-specific tool/API surface names: TaskCreate/TaskList/TaskGet (task-tracking), TeamCreate/TeamDelete (agent teams), teammateMode + CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS (teams env gates). Codex has no parallel primitives at these names; calls would fail or be silently ignored.",
+      "citation": "Claude Code tool surface (see /home/tanwa/.claude/CLAUDE.md §'Agent Teams' + §'Tool Usage').",
+      "action": "strip"
+    },
+    {
+      "id": "CLAUDE-CLI-007",
+      "regex": "(^|[^A-Za-z_-])claude-code([^A-Za-z_-]|$)",
+      "severity": "warn",
+      "category": "strip-from-agents",
+      "rationale": "Explicit 'claude-code' product name references are claude-specific. Under codex, these should either be dropped or qualified ('when running under claude-code, ...'). Warn not err — conditional guidance CAN be valid even in codex-read docs.",
+      "citation": "Inference from https://agents.md/ — spec targets cross-tool portability; hard product-name pinning defeats it.",
+      "action": "warn"
+    },
+    {
+      "id": "CLAUDE-CLI-008",
+      "regex": "(^|[^A-Za-z_-])Skill tool([(]|[^A-Za-z_-]|$)",
+      "severity": "err",
+      "category": "strip-from-agents",
+      "rationale": "'The Skill tool' is a claude-code invocation surface for bundled skills. Codex has its own agent-skills system (https://developers.openai.com/codex/skills) with different semantics — invoked as tool definitions via Agent SDK, not a single 'Skill tool'. Err-class because instructions 'use the Skill tool to run X' are actionable-wrong under codex.",
+      "citation": "https://developers.openai.com/codex/skills — codex skills dispatch via Agent SDK tool definitions.",
+      "action": "strip"
+    },
+    {
+      "id": "CLAUDE-CLI-009",
+      "regex": "(^|[^A-Za-z_-])(Explore|Plan) (agent|subagent)([^A-Za-z_-]|$)",
+      "severity": "warn",
+      "category": "strip-from-agents",
+      "rationale": "'Explore agent' and 'Plan agent' are claude-code's built-in subagent types (see the Task-tool subagent_type taxonomy). Codex has no matching named subagents — its Agent SDK primitives are user-defined. Warn (not err) because the words Explore/Plan also appear in generic planning contexts.",
+      "citation": "Claude Code built-in subagent list (Explore, Plan are first-class types in Task tool).",
+      "action": "warn"
+    },
+    {
+      "id": "ANTHROPIC-MODEL-001",
+      "regex": "(^|[^A-Za-z_-])claude[- ](opus|sonnet|haiku)[- ]?[0-9]",
+      "severity": "err",
+      "category": "anthropic-model-assumption",
+      "rationale": "Specific Anthropic model IDs (claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5, etc.) are not valid --model arguments for codex and have no routing semantics in OpenAI's codex CLI. An AGENTS.md instructing 'use claude-opus-4-7 for reasoning' is actionable-wrong under codex — the model name cannot resolve.",
+      "citation": "https://developers.openai.com/codex/cli/reference — codex --model accepts OpenAI model IDs only (gpt-5, gpt-5-codex, etc.).",
+      "action": "strip"
+    },
+    {
+      "id": "ANTHROPIC-MODEL-002",
+      "regex": "(^|[^A-Za-z_-])(knowledge cutoff|training (data )?cutoff)([^A-Za-z_-]|$)",
+      "severity": "warn",
+      "category": "anthropic-model-assumption",
+      "rationale": "Claims like 'Claude's knowledge cutoff is January 2026' bind a codex-reading agent to a false self-reference when the actual model is GPT-class (different cutoff). Warn (not err) because the phrase is generic and may appear in neutral research contexts.",
+      "citation": "Anthropic model cards vs OpenAI model cards diverge on cutoff dates; mirror-engineer design doc §3 + reference_kimi_third_party_agent_contract.md.",
+      "action": "warn"
+    },
+    {
+      "id": "ANTHROPIC-MODEL-003",
+      "regex": "(^|[^A-Za-z_-])(Anthropic SDK|anthropic\\.Anthropic[(]|from anthropic import|ANTHROPIC_API_KEY|api\\.anthropic\\.com)",
+      "severity": "warn",
+      "category": "anthropic-model-assumption",
+      "rationale": "Concrete Anthropic API/SDK code references. Tightened from mirror-engineer's initial sketch ('Anthropic (SDK|API)') to avoid false-positives on generic prose ('we use the Anthropic API'); these patterns specifically target code-level refs (Python import, SDK construction, API key env, API endpoint). Warn not err — a codex-read doc MAY legitimately describe an Anthropic-API-using tool component.",
+      "citation": "https://docs.anthropic.com/en/api/sdks — anthropic SDK patterns; hats-kimi-engineer's wrapper handles ANTHROPIC_* at runtime.",
+      "action": "warn"
+    },
+    {
+      "id": "ANTHROPIC-MODEL-004",
+      "regex": "(^|[^A-Za-z_-])(opus-4-7|sonnet-4-6|haiku-4-5)([^A-Za-z_-]|$)",
+      "severity": "err",
+      "category": "anthropic-model-assumption",
+      "rationale": "Specific model version strings without the 'claude-' prefix (e.g. 'use opus-4-7 for X'). Same actionable-wrong issue as ANTHROPIC-MODEL-001, different surface form.",
+      "citation": "Claude model IDs per /home/tanwa/.claude/CLAUDE.md 'Environment' block.",
+      "action": "strip"
+    },
+    {
+      "id": "ANTHROPIC-MODEL-005",
+      "regex": "(^|[^A-Za-z_-])(ANTHROPIC_API_KEY|ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN)([^A-Za-z_-]|$)",
+      "severity": "err",
+      "category": "anthropic-model-assumption",
+      "rationale": "ANTHROPIC_* env vars govern claude-code + claude-kimi wrapper auth. Codex auth uses OPENAI_API_KEY or ChatGPT OAuth tokens in ~/.codex/auth.json (see commit 160ff35). Instructions setting ANTHROPIC_* have no effect on codex runtime and will mislead.",
+      "citation": "https://developers.openai.com/codex/cli — codex auth surfaces; hats commit 160ff35 for auth.json schema.",
+      "action": "strip"
+    }
+  ]
+}

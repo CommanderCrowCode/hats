@@ -1052,6 +1052,77 @@ test_install_is_idempotent_on_reinstall() {
   fi
 }
 
+test_install_then_invoke_through_PATH() {
+  # Regression fence for feedback_installed_vs_source_drift.md (2026-04-21
+  # incident: shell-init'd kimi function was served from a stale
+  # /home/tanwa/.local/bin/hats, masking the 8746d5a base-URL fix for ~30min
+  # of debugging. All other smoke tests use $HATS_SCRIPT — the repo-root
+  # binary — and never exercise the installed-binary code path.
+  #
+  # Contract: after install.sh runs, the installed binary on PATH must emit
+  # shell-init output that matches the source binary byte-for-byte. shell-init
+  # has no COMMIT interpolation (only `version` does), so any divergence
+  # signals a stale-install, sed-stamp side effect, or installer bug.
+  #
+  # shell-init only materializes per-account functions, so we stage a kimi
+  # account first — that's the exact path the 2026-04-21 incident burned on
+  # (the emitted kimi() body inlines HATS_KIMI_BASE_URL, which is the value
+  # stale installs got wrong). Without an account the emission is empty and
+  # comparison is degenerate.
+  local dest rc=0 src_out="" inst_out=""
+  dest=$(mktemp -d "${TMPDIR:-/tmp}/hats-drift-XXXXXX")
+
+  "$HATS_REPO/install.sh" "$dest" >/dev/null 2>&1 || rc=$?
+
+  if [ "$rc" -ne 0 ] || [ ! -x "$dest/hats" ]; then
+    rm -rf "$dest"
+    die "install.sh failed (rc=$rc) — cannot compare PATH emission"
+    return
+  fi
+
+  # Stage a kimi account in the form shell-init recognizes (_accounts picks
+  # up directories with a credentials file). HATS_KIMI_ACCOUNT_NAME="kimi"
+  # triggers the kimi-specific emission branch in cmd_shell_init, whose body
+  # inlines HATS_KIMI_BASE_URL — the exact byte that drifted in the 2026-04-21
+  # incident.
+  local kimi_acct="$HATS_DIR/claude/kimi"
+  mkdir -p "$kimi_acct"
+  : > "$kimi_acct/.credentials.json"
+  chmod 600 "$kimi_acct/.credentials.json"
+  echo '{"hasCompletedOnboarding":true}' > "$kimi_acct/.claude.json"
+
+  src_out=$("$HATS_SCRIPT" shell-init 2>/dev/null) || {
+    rm -rf "$dest"
+    die "source shell-init exited non-zero"
+    return
+  }
+  inst_out=$(PATH="$dest:$PATH" "$dest/hats" shell-init 2>/dev/null) || {
+    rm -rf "$dest"
+    die "installed shell-init exited non-zero"
+    return
+  }
+
+  # Sanity: the emission must actually carry the kimi function body we
+  # care about. If both are empty this test degenerates to "null == null"
+  # and passes vacuously.
+  if ! printf '%s' "$src_out" | grep -q 'ANTHROPIC_BASE_URL='; then
+    rm -rf "$dest" "$kimi_acct"
+    die "shell-init emission does not contain expected kimi function body — test would pass vacuously"
+    return
+  fi
+
+  if [ "$src_out" = "$inst_out" ]; then
+    ok "install-then-invoke-through-PATH emits identical shell-init bytes (stale-install drift fence)"
+  else
+    local diff_excerpt
+    diff_excerpt=$(diff <(printf '%s' "$src_out") <(printf '%s' "$inst_out") | head -20)
+    printf 'diff (src vs installed, first 20 lines):\n%s\n' "$diff_excerpt" >&2
+    die "stale-install drift detected — installed binary emits different shell-init than source"
+  fi
+
+  rm -rf "$dest" "$kimi_acct"
+}
+
 test_config_migration_is_idempotent() {
   # Plant a legacy `default` key, run hats, verify it migrates to default_claude.
   cat > "$HATS_DIR/config.toml" <<'EOF'
@@ -2205,6 +2276,7 @@ test_install_rejects_too_many_args
 test_install_to_sandbox_stamps_commit
 test_install_check_gates_on_smoke
 test_install_is_idempotent_on_reinstall
+test_install_then_invoke_through_PATH
 test_config_migration_is_idempotent
 test_doctor_metrics_flag
 test_call_provider_variant_dispatch
