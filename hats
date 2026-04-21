@@ -3489,7 +3489,7 @@ Subcommands:
               config.toml provider stanza.
   fetch-key   Fetch + print a key-prefix summary (no secret leaked).
 
-The 'codex_kimi' shell function (emitted by 'hats codex shell-init')
+The \`codex_kimi\` shell function (emitted by \`hats codex shell-init\`)
 inlines CODEX_HOME + OPENAI_API_KEY on the \`codex\` invocation — env
 vars never leak to the parent shell or subsequent sessions. Base URL
 lives in config.toml (codex does NOT honor OPENAI_BASE_URL env var).
