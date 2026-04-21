@@ -2508,6 +2508,84 @@ test_codex_kimi_unset_model_emits_no_stanza() {
   ok "codex-kimi model-unpin: unset→no stanza, explicit→written, re-init preserves operator pin, doctor info/err split correct"
 }
 
+test_codex_kimi_doctor_flags_wire_api_incompat() {
+  # P1 directive 2026-04-21 via hats-lead msg-e6ef90ffcd0dd813 (praetor
+  # msg-e4343e5a3515e1da). codex v0.118.0 hard-rejects wire_api="chat";
+  # Kimi serves /chat/completions only (no /responses route anywhere). End-
+  # to-end codex-kimi is non-functional; doctor surfaces this at the
+  # earliest place operators would see it rather than silently 404 at first
+  # codex_kimi "..." call. Receipts in docs/codex-kimi-compat.md.
+  #
+  # This test asserts: doctor FAILs by default with the cited reason + hint
+  # at the HATS_KIMI_CODEX_BYPASS_COMPAT_CHECK escape hatch + points at
+  # docs/codex-kimi-compat.md.
+
+  local acct_dir="$HATS_DIR/codex/kimi"
+  rm -rf "$acct_dir"
+  "$HATS_SCRIPT" codex init >/dev/null 2>&1 || true
+  "$HATS_SCRIPT" codex kimi init >/dev/null 2>&1 \
+    || { die "hats codex kimi init rc!=0 on fresh sandbox"; return; }
+
+  local doctor_out doctor_rc=0
+  doctor_out=$("$HATS_SCRIPT" codex kimi doctor 2>&1) || doctor_rc=$?
+
+  # Doctor must fail (rc!=0) AND emit the specific wire_api incompat FAIL.
+  [ "$doctor_rc" -ne 0 ] \
+    || { printf 'got:\n%s\n' "$doctor_out" >&2; die "doctor should err (rc!=0) when wire_api=chat + Kimi endpoint combo is emitted by default"; return; }
+
+  echo "$doctor_out" | grep -q 'FAIL codex-kimi DISABLED' \
+    || { printf 'got:\n%s\n' "$doctor_out" >&2; die "doctor should emit the FAIL codex-kimi DISABLED marker"; return; }
+  echo "$doctor_out" | grep -q 'wire_api=' \
+    || { printf 'got:\n%s\n' "$doctor_out" >&2; die "doctor FAIL should cite wire_api as the root cause"; return; }
+  echo "$doctor_out" | grep -q 'HATS_KIMI_CODEX_BYPASS_COMPAT_CHECK' \
+    || { printf 'got:\n%s\n' "$doctor_out" >&2; die "doctor FAIL should name the escape-hatch env var"; return; }
+  echo "$doctor_out" | grep -q 'docs/codex-kimi-compat.md' \
+    || { printf 'got:\n%s\n' "$doctor_out" >&2; die "doctor FAIL should point to docs/codex-kimi-compat.md"; return; }
+
+  ok "hats codex kimi doctor FAILs by default on wire_api vs Kimi-endpoint incompat (cites cause + bypass env var + docs)"
+}
+
+test_codex_kimi_bypass_env_gate_allows_emit() {
+  # Operator-escape hatch: HATS_KIMI_CODEX_BYPASS_COMPAT_CHECK=1 silences the
+  # wire_api-incompat FAIL so LiteLLM-proxy operators (see
+  # docs/codex-kimi-compat.md workaround section) can actually USE the
+  # config.toml the wrapper emits. Verify:
+  #   (a) env=1 downgrades FAIL to WARN line; doctor returns 0 for that check
+  #   (b) config.toml continues to emit the provider block unchanged (base_url,
+  #       wire_api, env_key) so the operator's shim can sit in front of it
+
+  local acct_dir="$HATS_DIR/codex/kimi"
+  local cfg="$acct_dir/config.toml"
+  rm -rf "$acct_dir"
+  "$HATS_SCRIPT" codex init >/dev/null 2>&1 || true
+  "$HATS_SCRIPT" codex kimi init >/dev/null 2>&1 \
+    || { die "hats codex kimi init rc!=0"; return; }
+
+  # (a) doctor with bypass env=1 emits WARN, no FAIL on the wire_api check.
+  # rc may still be non-zero because of other FAIL lines (Infisical fetch in
+  # sandbox) — we only assert the wire_api-specific downgrade.
+  local doctor_bypassed
+  doctor_bypassed=$(HATS_KIMI_CODEX_BYPASS_COMPAT_CHECK=1 "$HATS_SCRIPT" codex kimi doctor 2>&1) || true
+  echo "$doctor_bypassed" | grep -q 'WARN wire_api=chat incompatibility suppressed' \
+    || { printf 'got:\n%s\n' "$doctor_bypassed" >&2; die "bypass env=1 should downgrade the wire_api FAIL to WARN"; return; }
+  echo "$doctor_bypassed" | grep -q 'FAIL codex-kimi DISABLED' \
+    && { printf 'got:\n%s\n' "$doctor_bypassed" >&2; die "bypass env=1 should NOT leave the FAIL codex-kimi DISABLED line in output"; return; }
+
+  # (b) config.toml emit unchanged — the provider block is still fully formed
+  # so a LiteLLM proxy (or similar) fronting Kimi can be swapped in by
+  # editing base_url without hats tooling breaking the stanza.
+  grep -q '^model_provider[[:space:]]*=[[:space:]]*"kimi"' "$cfg" \
+    || { printf 'got:\n%s\n' "$(cat "$cfg")" >&2; die "config.toml should still have model_provider=\"kimi\""; return; }
+  grep -q '^\[model_providers\.kimi\]' "$cfg" \
+    || { printf 'got:\n%s\n' "$(cat "$cfg")" >&2; die "config.toml should still have [model_providers.kimi] stanza"; return; }
+  grep -q 'wire_api[[:space:]]*=[[:space:]]*"chat"' "$cfg" \
+    || { printf 'got:\n%s\n' "$(cat "$cfg")" >&2; die "config.toml should still emit wire_api=\"chat\" (operator's proxy handles the translation)"; return; }
+  grep -q '# INCOMPATIBLE with codex' "$cfg" \
+    || { printf 'got:\n%s\n' "$(cat "$cfg")" >&2; die "config.toml should carry the INCOMPATIBLE marker comment"; return; }
+
+  ok "HATS_KIMI_CODEX_BYPASS_COMPAT_CHECK=1 downgrades doctor FAIL→WARN + preserves config.toml provider block for LiteLLM-proxy operators"
+}
+
 test_fleet_symmetry_check_runs_clean() {
   # The cross-provider symmetry audit (scripts/hats-fleet-symmetry-check,
   # roadmap #4) mechanizes case-law B-11/A-28 — flag any `case
@@ -2586,6 +2664,8 @@ test_kimi_interactive_bypass_full_seed
 test_codex_kimi_env_isolation
 test_codex_kimi_config_toml_idempotent
 test_codex_kimi_unset_model_emits_no_stanza
+test_codex_kimi_doctor_flags_wire_api_incompat
+test_codex_kimi_bypass_env_gate_allows_emit
 test_list_filter_flags
 test_fleet_symmetry_check_runs_clean
 

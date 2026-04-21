@@ -77,6 +77,11 @@ This copies `hats` to `~/.local/bin/`. Make sure `~/.local/bin` is in your `PATH
 
 Use `hats codex ...` to manage Codex accounts.
 
+### Backend aliases
+
+- `hats kimi ...` — Kimi (Moonshot) via the Anthropic-compat endpoint, routed through claude-code. Working, doctor 5/5 green. See `hats kimi --help`.
+- `hats codex kimi ...` — Kimi via codex. **Currently disabled** at the doctor level: codex v0.118.0+ requires `wire_api="responses"` and Kimi serves `/chat/completions` only. Use `hats kimi` for Kimi access today. See [docs/codex-kimi-compat.md](docs/codex-kimi-compat.md) for the vendor-state receipts and LiteLLM-proxy workaround.
+
 ## How It Works
 
 ### Per-Account Config Directories

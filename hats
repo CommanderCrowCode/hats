@@ -3297,7 +3297,11 @@ if data is None:
         needed.append(f'model = "{model_stripped}"')
     if '[model_providers.kimi]' not in existing:
         needed.append(
-            '\n[model_providers.kimi]\n'
+            '\n# INCOMPATIBLE with codex v0.118.0+ — see `hats codex kimi doctor`.\n'
+            '# codex rejects `wire_api = "chat"`; Kimi serves /chat/completions only.\n'
+            '# Set HATS_KIMI_CODEX_BYPASS_COMPAT_CHECK=1 to silence the doctor err\n'
+            '# if you are running a LiteLLM-style proxy (see docs/codex-kimi-compat.md).\n'
+            '[model_providers.kimi]\n'
             'name = "Kimi"\n'
             f'base_url = "{base_url}"\n'
             'env_key = "OPENAI_API_KEY"\n'
@@ -3367,6 +3371,15 @@ def emit(d, prefix=""):
         lines.append("")
     for k, v in tables.items():
         header = f"{prefix}{k}" if prefix else k
+        if header == "model_providers.kimi":
+            # Standing comment block above the kimi provider stanza. Round-trips
+            # through tomllib (which discards comments on read) because we
+            # always re-emit from scratch — the hand-rolled writer is the
+            # single source for config.toml content.
+            lines.append('# INCOMPATIBLE with codex v0.118.0+ — see `hats codex kimi doctor`.')
+            lines.append('# codex rejects `wire_api = "chat"`; Kimi serves /chat/completions only.')
+            lines.append('# Set HATS_KIMI_CODEX_BYPASS_COMPAT_CHECK=1 to silence the doctor err')
+            lines.append('# if you are running a LiteLLM-style proxy (see docs/codex-kimi-compat.md).')
         lines.append(f"[{header}]")
         sub = emit(v, header + ".")
         lines.extend(sub if sub else [""])
@@ -3485,6 +3498,15 @@ Infisical path: $HATS_KIMI_INFISICAL_PATH/$HATS_KIMI_INFISICAL_SECRET_NAME
 Base URL:       $HATS_KIMI_CODEX_BASE_URL
 Model default:  ${HATS_KIMI_CODEX_MODEL:-(unset — codex routes to endpoint's provider default)}
 Overrides:      HATS_KIMI_CODEX_BASE_URL, HATS_KIMI_CODEX_MODEL
+
+KNOWN LIMITATION (2026-04-21):
+  codex v0.118.0+ requires wire_api="responses" but Kimi serves
+  /chat/completions only — 'hats codex kimi doctor' FAILs by default.
+  Use 'hats kimi' (claude-kimi, Anthropic-compat) for working Kimi
+  access today. LiteLLM-proxy workaround available for operators
+  willing to run a /responses↔/chat/completions bridge — set
+  HATS_KIMI_CODEX_BYPASS_COMPAT_CHECK=1 to silence the doctor FAIL.
+  See docs/codex-kimi-compat.md for vendor-state receipts + setup.
 EOF
       else
         cat <<EOF
@@ -3685,6 +3707,21 @@ _kimi_doctor_onboarding_bypass_codex() {
     echo "  info model pinned in $_cfg: $_model_line"
   else
     echo "  info no model pinned — codex routes to endpoint's provider default (override via HATS_KIMI_CODEX_MODEL or 'codex -m <name>')"
+  fi
+
+  # wire_api vs Kimi-endpoint incompatibility — investigated 2026-04-21.
+  # codex v0.118.0 hard-rejects wire_api="chat"; Kimi serves /chat/completions
+  # only (404 on /responses at both api.kimi.com/coding/v1 and
+  # api.moonshot.ai/v1). Net: codex-kimi is non-functional end-to-end without
+  # a /responses↔/chat/completions translating proxy (e.g. LiteLLM). See
+  # docs/codex-kimi-compat.md for vendor-state receipts + P2 LiteLLM
+  # workaround. Escape hatch: HATS_KIMI_CODEX_BYPASS_COMPAT_CHECK=1 silences
+  # this check for operators who have a shim in front of the endpoint.
+  if [ "${HATS_KIMI_CODEX_BYPASS_COMPAT_CHECK:-0}" = "1" ]; then
+    echo "  WARN wire_api=chat incompatibility suppressed (HATS_KIMI_CODEX_BYPASS_COMPAT_CHECK=1) — assumes you have a LiteLLM-style /responses proxy fronting $HATS_KIMI_CODEX_BASE_URL"
+  else
+    echo "  FAIL codex-kimi DISABLED — codex v0.118.0+ requires wire_api=\"responses\" but Kimi serves /chat/completions only; end-to-end route does not exist. See docs/codex-kimi-compat.md. Use claude-kimi ('hats kimi init') for Kimi access today. LiteLLM-proxy workaround: set HATS_KIMI_CODEX_BYPASS_COMPAT_CHECK=1."
+    return 1
   fi
   return 0
 }
