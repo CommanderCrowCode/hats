@@ -2689,28 +2689,69 @@ PYEOF
       fi
       ;;
     codex)
+      # Codex auth.json carries more than account_id — id_token (JWT with an
+      # `exp` claim), access_token, refresh_token, plus auth_mode and
+      # last_refresh. OAuth-mode verify mirrors claude's expiry/refresh
+      # semantics; api_key mode asserts OPENAI_API_KEY non-null. A stale
+      # id_token with no refresh_token (or a wildly stale last_refresh) can
+      # no longer auto-recover — surface those instead of green-flagging on
+      # tokens.account_id presence alone.
       local probe
       probe=$(python3 - "$cfile" <<'PYEOF' 2>/dev/null
-import json, sys
+import base64, datetime, json, sys, time
 try:
     d = json.load(open(sys.argv[1]))
     tokens = d.get('tokens') or {}
+    print(f'auth_mode={d.get("auth_mode", "") or ""}')
+    api_key = d.get('OPENAI_API_KEY')
+    print(f'api_key_set={bool(api_key)}')
     if not tokens:
-        print('error=no tokens key')
-        sys.exit(0)
-    print(f'present=True')
-    print(f'account_id={tokens.get("account_id", "")}')
+        print('tokens_present=False')
+    else:
+        print('tokens_present=True')
+        print(f'account_id={tokens.get("account_id", "")}')
+        print(f'has_refresh={bool(tokens.get("refresh_token"))}')
+        # JWT id_token: decode middle (payload) segment only — no signature
+        # verification needed, just read `exp`. base64url without padding.
+        idt = tokens.get('id_token') or ''
+        parts = idt.split('.')
+        if len(parts) == 3:
+            b64 = parts[1] + '=' * (-len(parts[1]) % 4)
+            try:
+                payload = json.loads(base64.urlsafe_b64decode(b64))
+                exp = payload.get('exp')
+                if isinstance(exp, (int, float)):
+                    horizon_h = (exp - time.time()) / 3600
+                    print(f'horizon_h={horizon_h:.2f}')
+            except Exception:
+                pass
+    lr = d.get('last_refresh')
+    # last_refresh is codex-written ISO-8601 with nanosecond precision
+    # ("...Z"). strptime on the first 19 chars is portable across pythons.
+    if isinstance(lr, str) and len(lr) >= 19:
+        try:
+            dt = datetime.datetime.strptime(lr[:19], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=datetime.timezone.utc)
+            age_d = (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds() / 86400
+            print(f'last_refresh_age_d={age_d:.1f}')
+        except Exception:
+            pass
 except Exception as e:
     print(f'error={e}')
 PYEOF
 )
-      local err="" present="" acct_id=""
+      local err="" auth_mode="" api_key_set="" tokens_present="" acct_id=""
+      local has_refresh="" horizon="" refresh_age=""
       local _k _v
       while IFS='=' read -r _k _v; do
         case "$_k" in
-          error)      err="$_v" ;;
-          present)    present="$_v" ;;
-          account_id) acct_id="$_v" ;;
+          error)              err="$_v" ;;
+          auth_mode)          auth_mode="$_v" ;;
+          api_key_set)        api_key_set="$_v" ;;
+          tokens_present)     tokens_present="$_v" ;;
+          account_id)         acct_id="$_v" ;;
+          has_refresh)        has_refresh="$_v" ;;
+          horizon_h)          horizon="$_v" ;;
+          last_refresh_age_d) refresh_age="$_v" ;;
         esac
       done <<< "$probe"
 
@@ -2718,10 +2759,73 @@ PYEOF
         echo "    FAIL codex token: $err"
         return
       fi
-      if [ "$present" = "True" ]; then
-        echo "    PASS codex tokens present (account_id=${acct_id:-unknown})"
-      else
-        echo "    FAIL codex tokens missing"
+
+      # auth_mode sanity. Observed values on real codex auth.json files:
+      # 'chatgpt' / 'device_auth' (OAuth), 'api_key' (OPENAI_API_KEY path).
+      # Cross-check declared mode against the fields that mode requires.
+      # Legacy files without auth_mode infer from contents.
+      case "$auth_mode" in
+        chatgpt|device_auth)
+          if [ "$tokens_present" = "True" ]; then
+            echo "    PASS auth_mode=$auth_mode with tokens present (account_id=${acct_id:-unknown})"
+          else
+            echo "    FAIL auth_mode=$auth_mode but tokens missing — re-run 'codex login'"
+            return
+          fi
+          ;;
+        api_key)
+          if [ "$api_key_set" = "True" ]; then
+            echo "    PASS auth_mode=api_key with OPENAI_API_KEY set"
+          else
+            echo "    FAIL auth_mode=api_key but OPENAI_API_KEY null/empty — re-run 'codex login --with-api-key'"
+            return
+          fi
+          ;;
+        '')
+          if [ "$tokens_present" = "True" ]; then
+            echo "    WARN auth_mode missing (legacy); tokens present (account_id=${acct_id:-unknown})"
+          elif [ "$api_key_set" = "True" ]; then
+            echo "    WARN auth_mode missing (legacy); OPENAI_API_KEY set"
+          else
+            echo "    FAIL auth_mode missing AND no tokens AND no OPENAI_API_KEY — re-run 'codex login'"
+            return
+          fi
+          ;;
+        *)
+          echo "    WARN unrecognized auth_mode=$auth_mode (verify assumes chatgpt|device_auth|api_key)"
+          ;;
+      esac
+
+      # OAuth-mode expiry horizon. api_key mode has no id_token to check.
+      if [ "$auth_mode" = "chatgpt" ] || [ "$auth_mode" = "device_auth" ] \
+         || { [ -z "$auth_mode" ] && [ "$tokens_present" = "True" ]; }; then
+        if [ -z "$horizon" ]; then
+          echo "    WARN id_token has no decodable exp claim (skipping expiry check)"
+        else
+          local neg=0
+          case "$horizon" in -*) neg=1 ;; esac
+          if [ "$neg" = "0" ]; then
+            echo "    PASS id_token expiry in ${horizon}h"
+          elif [ "$has_refresh" = "True" ]; then
+            # Expired but refreshable. Cross-check last_refresh age — a
+            # refresh_token that hasn't successfully rotated in >90d is
+            # usually already invalidated server-side.
+            local stale_refresh=0
+            if [ -n "$refresh_age" ]; then
+              case "$refresh_age" in
+                -*) ;;
+                *)  stale_refresh=$(awk -v a="$refresh_age" 'BEGIN { print (a > 90) ? 1 : 0 }') ;;
+              esac
+            fi
+            if [ "$stale_refresh" = "1" ]; then
+              echo "    FAIL id_token expired (${horizon}h) and last_refresh ${refresh_age}d old — refresh_token likely invalidated; re-run 'codex login'"
+            else
+              echo "    WARN id_token expired (${horizon}h) but refresh_token present (last_refresh ${refresh_age:-?}d ago) — will auto-refresh"
+            fi
+          else
+            echo "    FAIL id_token expired (${horizon}h) and no refresh_token — re-run 'codex login'"
+          fi
+        fi
       fi
 
       # config.toml credential-store mode — 'file' is the only hats-supported

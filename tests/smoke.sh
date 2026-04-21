@@ -1235,6 +1235,159 @@ EOF
   ok "verify deep-checks token semantics (JSON, expiry+refresh, scopes, unknown flag, missing account)"
 }
 
+test_codex_verify_command() {
+  # G1 + G3 coverage in the codex verify arm. Codex auth.json carries an
+  # id_token JWT with an `exp` claim, a refresh_token, an auth_mode field
+  # (chatgpt / device_auth / api_key), and a last_refresh timestamp. Pre-
+  # this-commit verify only asserted tokens.account_id presence, which
+  # green-flagged a 14-day-expired id_token on real hardware.
+  #
+  # Fixtures cover: healthy chatgpt, expired-but-refreshable, expired-no-
+  # refresh, expired-stale-refresh, api_key mode, api_key-missing-key,
+  # and legacy (no auth_mode).
+
+  # Ensure codex tree exists. cv_* account names are namespaced so they
+  # don't collide with existing codex fixtures staged by other tests.
+  "$HATS_SCRIPT" codex init >/dev/null 2>&1 || true
+
+  # JWT forger: header.payload.sig where payload has a controlled exp.
+  # Signature is "x" — our probe only base64url-decodes the middle segment.
+  _mint_codex_jwt() {
+    python3 - "$1" <<'PYEOF'
+import base64, json, sys
+def b64(d):
+    return base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
+hdr = b64({"alg": "none", "typ": "JWT"})
+payload = b64({"exp": int(sys.argv[1]), "iat": int(sys.argv[1]) - 3600, "sub": "smoke"})
+print(f"{hdr}.{payload}.x")
+PYEOF
+  }
+
+  local now; now=$(date +%s)
+  local future=$((now + 3600))
+  local past=$((now - 3600))
+  local recent_lr stale_lr
+  recent_lr=$(date -u +%Y-%m-%dT%H:%M:%S.000000000Z)
+  # ~1 year old, comfortably >90d stale.
+  stale_lr="2025-01-01T00:00:00.000000000Z"
+  local jwt_future jwt_past
+  jwt_future=$(_mint_codex_jwt "$future")
+  jwt_past=$(_mint_codex_jwt "$past")
+
+  local toml_line='cli_auth_credentials_store = "file"'
+
+  # Stage seven fixtures. Each gets a config.toml with the correct store
+  # value so the pre-existing store assertion stays PASS and doesn't muddy
+  # the FAIL / WARN counts the tests check.
+  local out rc base="$HATS_DIR/codex"
+
+  stage_cv() {
+    local name="$1" body="$2"
+    local dir="$base/$name"
+    mkdir -p "$dir"
+    printf '%s\n' "$body" > "$dir/auth.json"
+    chmod 600 "$dir/auth.json"
+    printf '%s\n' "$toml_line" > "$dir/config.toml"
+  }
+
+  stage_cv cv_ok \
+"{\"auth_mode\":\"chatgpt\",\"OPENAI_API_KEY\":null,\"tokens\":{\"id_token\":\"$jwt_future\",\"access_token\":\"a\",\"refresh_token\":\"r\",\"account_id\":\"acc-ok\"},\"last_refresh\":\"$recent_lr\"}"
+  stage_cv cv_exp \
+"{\"auth_mode\":\"chatgpt\",\"OPENAI_API_KEY\":null,\"tokens\":{\"id_token\":\"$jwt_past\",\"access_token\":\"a\",\"refresh_token\":\"r\",\"account_id\":\"acc-exp\"},\"last_refresh\":\"$recent_lr\"}"
+  stage_cv cv_norefresh \
+"{\"auth_mode\":\"chatgpt\",\"OPENAI_API_KEY\":null,\"tokens\":{\"id_token\":\"$jwt_past\",\"access_token\":\"a\",\"account_id\":\"acc-norefresh\"},\"last_refresh\":\"$recent_lr\"}"
+  stage_cv cv_staleref \
+"{\"auth_mode\":\"chatgpt\",\"OPENAI_API_KEY\":null,\"tokens\":{\"id_token\":\"$jwt_past\",\"access_token\":\"a\",\"refresh_token\":\"r\",\"account_id\":\"acc-stale\"},\"last_refresh\":\"$stale_lr\"}"
+  stage_cv cv_apikey \
+'{"auth_mode":"api_key","OPENAI_API_KEY":"sk-test-smoke","tokens":null,"last_refresh":null}'
+  stage_cv cv_apikey_nokey \
+'{"auth_mode":"api_key","OPENAI_API_KEY":null,"tokens":null,"last_refresh":null}'
+  stage_cv cv_legacy \
+"{\"tokens\":{\"id_token\":\"$jwt_future\",\"access_token\":\"a\",\"refresh_token\":\"r\",\"account_id\":\"acc-legacy\"},\"last_refresh\":\"$recent_lr\"}"
+
+  # (1) healthy chatgpt: PASS id_token expiry, PASS auth_mode, no FAIL
+  rc=0
+  out=$("$HATS_SCRIPT" codex verify cv_ok 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ] \
+     || ! echo "$out" | grep -q 'PASS auth_mode=chatgpt with tokens present' \
+     || ! echo "$out" | grep -q 'PASS id_token expiry' \
+     || echo "$out" | grep -Eq '^ {4}FAIL'; then
+    printf 'got (cv_ok):\n%s\n' "$out" >&2
+    die "codex verify cv_ok should pass cleanly (rc=$rc)"
+    return
+  fi
+
+  # (2) expired + refresh + recent last_refresh: WARN, rc=0
+  rc=0
+  out=$("$HATS_SCRIPT" codex verify cv_exp 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ] \
+     || ! echo "$out" | grep -q 'WARN id_token expired.*will auto-refresh' \
+     || echo "$out" | grep -Eq '^ {4}FAIL'; then
+    printf 'got (cv_exp):\n%s\n' "$out" >&2
+    die "codex verify cv_exp should WARN (rc=$rc)"
+    return
+  fi
+
+  # (3) expired + no refresh: FAIL, rc=1
+  rc=0
+  out=$("$HATS_SCRIPT" codex verify cv_norefresh 2>&1) || rc=$?
+  if [ "$rc" -eq 0 ] \
+     || ! echo "$out" | grep -q 'FAIL id_token expired.*no refresh_token'; then
+    printf 'got (cv_norefresh):\n%s\n' "$out" >&2
+    die "codex verify cv_norefresh should FAIL (rc=$rc)"
+    return
+  fi
+
+  # (4) expired + refresh + stale last_refresh (>90d): FAIL, rc=1
+  rc=0
+  out=$("$HATS_SCRIPT" codex verify cv_staleref 2>&1) || rc=$?
+  if [ "$rc" -eq 0 ] \
+     || ! echo "$out" | grep -q 'FAIL id_token expired.*last_refresh.*likely invalidated'; then
+    printf 'got (cv_staleref):\n%s\n' "$out" >&2
+    die "codex verify cv_staleref should FAIL on stale refresh (rc=$rc)"
+    return
+  fi
+
+  # (5) api_key mode + OPENAI_API_KEY set: PASS, rc=0
+  rc=0
+  out=$("$HATS_SCRIPT" codex verify cv_apikey 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ] \
+     || ! echo "$out" | grep -q 'PASS auth_mode=api_key with OPENAI_API_KEY set' \
+     || echo "$out" | grep -q 'id_token expiry'; then
+    printf 'got (cv_apikey):\n%s\n' "$out" >&2
+    die "codex verify cv_apikey should PASS without touching id_token (rc=$rc)"
+    return
+  fi
+
+  # (6) api_key mode + OPENAI_API_KEY null: FAIL, rc=1
+  rc=0
+  out=$("$HATS_SCRIPT" codex verify cv_apikey_nokey 2>&1) || rc=$?
+  if [ "$rc" -eq 0 ] \
+     || ! echo "$out" | grep -q 'FAIL auth_mode=api_key but OPENAI_API_KEY null'; then
+    printf 'got (cv_apikey_nokey):\n%s\n' "$out" >&2
+    die "codex verify cv_apikey_nokey should FAIL (rc=$rc)"
+    return
+  fi
+
+  # (7) legacy file (no auth_mode) with future-exp tokens: WARN on mode,
+  # PASS on id_token expiry, rc=0.
+  rc=0
+  out=$("$HATS_SCRIPT" codex verify cv_legacy 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ] \
+     || ! echo "$out" | grep -q 'WARN auth_mode missing (legacy)' \
+     || ! echo "$out" | grep -q 'PASS id_token expiry' \
+     || echo "$out" | grep -Eq '^ {4}FAIL'; then
+    printf 'got (cv_legacy):\n%s\n' "$out" >&2
+    die "codex verify cv_legacy should WARN on mode + PASS on expiry (rc=$rc)"
+    return
+  fi
+
+  rm -rf "$base/cv_ok" "$base/cv_exp" "$base/cv_norefresh" "$base/cv_staleref" \
+         "$base/cv_apikey" "$base/cv_apikey_nokey" "$base/cv_legacy"
+
+  ok "codex verify checks id_token JWT expiry + refresh freshness + auth_mode sanity (G1+G3)"
+}
+
 test_export_import_roundtrip() {
   # `hats export` + `hats import` (roadmap #1 / MSH-11) — crypto-agnostic
   # scaffold. Verify the unencrypted path: export a staged account to a
@@ -1836,6 +1989,7 @@ test_config_migration_is_idempotent
 test_doctor_metrics_flag
 test_call_provider_variant_dispatch
 test_verify_command
+test_codex_verify_command
 test_export_import_roundtrip
 test_export_openssl_backend
 test_kimi_env_isolation
