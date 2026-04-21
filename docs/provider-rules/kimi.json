@@ -1,0 +1,80 @@
+{
+  "provider": "kimi",
+  "source_url": "https://platform.moonshot.ai/docs/third-party-agents",
+  "schema_version": "1",
+  "notes": "Rules for CLAUDE.md content when read by Kimi K2.5 via the Anthropic-compat (claude-kimi) or OpenAI-compat (codex-kimi) wrapper. POSIX ERE only (BSD-compatible: no \\d \\w \\s \\b). ID namespace is shared across provider files. Per mirror-engineer's §3 taxonomy, CLAUDE.md-for-Kimi findings are mostly warn-severity; err-severity reserved for hats-invariant violations that break the wrapper flow regardless of reader. Author: hats-e2e-engineer 2026-04-21. Research: hats-kimi-engineer (ag-1755a24ecbfb4a95) msg-8337ae9dc2cfe9f3 — grounded in commits 8746d5a (base-URL fix), bc136e0 (kimi slot), fbe77ed (codex-kimi) + hats-kimi-engineer's strings-grep of codex binary + tanwa's 2026-04-20 `export ANTHROPIC_BASE_URL` poisoning incident. [A]-tagged rules are analytical (not empirically tested against K2.5 inference); treat as reasoning not observation. Version: 1.",
+  "patterns": [
+    {
+      "id": "HATS-ENV-INVARIANT-001",
+      "regex": "(^|[^A-Za-z_-])export[[:space:]]+(ANTHROPIC_BASE_URL|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|OPENAI_API_KEY|OPENAI_BASE_URL|CODEX_API_KEY)",
+      "severity": "err",
+      "category": "strip-from-claude-kimi",
+      "rationale": "hats-kimi wrappers inline-prefix ANTHROPIC_* and OPENAI_* env vars on the command invocation — NEVER export them — so that stock `claude` and `codex` elsewhere in the shell session stay routed to Anthropic / OpenAI. Guidance that instructs operators to `export ANTHROPIC_BASE_URL=...` (or the other listed vars) globally via .zshrc / .bashrc silently poisons every subsequent claude/codex invocation to the Kimi endpoint. Root-cause of tanwa's 2026-04-20 stock-claude poisoning incident; directly preceded the 8746d5a fix.",
+      "citation": "hats/hats lines 26-39 (env-isolation invariant), memory feedback_installed_vs_source_drift.md (stale-install neighbor incident), hats-kimi-engineer msg-8337ae9dc2cfe9f3 rule #1.",
+      "action": "strip"
+    },
+    {
+      "id": "KIMI-URL-001",
+      "regex": "api\\.moonshot\\.ai/anthropic",
+      "severity": "err",
+      "category": "strip-from-claude-kimi",
+      "rationale": "Pre-8746d5a default URL. Moonshot's general-purpose Anthropic-compat endpoint, NOT the coding-agents endpoint Kimi prescribes. claude-kimi's correct endpoint is https://api.kimi.com/coding/ per the third-party-agents doc. Instructions pointing to moonshot.ai/anthropic will reject coding-agent routes and produce auth failures.",
+      "citation": "https://platform.moonshot.ai/docs/third-party-agents; hats commit 8746d5a (base-URL fix 2026-04-21); memory reference_kimi_third_party_agent_contract.md.",
+      "action": "replace:https://api.kimi.com/coding/"
+    },
+    {
+      "id": "KIMI-URL-002",
+      "regex": "(^|[^A-Za-z_-])OPENAI_BASE_URL([^A-Za-z_-]|=|$)",
+      "severity": "warn",
+      "category": "strip-from-claude-kimi",
+      "rationale": "Codex CLI does NOT honor OPENAI_BASE_URL as an env var — 0 hits in strings-grep of codex binary per hats-kimi-engineer. Base URL for codex-kimi lives in ~/.codex/config.toml under [model_providers.kimi].base_url (set by `hats codex kimi init`). Guidance saying 'set OPENAI_BASE_URL to point codex at a custom endpoint' is wrong under codex (but correct for raw OpenAI Python SDK — easy confusion). Warn + clarify.",
+      "citation": "hats/hats lines 1449-1456 (codex-kimi does NOT honor OPENAI_BASE_URL, verified by strings-grep); hats-kimi-engineer msg-8337ae9dc2cfe9f3 rule #3.",
+      "action": "warn"
+    },
+    {
+      "id": "KIMI-CTX-001",
+      "regex": "(^|[^A-Za-z_-])\\.credentials\\.json",
+      "severity": "warn",
+      "category": "strip-from-claude-kimi",
+      "rationale": "kimi accounts (both claude-kimi at ~/.hats/claude/kimi/ and codex-kimi at ~/.hats/codex/kimi/) have NO .credentials.json — Kimi is API-key-backed (fetched fresh from Infisical on invocation), not OAuth. Guidance saying 'check .credentials.json for the kimi account' will fail. Warn (not err) because the same instruction IS correct for shannon/monet/debussy claude accounts; context-dependent.",
+      "citation": "hats commit bc136e0 ('Kimi is API-key-backed, not OAuth, no .credentials.json'); hats-kimi-engineer msg-8337ae9dc2cfe9f3 rule #4.",
+      "action": "warn"
+    },
+    {
+      "id": "KIMI-CTX-002",
+      "regex": "(^|[^A-Za-z_-])hasCompletedOnboarding([^A-Za-z_-]|$)",
+      "severity": "warn",
+      "category": "strip-from-claude-kimi",
+      "rationale": "This flag is a Kimi-specific claude-code onboarding-wall bypass (writes {\"hasCompletedOnboarding\": true} into ~/.hats/claude/kimi/.claude.json). It's not a stock claude-code concept and has NO codex analog (codex api-key mode has no OAuth wall). Valid in kimi-specific guidance; misleading if applied universally.",
+      "citation": "hats commit 8746d5a (hasCompletedOnboarding flag + platform.claude.com OAuth wall bypass); hats-kimi-engineer msg-8337ae9dc2cfe9f3 rule #5.",
+      "action": "warn"
+    },
+    {
+      "id": "KIMI-CTX-003",
+      "regex": "(model_provider[[:space:]]*=[[:space:]]*\"kimi\"|\\[model_providers\\.kimi\\])",
+      "severity": "warn",
+      "category": "strip-from-claude-kimi",
+      "rationale": "TOML constructs from codex-kimi's config.toml (fbe77ed). In a CLAUDE.md read by stock claude or claude-kimi, they're noise (claude config is JSON-based in .claude.json, not TOML). Warn-class; may be valid in cross-context guidance documentation.",
+      "citation": "hats commit fbe77ed (codex-kimi config.toml model_providers stanza); hats-kimi-engineer msg-8337ae9dc2cfe9f3 rule #6.",
+      "action": "warn"
+    },
+    {
+      "id": "ANTHROPIC-IDENTITY-001",
+      "regex": "(^|[^A-Za-z_-])(You are Claude|I am Claude|As Claude)([^A-Za-z_-]|,|\\.)",
+      "severity": "warn",
+      "category": "strip-from-claude-kimi",
+      "rationale": "[ANALYTICAL] When CLAUDE.md contains identity directives like 'You are Claude', K2.5 via the Anthropic-compat wrapper receives the prompt verbatim. Moonshot's K2 is tuned as a general coding assistant; it does NOT reliably correct the framing. The impersonation is by-design for the code-agent drop-in case, but CLAUDE.md content that *depends* on Claude-specific RLHF behavior (HHH-trained outputs) won't reproduce faithfully. Warn-severity: useful for operators to know; not a hard miswiring.",
+      "citation": "hats-kimi-engineer msg-8337ae9dc2cfe9f3 rule #7 (analytical — not empirically tested against K2.5 inference).",
+      "action": "warn"
+    },
+    {
+      "id": "ANTHROPIC-IDENTITY-002",
+      "regex": "(Anthropic'?s?[[:space:]]+(safety|usage|HHH|training|refusal)|defer to (Claude|Anthropic))",
+      "severity": "warn",
+      "category": "strip-from-claude-kimi",
+      "rationale": "[ANALYTICAL] K2.5 has its own safety training from Moonshot. CLAUDE.md guidance saying 'follow Anthropic's usage policies' or 'defer to Anthropic's HHH' parses as plausible instruction to K2.5, but the *specific* policies K2.5 adheres to are Moonshot's — outputs won't be byte-equivalent to an Anthropic-trained model. Warn: useful to flag; not a hard miswiring.",
+      "citation": "hats-kimi-engineer msg-8337ae9dc2cfe9f3 rule #8 (analytical).",
+      "action": "warn"
+    }
+  ]
+}

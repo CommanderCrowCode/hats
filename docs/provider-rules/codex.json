@@ -24,11 +24,11 @@
     },
     {
       "id": "CLAUDE-CLI-003",
-      "regex": "(^|[^A-Za-z_-])(PostToolUse|PreToolUse|SessionStart|UserPromptSubmit|Stop)(Hook)?([^A-Za-z_-]|$)",
+      "regex": "(^|[^A-Za-z_-])(PostToolUse|PreToolUse|SessionStart|UserPromptSubmit)(Hook)?([^A-Za-z_-]|$)",
       "severity": "err",
       "category": "strip-from-agents",
-      "rationale": "These are claude-code hook event names (from settings.json hooks config). Codex has no event-hook mechanism at the CLI layer; references to these hook types are actionable-wrong when read by codex.",
-      "citation": "claude-code hooks docs (internal); codex config.toml has no hook event vocabulary.",
+      "rationale": "These are claude-code hook event names (from settings.json hooks config). Codex has no event-hook mechanism at the CLI layer; references to these hook types are actionable-wrong when read by codex. Bare 'Stop' was DROPPED from the alternation per hats-mirror-engineer's dry-run (msg-f7f36bd59b622d09): English imperative 'Stop' (e.g. 'Stop Deacon') trips the regex in non-hook prose. If Stop-hook coverage becomes needed, add a separate warn-class pattern requiring 'StopHook' or '\"Stop\" hook' context.",
+      "citation": "claude-code hooks docs (internal); codex config.toml has no hook event vocabulary; mirror-engineer dry-run msg-f7f36bd59b622d09.",
       "action": "strip"
     },
     {
