@@ -2493,15 +2493,15 @@ test_codex_kimi_unset_model_emits_no_stanza() {
   # the model-line output, not the overall doctor pass/fail).
   rm -rf "$acct_dir"
   "$HATS_SCRIPT" codex kimi init >/dev/null 2>&1
-  local doctor_unset doctor_unset_rc=0
-  doctor_unset=$("$HATS_SCRIPT" codex kimi doctor 2>&1) || doctor_unset_rc=$?
+  local doctor_unset _doctor_unset_rc=0
+  doctor_unset=$("$HATS_SCRIPT" codex kimi doctor 2>&1) || _doctor_unset_rc=$?
   echo "$doctor_unset" | grep -q 'info no model pinned' \
     || { printf 'got:\n%s\n' "$doctor_unset" >&2; die "doctor should emit 'info no model pinned' when env unset"; return; }
   echo "$doctor_unset" | grep -qE 'FAIL (model|HATS_KIMI_CODEX_MODEL)' \
     && { printf 'got:\n%s\n' "$doctor_unset" >&2; die "doctor should NOT err when env unset — that is the intended quieter default"; return; }
 
-  local doctor_malformed doctor_malformed_rc=0
-  doctor_malformed=$(HATS_KIMI_CODEX_MODEL="   " "$HATS_SCRIPT" codex kimi doctor 2>&1) || doctor_malformed_rc=$?
+  local doctor_malformed _doctor_malformed_rc=0
+  doctor_malformed=$(HATS_KIMI_CODEX_MODEL="   " "$HATS_SCRIPT" codex kimi doctor 2>&1) || _doctor_malformed_rc=$?
   echo "$doctor_malformed" | grep -q 'FAIL HATS_KIMI_CODEX_MODEL is set to whitespace-only' \
     || { printf 'got:\n%s\n' "$doctor_malformed" >&2; die "doctor should err on whitespace-only HATS_KIMI_CODEX_MODEL"; return; }
 

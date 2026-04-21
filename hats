@@ -3496,13 +3496,13 @@ lives in config.toml (codex does NOT honor OPENAI_BASE_URL env var).
 
 Infisical path: $HATS_KIMI_INFISICAL_PATH/$HATS_KIMI_INFISICAL_SECRET_NAME
 Base URL:       $HATS_KIMI_CODEX_BASE_URL
-Model default:  ${HATS_KIMI_CODEX_MODEL:-(unset — codex routes to endpoint's provider default)}
+Model default:  ${HATS_KIMI_CODEX_MODEL:-(unset — codex routes to the endpoint-provided default)}
 Overrides:      HATS_KIMI_CODEX_BASE_URL, HATS_KIMI_CODEX_MODEL
 
 KNOWN LIMITATION (2026-04-21):
   codex v0.118.0+ requires wire_api="responses" but Kimi serves
-  /chat/completions only — 'hats codex kimi doctor' FAILs by default.
-  Use 'hats kimi' (claude-kimi, Anthropic-compat) for working Kimi
+  /chat/completions only — \`hats codex kimi doctor\` FAILs by default.
+  Use \`hats kimi\` (claude-kimi, Anthropic-compat) for working Kimi
   access today. LiteLLM-proxy workaround available for operators
   willing to run a /responses↔/chat/completions bridge — set
   HATS_KIMI_CODEX_BYPASS_COMPAT_CHECK=1 to silence the doctor FAIL.
