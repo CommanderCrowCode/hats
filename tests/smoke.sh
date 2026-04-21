@@ -1052,6 +1052,97 @@ test_install_is_idempotent_on_reinstall() {
   fi
 }
 
+test_e2e_probe_claude_scope_with_stub_binary() {
+  # Stubs the `claude` binary to exercise hats-e2e-probe's classification
+  # paths without spending real API budget or requiring network. Four cases:
+  # (1) happy-path token hit, (2) timeout (rc=124), (3) network fail (curl-
+  # style stderr), (4) auth fail (401 stderr).
+  #
+  # Lives under tests/ so it gates every smoke run; the probe's contract is
+  # "bounded-time + network-WARN + auth-FAIL" and a regression there breaks
+  # the entire ship-gate philosophy.
+  local probe="$HATS_REPO/scripts/hats-e2e-probe"
+  [ -x "$probe" ] || { die "hats-e2e-probe not executable at $probe"; return; }
+
+  # Stage a claude account so discover_accounts() finds something.
+  local acct_dir="$HATS_DIR/claude/probe1"
+  mkdir -p "$acct_dir"
+  : > "$acct_dir/.credentials.json"
+  chmod 600 "$acct_dir/.credentials.json"
+
+  local stubdir; stubdir=$(mktemp -d "${TMPDIR:-/tmp}/hats-probe-stub-XXXXXX")
+
+  # Stub #1 — prints "ok" and exits 0. PASS.
+  cat > "$stubdir/claude-ok" <<'STUB'
+#!/usr/bin/env bash
+echo "ok"
+exit 0
+STUB
+  # Stub #2 — sleeps past the probe timeout to force rc=124.
+  cat > "$stubdir/claude-timeout" <<'STUB'
+#!/usr/bin/env bash
+sleep 30
+STUB
+  # Stub #3 — emits a network-style error to stderr + exits non-zero.
+  cat > "$stubdir/claude-network" <<'STUB'
+#!/usr/bin/env bash
+echo "curl: (6) Could not resolve host: api.anthropic.com" >&2
+exit 6
+STUB
+  # Stub #4 — emits an auth-style error to stderr + exits non-zero.
+  cat > "$stubdir/claude-auth" <<'STUB'
+#!/usr/bin/env bash
+echo "401 Unauthorized: token expired — re-run claude login" >&2
+exit 1
+STUB
+  chmod +x "$stubdir"/claude-*
+
+  # Guard every invocation with `|| rc=$?` — `set -e` at the top of smoke.sh
+  # would otherwise kill the whole suite on any non-zero rc (auth-fail path
+  # and strict-mode-network-fail are expected rc=1).
+  local r_ok=0 r_to=0 r_net=0 r_auth=0 r_strict_net=0
+  HATS_E2E_CLAUDE_BIN="$stubdir/claude-ok" "$probe" --scope claude --probe-timeout 2 --max-wall 10 --quiet >/dev/null 2>&1 || r_ok=$?
+  HATS_E2E_CLAUDE_BIN="$stubdir/claude-timeout" "$probe" --scope claude --probe-timeout 1 --max-wall 5 --quiet >/dev/null 2>&1 || r_to=$?
+  HATS_E2E_CLAUDE_BIN="$stubdir/claude-network" "$probe" --scope claude --probe-timeout 2 --max-wall 5 --quiet >/dev/null 2>&1 || r_net=$?
+  HATS_E2E_CLAUDE_BIN="$stubdir/claude-auth" "$probe" --scope claude --probe-timeout 2 --max-wall 5 --quiet >/dev/null 2>&1 || r_auth=$?
+  HATS_E2E_CLAUDE_BIN="$stubdir/claude-network" "$probe" --scope claude --strict --probe-timeout 2 --max-wall 5 --quiet >/dev/null 2>&1 || r_strict_net=$?
+
+  # JSON shape sanity — must contain the schema_version + summary keys we pinned.
+  local json_out
+  json_out=$(HATS_E2E_CLAUDE_BIN="$stubdir/claude-ok" "$probe" --scope claude --json --probe-timeout 2 --max-wall 10 2>/dev/null)
+  local json_ok=0
+  printf '%s' "$json_out" | grep -q '"schema_version":1' \
+    && printf '%s' "$json_out" | grep -q '"summary"' \
+    && printf '%s' "$json_out" | grep -q '"probe_token_hit":true' \
+    && json_ok=1
+
+  rm -rf "$stubdir" "$acct_dir"
+
+  # Expected: PASS=0, TIMEOUT/NETWORK=0 (lenient WARN), AUTH=1, STRICT_NETWORK=1
+  if [ "$r_ok" -eq 0 ] && [ "$r_to" -eq 0 ] && [ "$r_net" -eq 0 ] \
+     && [ "$r_auth" -eq 1 ] && [ "$r_strict_net" -eq 1 ] && [ "$json_ok" -eq 1 ]; then
+    ok "hats-e2e-probe classifies ok/timeout/network/auth + strict escalation + --json shape (stubbed claude)"
+  else
+    die "hats-e2e-probe broken (ok=$r_ok timeout=$r_to network=$r_net auth=$r_auth strict_net=$r_strict_net json=$json_ok)"
+  fi
+}
+
+test_e2e_probe_rejects_unimplemented_scope() {
+  # codex/kimi/all scopes are not yet implemented; probe must reject them
+  # with rc=2 so callers don't silently skip unintended coverage.
+  local probe="$HATS_REPO/scripts/hats-e2e-probe"
+  local rc1=0 rc2=0 rc3=0
+  "$probe" --scope codex --quiet >/dev/null 2>&1 || rc1=$?
+  "$probe" --scope kimi --quiet >/dev/null 2>&1 || rc2=$?
+  "$probe" --scope all --quiet >/dev/null 2>&1 || rc3=$?
+  # All three already guarded — no bare-rc set-e risk.
+  if [ "$rc1" -eq 2 ] && [ "$rc2" -eq 2 ] && [ "$rc3" -eq 2 ]; then
+    ok "hats-e2e-probe rejects unimplemented scopes with rc=2 (fail-safe)"
+  else
+    die "hats-e2e-probe accepted unimplemented scope (codex=$rc1 kimi=$rc2 all=$rc3)"
+  fi
+}
+
 test_install_then_invoke_through_PATH() {
   # Regression fence for feedback_installed_vs_source_drift.md (2026-04-21
   # incident: shell-init'd kimi function was served from a stale
@@ -2277,6 +2368,8 @@ test_install_to_sandbox_stamps_commit
 test_install_check_gates_on_smoke
 test_install_is_idempotent_on_reinstall
 test_install_then_invoke_through_PATH
+test_e2e_probe_claude_scope_with_stub_binary
+test_e2e_probe_rejects_unimplemented_scope
 test_config_migration_is_idempotent
 test_doctor_metrics_flag
 test_call_provider_variant_dispatch
