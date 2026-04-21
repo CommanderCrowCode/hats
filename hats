@@ -594,7 +594,24 @@ _seed_claude_oauth_account_from_status() {
   local status
   status=$(_claude_auth_status_with_token_file "$token_file" "$acct_dir") || return 0
 
-  python3 - "$acct_dir/.claude.json" "$status" <<'PYEOF' 2>/dev/null || true
+  # Build donor list so we can copy mcpServers from existing creds.
+  local _donors=()
+  local _preferred _d _name
+  for _preferred in shannon monet debussy; do
+    [ -f "$PROVIDER_DIR/$_preferred/.claude.json" ] && _donors+=("$PROVIDER_DIR/$_preferred/.claude.json")
+  done
+  if [ -d "$PROVIDER_DIR" ]; then
+    for _d in "$PROVIDER_DIR"/*; do
+      [ -d "$_d" ] || continue
+      _name=$(basename "$_d")
+      [ "$_name" = "$(basename "$acct_dir")" ] && continue
+      [ "$_name" = "base" ] && continue
+      case "$_name" in shannon|monet|debussy) continue ;; esac
+      [ -f "$_d/.claude.json" ] && _donors+=("$_d/.claude.json")
+    done
+  fi
+
+  python3 - "$acct_dir/.claude.json" "$status" "${_donors[@]}" <<'PYEOF' 2>/dev/null || true
 import json, os, sys, tempfile
 
 target = sys.argv[1]
@@ -604,6 +621,8 @@ except Exception:
     sys.exit(0)
 if not status.get("loggedIn"):
     sys.exit(0)
+
+donors = sys.argv[3:]
 
 try:
     with open(target) as f:
@@ -648,6 +667,27 @@ for key, value in (
     if data.get(key) != value:
         data[key] = value
         changed = True
+
+# Copy mcpServers (and related fields) from the first donor that has them.
+MCP_FIELDS = ["mcpServers", "enabledMcpjsonServers", "disabledMcpjsonServers", "mcpContextUris"]
+for dp in donors:
+    try:
+        with open(dp) as f:
+            donor_data = json.load(f)
+    except Exception:
+        continue
+    if not isinstance(donor_data, dict):
+        continue
+    if not isinstance(donor_data.get("mcpServers"), dict) or not donor_data["mcpServers"]:
+        continue
+    for field in MCP_FIELDS:
+        if field in data:
+            continue
+        src = donor_data.get(field)
+        if src is not None:
+            data[field] = src
+            changed = True
+    break
 
 if not changed:
     sys.exit(0)
