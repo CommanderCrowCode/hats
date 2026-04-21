@@ -1510,14 +1510,6 @@ KIMICODEXFN
 # Critical safety: ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY are inlined on the
 # claude invocation, NEVER exported. Verified by 'hats kimi doctor'.
 ${fn_name}() {
-  # Auto-restore the hasCompletedOnboarding flag if absent. Prevents the
-  # platform.claude.com OAuth wall from firing on a kimi session after the
-  # operator (or a reinstall) wipes ~/.hats/claude/kimi/.claude.json.
-  if ! grep -q '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$acct_dir/.claude.json" 2>/dev/null; then
-    $(_hats_cmd_prefix) kimi init >/dev/null 2>&1 || {
-      echo "kimi: hats kimi init failed — OAuth wall may block this session" >&2
-    }
-  fi
   local _kimi_key
   _kimi_key=\$(
     set +u
@@ -1537,6 +1529,12 @@ ${fn_name}() {
     unset _kimi_key
     return 1
   fi
+  # Ensure ALL interactive-mode bypass gates are open for this key BEFORE
+  # launching claude: hasCompletedOnboarding + oauthAccount stanza +
+  # mcpServers + customApiKeyResponses.approved[key-suffix]. Consolidated
+  # into one call. Non-fatal on failure — claude will fall back to prompting
+  # interactively (annoying but not a hard block); doctor surfaces the gap.
+  $(_hats_cmd_prefix) kimi _approve_key "\$_kimi_key" >/dev/null 2>&1 || true
   ANTHROPIC_BASE_URL="$HATS_KIMI_BASE_URL" \\
   ANTHROPIC_API_KEY="\$_kimi_key" \\
   CLAUDE_CONFIG_DIR="$acct_dir" \\
@@ -3057,47 +3055,167 @@ _kimi_fetch_api_key() {
   ) 2>/dev/null
 }
 
-_ensure_kimi_onboarding_flag_claude() {
-  # Write (or merge-in) hasCompletedOnboarding:true into $acct_dir/.claude.json.
-  # Kimi's docs prescribe this flag so a fresh CLAUDE_CONFIG_DIR skips the
-  # platform.claude.com OAuth wall on first launch — OAuth is irrelevant for
-  # an API-key-backed backend and the wall otherwise blocks the kimi flow.
-  # Idempotent: preserves every other key already in the file.
+_seed_kimi_claude_config_from_donor() {
+  # Seed $acct_dir/.claude.json with the fields required for interactive-mode
+  # Claude Code to treat a Kimi (API-key-backed) session as fully logged in.
+  # Five field-classes copied idempotently from a donor credential dir
+  # (first available of shannon/monet/debussy/any-other non-kimi claude):
+  #
+  #   1. hasCompletedOnboarding:true — platform.claude.com OAuth first-run wall
+  #   2. oauthAccount (11 fields) — interactive "logged in" rendering gate;
+  #      without this, `kimi "..."` hits "Not logged in · Please run /login"
+  #      EVEN WITH ANTHROPIC_API_KEY set. Discovered 2026-04-21 via archaeology
+  #      on Tanwa's working darling-nikki .claude.json.
+  #   3. mcpServers + enabledMcpjsonServers + disabledMcpjsonServers
+  #      + mcpContextUris — tool-discovery gate; without mcpServers.relay-mesh
+  #      the /mcp slash-command returns "No MCP servers configured" and agents
+  #      can't call mesh tools. Scope-add via praetor msg-a593c93cb91932c0.
+  #   4. userID + migrationVersion + opusProMigrationComplete
+  #      + sonnet1m45MigrationComplete — version-drift gates so first launch
+  #      skips one-time migration UI.
+  #   5. customApiKeyResponses.approved[last-20-chars] — optional 2nd arg;
+  #      if supplied, ensures this key's suffix is approved (and removed
+  #      from rejected[] if previously recorded). The shell function passes
+  #      the runtime-fetched key so KIMI_API_KEY rotations auto-heal.
+  #
+  # All hats credentials share the same Anthropic identity (same operator,
+  # same account), so copying these user-global fields is legitimate reuse,
+  # not identity forgery.
+  #
+  # Idempotent: each field copied ONLY when target is missing or empty.
+  # Existing operator-customized values preserved. Errs if NO donor has an
+  # oauthAccount and target also lacks one (operator has never logged into
+  # any Anthropic account via hats — they must `hats add <name>` first).
   local acct_dir="$1"
+  local key="${2:-}"
   local target="$acct_dir/.claude.json"
   [ -d "$acct_dir" ] || return 0
 
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$target" <<'PY' || return 1
+  command -v python3 >/dev/null 2>&1 \
+    || { echo "kimi: python3 missing — cannot seed $target from donor. Install python3." >&2; return 1; }
+
+  local suffix=""
+  if [ -n "$key" ] && [ "${#key}" -ge 20 ]; then
+    suffix="${key: -20}"
+  fi
+
+  local _donors=()
+  local preferred d name
+  for preferred in shannon monet debussy; do
+    [ -f "$PROVIDER_DIR/$preferred/.claude.json" ] && _donors+=("$PROVIDER_DIR/$preferred/.claude.json")
+  done
+  if [ -d "$PROVIDER_DIR" ]; then
+    for d in "$PROVIDER_DIR"/*; do
+      [ -d "$d" ] || continue
+      name=$(basename "$d")
+      [ "$name" = "$HATS_KIMI_ACCOUNT_NAME" ] && continue
+      [ "$name" = "base" ] && continue
+      case "$name" in shannon|monet|debussy) continue ;; esac
+      [ -f "$d/.claude.json" ] && _donors+=("$d/.claude.json")
+    done
+  fi
+
+  python3 - "$target" "$suffix" "${_donors[@]}" <<'PY' || return 1
 import json, os, sys, tempfile
-path = sys.argv[1]
-try:
-    with open(path) as f:
-        d = json.load(f)
-    if not isinstance(d, dict):
-        d = {}
-except FileNotFoundError:
-    d = {}
-except (json.JSONDecodeError, OSError):
-    d = {}
-if d.get("hasCompletedOnboarding") is True:
+
+target = sys.argv[1]
+suffix = sys.argv[2]
+donors = sys.argv[3:]
+
+DONOR_FIELDS = [
+    "oauthAccount",
+    "mcpServers",
+    "enabledMcpjsonServers",
+    "disabledMcpjsonServers",
+    "mcpContextUris",
+    "userID",
+    "migrationVersion",
+    "opusProMigrationComplete",
+    "sonnet1m45MigrationComplete",
+]
+
+def load(p):
+    try:
+        with open(p) as f:
+            v = json.load(f)
+        return v if isinstance(v, dict) else None
+    except Exception:
+        return None
+
+def is_populated(v):
+    if v is None:
+        return False
+    if isinstance(v, (dict, list, str)):
+        return len(v) > 0
+    return True
+
+d = load(target) or {}
+changed = False
+
+if d.get("hasCompletedOnboarding") is not True:
+    d["hasCompletedOnboarding"] = True
+    changed = True
+
+donor_d = None
+for dp in donors:
+    sd = load(dp)
+    if sd is None:
+        continue
+    if is_populated(sd.get("oauthAccount")):
+        donor_d = sd
+        break
+
+if donor_d is None and not is_populated(d.get("oauthAccount")):
+    sys.stderr.write(
+        "kimi: no OAuth'd claude cred available to seed donor fields for "
+        + target + ". Log into any Anthropic account first via 'hats add <name>'.\n"
+    )
+    sys.exit(1)
+
+if donor_d is not None:
+    for field in DONOR_FIELDS:
+        if is_populated(d.get(field)):
+            continue
+        src = donor_d.get(field)
+        if src is None:
+            continue
+        d[field] = src
+        changed = True
+
+if suffix:
+    car = d.get("customApiKeyResponses") or {}
+    if not isinstance(car, dict):
+        car = {}
+    approved = car.get("approved") or []
+    rejected = car.get("rejected") or []
+    if not isinstance(approved, list):
+        approved = []
+    if not isinstance(rejected, list):
+        rejected = []
+    if suffix not in approved:
+        approved.append(suffix)
+        changed = True
+    new_rejected = [s for s in rejected if s != suffix]
+    if len(new_rejected) != len(rejected):
+        changed = True
+    car["approved"] = approved
+    car["rejected"] = new_rejected
+    d["customApiKeyResponses"] = car
+
+if not changed:
     sys.exit(0)
-d["hasCompletedOnboarding"] = True
-tmp = tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path) or ".", delete=False)
+
+tmp = tempfile.NamedTemporaryFile("w", dir=os.path.dirname(target) or ".", delete=False)
 json.dump(d, tmp, indent=2, sort_keys=True)
 tmp.flush(); os.fsync(tmp.fileno()); tmp.close()
-os.replace(tmp.name, path)
+os.replace(tmp.name, target)
 PY
-  else
-    # Pure-bash fallback: safe only when file is absent or is the canonical
-    # empty '{}' — anything else risks clobbering keys we can't parse.
-    if [ ! -s "$target" ] || [ "$(tr -d ' \n\t' < "$target")" = '{}' ]; then
-      printf '{"hasCompletedOnboarding": true}\n' > "$target"
-    else
-      echo "kimi: python3 missing — cannot merge hasCompletedOnboarding into existing $target. Install python3 or edit manually." >&2
-      return 1
-    fi
-  fi
+}
+
+_ensure_kimi_onboarding_flag_claude() {
+  # Backwards-compat shim: delegate to _seed_kimi_claude_config_from_donor.
+  # The consolidated helper supersedes the old single-purpose shape.
+  _seed_kimi_claude_config_from_donor "$@"
 }
 
 _ensure_kimi_onboarding_flag_codex() {
@@ -3306,6 +3424,23 @@ EOF
       [ -n "$_k" ] || { echo "kimi: fetched an empty value" >&2; return 1; }
       echo "kimi api key fetched: prefix=$(printf '%s' "$_k" | cut -c1-6)... length=${#_k}"
       ;;
+    _approve_key)
+      # Internal — called by the emitted kimi shell function per-invocation
+      # with the just-fetched KIMI_API_KEY. Ensures ALL interactive-mode
+      # bypass gates in $acct_dir/.claude.json are in place:
+      # hasCompletedOnboarding, oauthAccount, mcpServers, customApiKeyResponses.
+      # Consolidates in a single seed-from-donor call. Claude-only; codex
+      # has no analogous interactive prompt class.
+      local _k="${1:-}"
+      [ -n "$_k" ] || { echo "kimi _approve_key: missing key arg" >&2; return 2; }
+      if [ "$CURRENT_PROVIDER" != "claude" ]; then
+        return 0
+      fi
+      local _acct_dir
+      _acct_dir=$(_account_dir "$HATS_KIMI_ACCOUNT_NAME")
+      [ -d "$_acct_dir" ] || { echo "kimi _approve_key: $_acct_dir missing — run 'hats kimi init'" >&2; return 1; }
+      _seed_kimi_claude_config_from_donor "$_acct_dir" "$_k"
+      ;;
     ''|-h|--help)
       if [ "$CURRENT_PROVIDER" = "codex" ]; then
         cat <<EOF
@@ -3388,6 +3523,23 @@ cmd_kimi_doctor() {
   # 5. First-run-gate bypass (provider-variant): hasCompletedOnboarding
   # flag for claude, model_provider=kimi stanza in config.toml for codex.
   if _kimi_doctor_onboarding_bypass "$acct_dir"; then :; else issues=$((issues + 1)); fi
+
+  # 6. Interactive API-key-approval (claude-only variance): the current-
+  # fetched key's last-20-char suffix must be in customApiKeyResponses.
+  # approved[] and NOT in rejected[]. Without this claude hits the
+  # "Custom API key detected — approve?" prompt; a prior "reject" caches
+  # a permanent block. Shell function auto-heals per-invocation.
+  if _kimi_doctor_apikey_approved "$acct_dir" "$_kimi_key"; then :; else issues=$((issues + 1)); fi
+
+  # 7. oauthAccount stanza (claude-only variance): interactive mode checks
+  # for this to render "logged in"; without it, `kimi "..."` shows
+  # "Not logged in · Please run /login" even with valid API key.
+  if _kimi_doctor_oauth_stanza "$acct_dir"; then :; else issues=$((issues + 1)); fi
+
+  # 8. MCP server registration (claude-only variance): mcpServers.relay-mesh
+  # must exist so /mcp slash-command lists tools and agents can call mesh.
+  # Seeded from donor cred on init.
+  if _kimi_doctor_mcp_servers "$acct_dir"; then :; else issues=$((issues + 1)); fi
 
   echo ""
   echo "Done. $issues issue(s)."
@@ -3494,6 +3646,121 @@ _kimi_doctor_onboarding_bypass_codex() {
 }
 
 _kimi_doctor_onboarding_bypass() { _call_provider_variant kimi_doctor_onboarding_bypass "$@"; }
+
+_kimi_doctor_apikey_approved_claude() {
+  local acct_dir="$1"
+  local key="${2:-}"
+  local _flag_file="$acct_dir/.claude.json"
+  if [ -z "$key" ] || [ "${#key}" -lt 20 ]; then
+    echo "  WARN cannot check apikey-approved — no fetched key (check #2 likely failed)"
+    return 0
+  fi
+  if [ ! -f "$_flag_file" ]; then
+    echo "  FAIL $_flag_file missing — run 'hats kimi init'."
+    return 1
+  fi
+  command -v python3 >/dev/null 2>&1 \
+    || { echo "  WARN python3 missing — skipping apikey-approved check"; return 0; }
+  local suffix="${key: -20}"
+  local verdict
+  verdict=$(python3 - "$_flag_file" "$suffix" <<'PY' 2>/dev/null
+import json, sys
+path, suffix = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(path))
+except Exception:
+    print("unreadable"); sys.exit(0)
+car = d.get("customApiKeyResponses") or {}
+approved = car.get("approved") or []
+rejected = car.get("rejected") or []
+if suffix in rejected: print("rejected")
+elif suffix in approved: print("approved")
+else: print("absent")
+PY
+) || verdict="unreadable"
+  case "$verdict" in
+    approved)  echo "  OK   customApiKeyResponses.approved[] contains current key suffix"; return 0 ;;
+    rejected)  echo "  FAIL current key suffix is in customApiKeyResponses.rejected[] — interactive 'kimi' will fail 'Not logged in'. Next shell-function invocation will auto-heal."; return 1 ;;
+    absent)    echo "  WARN current key suffix absent from approved[] — first interactive 'kimi' will prompt; shell-function auto-heals on next invocation"; return 0 ;;
+    *)         echo "  WARN could not parse $_flag_file to check apikey-approved"; return 0 ;;
+  esac
+}
+
+_kimi_doctor_apikey_approved_codex() {
+  # B-11/A-28 variance: codex api_key auth has no interactive prompt.
+  :
+}
+
+_kimi_doctor_apikey_approved() { _call_provider_variant kimi_doctor_apikey_approved "$@"; }
+
+_kimi_doctor_oauth_stanza_claude() {
+  local acct_dir="$1"
+  local _flag_file="$acct_dir/.claude.json"
+  if [ ! -f "$_flag_file" ]; then
+    echo "  FAIL $_flag_file missing — run 'hats kimi init'."
+    return 1
+  fi
+  command -v python3 >/dev/null 2>&1 \
+    || { echo "  WARN python3 missing — skipping oauthAccount check"; return 0; }
+  if python3 -c "
+import json, sys
+d = json.load(open('$_flag_file'))
+oa = d.get('oauthAccount')
+sys.exit(0 if isinstance(oa, dict) and oa else 1)
+" 2>/dev/null; then
+    echo "  OK   oauthAccount stanza present in $_flag_file"
+    return 0
+  fi
+  echo "  FAIL oauthAccount stanza missing in $_flag_file — interactive 'kimi' will show 'Not logged in'. Run 'hats kimi init'."
+  return 1
+}
+
+_kimi_doctor_oauth_stanza_codex() {
+  # B-11/A-28 variance: codex has no oauthAccount analog.
+  :
+}
+
+_kimi_doctor_oauth_stanza() { _call_provider_variant kimi_doctor_oauth_stanza "$@"; }
+
+_kimi_doctor_mcp_servers_claude() {
+  local acct_dir="$1"
+  local _flag_file="$acct_dir/.claude.json"
+  if [ ! -f "$_flag_file" ]; then
+    echo "  FAIL $_flag_file missing — run 'hats kimi init'."
+    return 1
+  fi
+  command -v python3 >/dev/null 2>&1 \
+    || { echo "  WARN python3 missing — skipping mcpServers check"; return 0; }
+  local verdict
+  verdict=$(python3 - "$_flag_file" <<'PY' 2>/dev/null
+import json, sys
+d = json.load(open(sys.argv[1]))
+ms = d.get("mcpServers") or {}
+if not isinstance(ms, dict) or not ms:
+    print("empty"); sys.exit(0)
+rm = ms.get("relay-mesh")
+if isinstance(rm, dict) and rm:
+    print("has-relay-mesh " + str(len(ms)))
+else:
+    print("no-relay-mesh " + str(len(ms)))
+PY
+) || verdict="unreadable"
+  case "$verdict" in
+    has-relay-mesh*)  echo "  OK   mcpServers.relay-mesh registered ($verdict)"; return 0 ;;
+    no-relay-mesh*)   echo "  WARN mcpServers present but no relay-mesh entry ($verdict) — mesh tool discovery degraded"; return 0 ;;
+    empty)            echo "  FAIL mcpServers empty in $_flag_file — /mcp slash-command will return 'No MCP servers configured'. Run 'hats kimi init'."; return 1 ;;
+    *)                echo "  WARN could not parse $_flag_file to check mcpServers"; return 0 ;;
+  esac
+}
+
+_kimi_doctor_mcp_servers_codex() {
+  # B-11/A-28 variance: codex's MCP servers live in ~/.codex/config.toml
+  # globally, not per-account; hats-codex-engineer's canary confirmed
+  # relay-mesh is pre-registered. No per-account check needed.
+  :
+}
+
+_kimi_doctor_mcp_servers() { _call_provider_variant kimi_doctor_mcp_servers "$@"; }
 
 cmd_providers() {
   echo "Supported providers:"

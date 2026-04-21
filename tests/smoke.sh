@@ -2062,6 +2062,19 @@ test_kimi_onboarding_flag_idempotent() {
   local acct_dir="$HATS_DIR/claude/kimi"
   local flag_file="$acct_dir/.claude.json"
 
+  # Pre-seed a donor cred — the new _seed_kimi_claude_config_from_donor
+  # helper errs out if no OAuth'd account exists, which is the right
+  # operator-facing behavior but requires the test to fabricate one.
+  local donor_dir="$HATS_DIR/claude/shannon"
+  mkdir -p "$donor_dir"
+  cat > "$donor_dir/.claude.json" <<'EOF'
+{
+  "hasCompletedOnboarding": true,
+  "oauthAccount": {"accountUuid": "smoke", "emailAddress": "s@example.com"},
+  "mcpServers": {"relay-mesh": {"type": "http", "url": "http://127.0.0.1:18808/mcp"}}
+}
+EOF
+
   # (a) Fresh init from no kimi dir.
   rm -rf "$acct_dir"
   "$HATS_SCRIPT" kimi init >/dev/null 2>&1 || { die "hats kimi init rc!=0 on fresh sandbox"; return; }
@@ -2129,6 +2142,131 @@ EOF
     || { printf 'flag file now:\n%s\n' "$(cat "$flag_file")" >&2; die "shell-function guard did not auto-restore hasCompletedOnboarding"; return; }
 
   ok "hats kimi init + shell-function guard set/merge/auto-restore hasCompletedOnboarding idempotently"
+}
+
+test_kimi_interactive_bypass_full_seed() {
+  # Regression fence for the 2026-04-21 interactive-kimi "Not logged in"
+  # incident. Four field-classes are required for interactive-mode Claude
+  # Code to treat a Kimi (API-key) session as fully logged in:
+  #   (a) hasCompletedOnboarding:true
+  #   (b) oauthAccount stanza (copied from donor)
+  #   (c) mcpServers.relay-mesh (so /mcp shows tools)
+  #   (d) customApiKeyResponses.approved[suffix] + NOT in rejected[]
+  # _seed_kimi_claude_config_from_donor handles all of them; the shell
+  # function auto-invokes it per-invocation via 'hats kimi _approve_key'.
+  # PATH contract per feedback_shell_function_path_contract.md applies.
+
+  local acct_dir="$HATS_DIR/claude/kimi"
+  local flag_file="$acct_dir/.claude.json"
+  local donor_dir="$HATS_DIR/claude/shannon"
+  mkdir -p "$donor_dir"
+  cat > "$donor_dir/.claude.json" <<'EOF'
+{
+  "hasCompletedOnboarding": true,
+  "oauthAccount": {
+    "accountUuid": "smoke-account-uuid",
+    "emailAddress": "smoke@example.com",
+    "organizationUuid": "smoke-org-uuid",
+    "billingType": "max",
+    "displayName": "Smoke Test User",
+    "organizationName": "Smoke Org",
+    "organizationRole": "admin",
+    "workspaceRole": "admin",
+    "hasExtraUsageEnabled": true,
+    "accountCreatedAt": "2026-01-01T00:00:00Z",
+    "subscriptionCreatedAt": "2026-01-01T00:00:00Z"
+  },
+  "mcpServers": {
+    "relay-mesh": {"type": "http", "url": "http://127.0.0.1:18808/mcp"}
+  },
+  "enabledMcpjsonServers": ["relay-mesh"],
+  "disabledMcpjsonServers": [],
+  "mcpContextUris": [],
+  "userID": "smoke-user-id",
+  "migrationVersion": 11,
+  "opusProMigrationComplete": true,
+  "sonnet1m45MigrationComplete": true
+}
+EOF
+
+  mkdir -p "$acct_dir"
+  local seeded_suffix="00000000000000000000"
+  cat > "$flag_file" <<EOF
+{
+  "hasCompletedOnboarding": false,
+  "customApiKeyResponses": {
+    "approved": [],
+    "rejected": ["$seeded_suffix"]
+  },
+  "operator_custom_key": "preserve-me"
+}
+EOF
+
+  local fake_env="$SANDBOX_ROOT/.infisical.env"
+  cat > "$fake_env" <<EOF
+INFISICAL_UNIVERSAL_AUTH_CLIENT_ID=smoke-client-id
+INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=smoke-client-secret
+EOF
+  local emitted
+  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" shell-init 2>/dev/null)
+
+  local probe_out probe_rc
+  probe_out=$(PATH="$HATS_REPO:$PATH" bash -c '
+    set +e
+    eval "$1"
+    infisical() {
+      case "$1" in
+        login)  echo "smoke-token" ;;
+        secrets) echo "sk-kimi-smoke-$(printf '%.0s0' {1..50})" ;;
+        *)       return 0 ;;
+      esac
+    }
+    export -f infisical
+    claude() { :; }
+    export -f claude
+    kimi stub-prompt
+  ' _ "$emitted" 2>&1)
+  probe_rc=$?
+  if [ "$probe_rc" -ne 0 ]; then
+    printf 'got:\n%s\n' "$probe_out" >&2
+    die "kimi interactive-bypass probe exited non-zero (rc=$probe_rc)"
+    return
+  fi
+
+  python3 - "$flag_file" "$seeded_suffix" <<'PY' >/tmp/kimi-seed-verdict 2>&1
+import json, sys
+d = json.load(open(sys.argv[1]))
+suffix = sys.argv[2]
+errs = []
+if d.get("hasCompletedOnboarding") is not True:
+    errs.append("hasCompletedOnboarding not restored")
+car = d.get("customApiKeyResponses") or {}
+if suffix in (car.get("rejected") or []):
+    errs.append("suffix still in rejected[]")
+if suffix not in (car.get("approved") or []):
+    errs.append("suffix not added to approved[]")
+oa = d.get("oauthAccount")
+if not isinstance(oa, dict) or not oa.get("accountUuid"):
+    errs.append("oauthAccount stanza not seeded from donor")
+ms = d.get("mcpServers") or {}
+if not isinstance(ms.get("relay-mesh"), dict):
+    errs.append("mcpServers.relay-mesh not seeded from donor")
+if d.get("operator_custom_key") != "preserve-me":
+    errs.append("operator_custom_key clobbered")
+if errs:
+    print("FAIL:", "; ".join(errs)); sys.exit(1)
+print("OK")
+PY
+  if ! grep -q '^OK$' /tmp/kimi-seed-verdict; then
+    printf 'flag file now:\n%s\n' "$(cat "$flag_file")" >&2
+    printf 'verdict:\n%s\n' "$(cat /tmp/kimi-seed-verdict)" >&2
+    die "kimi shell function did not fully seed bypass state"
+    return
+  fi
+
+  rm -rf "$donor_dir"
+
+  ok "hats kimi _approve_key seeds all 4 bypass gates from donor + un-rejects suffix + preserves operator keys (interactive 'Not logged in' regression fence)"
 }
 
 test_codex_kimi_env_isolation() {
@@ -2379,6 +2517,7 @@ test_export_import_roundtrip
 test_export_openssl_backend
 test_kimi_env_isolation
 test_kimi_onboarding_flag_idempotent
+test_kimi_interactive_bypass_full_seed
 test_codex_kimi_env_isolation
 test_codex_kimi_config_toml_idempotent
 test_list_filter_flags
