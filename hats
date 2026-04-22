@@ -875,12 +875,26 @@ _token_info_codex() {
 
   # File path passed via argv, not string-interpolated (see _token_info_claude).
   python3 - "$file" <<'PYEOF' 2>/dev/null
-import json, sys
+import base64, json, sys, time
 try:
     d = json.load(open(sys.argv[1]))
     tokens = d.get('tokens') or {}
     print('present=True')
     print(f"account_id={tokens.get('account_id', 'unknown')}")
+    # Decode JWT id_token payload to surface expiry + refresh parity with
+    # _token_info_claude. Mirrors the verify-arm logic (hats:3136-3176).
+    idt = tokens.get('id_token') or ''
+    parts = idt.split('.')
+    if len(parts) == 3:
+        b64 = parts[1] + '=' * (-len(parts[1]) % 4)
+        try:
+            payload = json.loads(base64.urlsafe_b64decode(b64))
+            exp = payload.get('exp')
+            if isinstance(exp, (int, float)):
+                print(f'expired={time.time() > exp}')
+        except Exception:
+            pass
+    print(f'refresh={bool(tokens.get("refresh_token"))}')
 except Exception as e:
     print(f'error={e}')
 PYEOF
@@ -978,11 +992,21 @@ _show_account_status() {
       echo "$status"
       ;;
     codex)
-      if [ "$store" = "file" ]; then
-        echo "ok (auth.json present; store=file; account $account_id)"
+      local status=""
+      if [ "$expired" = "True" ]; then
+        if [ "$has_refresh" = "True" ]; then
+          status="ok (id_token expired, will auto-refresh)"
+        else
+          status="EXPIRED (needs re-login)"
+        fi
       else
-        echo "ok (auth.json present; store=$store, expected file; account $account_id)"
+        if [ "$store" = "file" ]; then
+          status="ok (auth.json present; store=file; account $account_id)"
+        else
+          status="ok (auth.json present; store=$store, expected file; account $account_id)"
+        fi
       fi
+      echo "$status"
       ;;
   esac
 }

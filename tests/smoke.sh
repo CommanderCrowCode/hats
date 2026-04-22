@@ -1596,6 +1596,70 @@ PYEOF
   ok "codex verify checks id_token JWT expiry + refresh freshness + auth_mode sanity + login-status liveness (G1+G2+G3)"
 }
 
+test_codex_list_shows_expiry_markers() {
+  # _token_info_codex parity: claude list shows EXPIRED / will-auto-refresh
+  # markers; codex list should do the same by decoding the id_token JWT exp
+  # claim and checking refresh_token presence. Mirrors G1 verify logic on the
+  # list surface.
+  "$HATS_SCRIPT" codex init >/dev/null 2>&1 || true
+
+  _mint_codex_jwt() {
+    python3 - "$1" <<'PYEOF'
+import base64, json, sys
+def b64(d):
+    return base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
+hdr = b64({"alg": "none", "typ": "JWT"})
+payload = b64({"exp": int(sys.argv[1]), "iat": int(sys.argv[1]) - 3600, "sub": "smoke"})
+print(f"{hdr}.{payload}.x")
+PYEOF
+  }
+
+  local now; now=$(date +%s)
+  local future=$((now + 3600))
+  local past=$((now - 3600))
+  local jwt_future jwt_past
+  jwt_future=$(_mint_codex_jwt "$future")
+  jwt_past=$(_mint_codex_jwt "$past")
+
+  local base="$HATS_DIR/codex"
+  stage_li() {
+    local name="$1" body="$2"
+    local dir="$base/$name"
+    mkdir -p "$dir"
+    printf '%s\n' "$body" > "$dir/auth.json"
+    chmod 600 "$dir/auth.json"
+    printf '%s\n' 'cli_auth_credentials_store = "file"' > "$dir/config.toml"
+  }
+
+  stage_li li_ok \
+"{\"auth_mode\":\"chatgpt\",\"tokens\":{\"id_token\":\"$jwt_future\",\"refresh_token\":\"r\",\"account_id\":\"acc-ok\"}}"
+  stage_li li_exp_refresh \
+"{\"auth_mode\":\"chatgpt\",\"tokens\":{\"id_token\":\"$jwt_past\",\"refresh_token\":\"r\",\"account_id\":\"acc-exp-ref\"}}"
+  stage_li li_exp_norefresh \
+"{\"auth_mode\":\"chatgpt\",\"tokens\":{\"id_token\":\"$jwt_past\",\"account_id\":\"acc-exp-noref\"}}"
+
+  local out rc=0
+  out=$("$HATS_SCRIPT" codex list 2>&1) || rc=$?
+
+  local ok_ok=0 ok_exp_ref=0 ok_exp_noref=0
+  echo "$out" | grep -q 'li_ok.*ok (auth.json present' && ok_ok=1
+  echo "$out" | grep -q 'li_exp_refresh.*ok (id_token expired, will auto-refresh)' && ok_exp_ref=1
+  echo "$out" | grep -q 'li_exp_norefresh.*EXPIRED (needs re-login)' && ok_exp_noref=1
+
+  # --expired filter: should match only the two expired accounts
+  local expired_out expired_match=0
+  expired_out=$("$HATS_SCRIPT" codex list --expired 2>&1) || true
+  echo "$expired_out" | grep -q 'li_exp_refresh' && echo "$expired_out" | grep -q 'li_exp_norefresh' && expired_match=1
+
+  rm -rf "$base/li_ok" "$base/li_exp_refresh" "$base/li_exp_norefresh"
+
+  if [ "$ok_ok" -eq 1 ] && [ "$ok_exp_ref" -eq 1 ] && [ "$ok_exp_noref" -eq 1 ] && [ "$expired_match" -eq 1 ]; then
+    ok "codex list shows expiry markers + --expired filter works (G1 list parity)"
+  else
+    die "codex list parity broken (ok=$ok_ok exp_ref=$ok_exp_ref exp_noref=$ok_exp_noref expired_filter=$expired_match)"
+  fi
+}
+
 test_export_import_roundtrip() {
   # `hats export` + `hats import` (roadmap #1 / MSH-11) — crypto-agnostic
   # scaffold. Verify the unencrypted path: export a staged account to a
@@ -2666,6 +2730,7 @@ test_codex_kimi_config_toml_idempotent
 test_codex_kimi_unset_model_emits_no_stanza
 test_codex_kimi_doctor_flags_wire_api_incompat
 test_codex_kimi_bypass_env_gate_allows_emit
+test_codex_list_shows_expiry_markers
 test_list_filter_flags
 test_fleet_symmetry_check_runs_clean
 
