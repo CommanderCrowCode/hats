@@ -1756,9 +1756,11 @@ ${fn_name}() {
     unset _kimi_key
     return 1
   fi
-  CODEX_HOME="$acct_dir" \\
-  OPENAI_API_KEY="\$_kimi_key" \\
-    $RUNTIME_COMMAND -c 'cli_auth_credentials_store="file"' "\$@"
+  (
+    CODEX_HOME="$acct_dir" \\
+    OPENAI_API_KEY="\$_kimi_key" \\
+      $RUNTIME_COMMAND -c 'cli_auth_credentials_store="file"' "\$@"
+  )
   local _rc=\$?
   unset _kimi_key
   return \$_rc
@@ -1803,10 +1805,12 @@ ${fn_name}() {
   # into one call. Non-fatal on failure — claude will fall back to prompting
   # interactively (annoying but not a hard block); doctor surfaces the gap.
   $(_hats_cmd_prefix) kimi _approve_key "\$_kimi_key" >/dev/null 2>&1 || true
-  ANTHROPIC_BASE_URL="$HATS_KIMI_BASE_URL" \\
-  ANTHROPIC_API_KEY="\$_kimi_key" \\
-  CLAUDE_CONFIG_DIR="$acct_dir" \\
-    $RUNTIME_COMMAND --dangerously-skip-permissions "\$@"
+  (
+    ANTHROPIC_BASE_URL="$HATS_KIMI_BASE_URL" \\
+    ANTHROPIC_API_KEY="\$_kimi_key" \\
+    CLAUDE_CONFIG_DIR="$acct_dir" \\
+      $RUNTIME_COMMAND --dangerously-skip-permissions "\$@"
+  )
   local _rc=\$?
   unset _kimi_key
   return \$_rc
