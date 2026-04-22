@@ -2700,7 +2700,7 @@ test_flip_dry_run_and_b20_refusal() {
 
   # (d) rollback plan was written
   local rollback_count
-  rollback_count=$(ls -1 "$rot_dir/rollback"/rot-*.yaml 2>/dev/null | wc -l)
+  rollback_count=$(find "$rot_dir/rollback" -maxdepth 1 -name 'rot-*.yaml' -type f 2>/dev/null | wc -l)
   if [ "$rollback_count" -lt 2 ]; then
     die "flip did not write rollback plans (count=$rollback_count)"
     return

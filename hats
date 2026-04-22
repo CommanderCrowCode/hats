@@ -72,6 +72,8 @@ SHARED_ALLOWLIST=()
 
 die() { echo "Error: $*" >&2; exit 1; }
 
+log_warn() { echo "Warning: $*" >&2; }
+
 _is_macos() {
   [ "$(uname -s 2>/dev/null || echo unknown)" = "Darwin" ]
 }
@@ -2027,9 +2029,10 @@ _rotation_log() {
     return 0
   fi
 
-  # List all events, newest first
+  # List all events (shellcheck SC2045: glob instead of ls)
   local event
-  for event in $(ls -t "${rollback_dir}"/rot-*.yaml 2>/dev/null); do
+  for event in "${rollback_dir}"/rot-*.yaml; do
+    [ -e "$event" ] || continue
     [ -f "$event" ] || continue
     local basename ev_id agent from_harness to_harness
     basename=$(basename "$event" .yaml)
