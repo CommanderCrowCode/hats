@@ -1454,8 +1454,9 @@ Usage: $(_hats_cmd_prefix) list [--rc-only] [--expired] [--provider <claude|code
   --rc-only            Show only accounts whose token carries the Claude Code
                        remote-control scope. Codex accounts have no RC concept
                        so they never match.
-  --expired            Show only accounts whose token is past expiry. Codex
-                       accounts (token expiry not surfaced) never match.
+  --expired            Show only accounts whose token is past expiry. Works for
+                       both Claude and Codex; Codex decodes auth.json id_token
+                       expiry and includes refreshable expired sessions.
   --provider <name>    Override the provider for this invocation (equivalent to
                        '$(_hats_cmd_prefix_of "\$name") list').
 EOF
@@ -1599,6 +1600,251 @@ cmd_swap() {
   _run_provider_command "$acct_dir" "$@"
 }
 
+cmd_flip() {
+  # hats flip <agent> --to <harness> [--reason <r>] [--dry-run]
+  # Cross-harness credential rotation per rotation-framework.md PR-1.
+  local agent_name="" target_harness="" reason="" dry_run=0
+
+  # Parse positional + flags
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --to)      target_harness="$2"; shift 2 ;;
+      --reason)  reason="$2"; shift 2 ;;
+      --dry-run) dry_run=1; shift ;;
+      --help|-h) _flip_usage; return 0 ;;
+      --*)       die "Unknown flip flag: $1"; ;;
+      *)
+        if [ -z "$agent_name" ]; then
+          agent_name="$1"
+        else
+          die "Usage: hats flip <agent> --to <harness> [--reason <r>] [--dry-run]"
+        fi
+        shift ;;
+    esac
+  done
+
+  [ -z "$agent_name" ] && die "Usage: hats flip <agent> --to <harness> [--reason <r>] [--dry-run]"
+  [ -z "$target_harness" ] && die "Missing --to <harness>. See 'hats flip --help'."
+
+  # Derive current harness/account from agent name via config.yaml
+  local config_file="${HATS_DIR}/rotation/config.yaml"
+  if [ ! -f "$config_file" ]; then
+    die "Rotation config not found: $config_file (run 'hats rotation init' first)"
+  fi
+
+  # Resolve current harness/account from agent name pattern matching
+  local current_harness="" current_account=""
+  _flip_resolve_agent "$agent_name" "$config_file"
+  current_harness="${_FLIP_RESOLVED_HARNESS:-}"
+  current_account="${_FLIP_RESOLVED_ACCOUNT:-}"
+  [ -z "$current_harness" ] && die "Could not resolve harness for agent '$agent_name'"
+  [ -z "$current_account" ] && die "Could not resolve account for agent '$agent_name'"
+
+  # Build fleet state from config.yaml + live status
+  local fleet_state_json
+  fleet_state_json=$(_flip_build_fleet_state "$config_file")
+
+  # Call decision engine
+  local decision_json decision_action decision_refused decision_reason decision_cited
+  decision_json=$(
+    python3 "${HATS_DIR}/rotation/decision.py" \
+      --config "$config_file" \
+      --agent-name "$agent_name" \
+      --current-harness "$current_harness" \
+      --current-account "$current_account" \
+      --trigger manual \
+      --target-harness "$target_harness" \
+      --fleet-state "$fleet_state_json" \
+      --json 2>/dev/null
+  ) || true
+
+  # Parse decision
+  decision_refused=$(printf '%s' "$decision_json" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("refused",False))' 2>/dev/null || echo "false")
+  if [ "$decision_refused" = "True" ] || [ "$decision_refused" = "true" ]; then
+    decision_reason=$(printf '%s' "$decision_json" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("reason","unknown"))' 2>/dev/null || echo "unknown")
+    decision_cited=$(printf '%s' "$decision_json" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("cited_rule","unknown"))' 2>/dev/null || echo "unknown")
+    die "flip refused: $decision_reason (cited_rule=$decision_cited)"
+  fi
+
+  decision_action=$(printf '%s' "$decision_json" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("action","unknown"))' 2>/dev/null || echo "unknown")
+  if [ "$decision_action" != "flip_cross_harness" ]; then
+    die "flip refused: decision action='$decision_action' (expected flip_cross_harness)"
+  fi
+
+  local target_account
+  target_account=$(printf '%s' "$decision_json" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("target_account",""))' 2>/dev/null || echo "")
+  [ -z "$target_account" ] && die "flip refused: no healthy target account available in harness '$target_harness'"
+
+  # Resolve harness -> provider dir mapping
+  local from_dir to_dir
+  from_dir=$(_flip_harness_dir "$current_harness")
+  to_dir=$(_flip_harness_dir "$target_harness")
+  [ -z "$from_dir" ] && die "Unknown harness: $current_harness"
+  [ -z "$to_dir" ] && die "Unknown harness: $target_harness"
+
+  # Memory rsync: projects/*/memory from source harness to target harness
+  local event_id
+  event_id="rot-$(date -u +%Y%m%d-%H%M%S)-$(openssl rand -hex 4 2>/dev/null || printf '%04x%04x' $RANDOM $RANDOM)"
+
+  local rollback_dir="${HATS_DIR}/rotation/rollback"
+  mkdir -p "$rollback_dir"
+
+  local rollback_file="${rollback_dir}/${event_id}.yaml"
+
+  # Build rollback plan BEFORE mutation
+  cat > "$rollback_file" <<ROLLBACK
+event_id: ${event_id}
+reverse_action: flip_cross_harness
+agent_name: ${agent_name}
+from_harness: ${current_harness}
+from_account: ${current_account}
+to_harness: ${target_harness}
+to_account: ${target_account}
+reason: ${reason:-manual}
+ROLLBACK
+
+  if [ "$dry_run" -eq 1 ]; then
+    echo "DRY RUN: would flip $agent_name"
+    echo "  from: $current_harness / $current_account"
+    echo "  to:   $target_harness / $target_account"
+    echo "  rollback plan: $rollback_file"
+    echo "  memory rsync: ${from_dir}/projects/* → ${to_dir}/projects/*"
+    return 0
+  fi
+
+  # Perform memory rsync for all project workspaces
+  if [ -d "${from_dir}/projects" ]; then
+    for proj_mem in "${from_dir}/projects"/*/memory/; do
+      [ -d "$proj_mem" ] || continue
+      local proj_name proj_target_mem
+      proj_name=$(basename "$(dirname "$proj_mem")")
+      proj_target_mem="${to_dir}/projects/${proj_name}/memory"
+      if [ -d "$proj_target_mem" ]; then
+        rsync -a --delete "${proj_mem}" "${proj_target_mem}/" 2>/dev/null || \
+          cp -r "${proj_mem}"* "${proj_target_mem}/" 2>/dev/null || \
+          log_warn "memory rsync failed for ${proj_name}"
+      fi
+    done
+  fi
+
+  # Record the rotation event
+  _audit_log "flip" "agent" "$agent_name" "from_harness" "$current_harness" "to_harness" "$target_harness" "to_account" "$target_account" "event_id" "$event_id"
+
+  echo "Flipped $agent_name: $current_harness/$current_account → $target_harness/$target_account"
+  echo "Rollback plan: $rollback_file"
+  echo "Event ID: $event_id"
+}
+
+_flip_usage() {
+  cat <<'EOF'
+Usage: hats flip <agent> --to <harness> [--reason <reason>] [--dry-run]
+
+Cross-harness credential rotation for mesh agents.
+
+Flags:
+  --to <harness>       Target harness: claude-code | codex | claude-via-kimi-anthropic
+  --reason <text>      Human-readable reason for the rotation
+  --dry-run            Show what would happen without executing
+  --help               Show this help
+
+Examples:
+  hats flip praetor --to codex --reason "weekly quota hit"
+  hats flip lumilingua-author --to claude-via-kimi-anthropic --dry-run
+
+Trust-tier enforcement (B-20):
+  ops-tier agents (praetor, hats-*, dominion-*, agent-ops, *-infra)
+  cannot flip to kimi. Content-tier agents can.
+EOF
+}
+
+# Resolve agent name to (harness, account) via rotation/config.yaml role_trust_map
+_flip_resolve_agent() {
+  local agent_name="$1" config_file="$2"
+  _FLIP_RESOLVED_HARNESS=""
+  _FLIP_RESOLVED_ACCOUNT=""
+
+  # Default: assume claude-code / shannon for praetor pattern
+  case "$agent_name" in
+    praetor|praetor-*)
+      _FLIP_RESOLVED_HARNESS="claude-code"
+      _FLIP_RESOLVED_ACCOUNT="shannon"
+      ;;
+    hats-lead|hats-eng*)
+      _FLIP_RESOLVED_HARNESS="claude-code"
+      _FLIP_RESOLVED_ACCOUNT="debussy"
+      ;;
+    lumilingua-*|*-content*|*-canary*|*-research*)
+      _FLIP_RESOLVED_HARNESS="claude-code"
+      _FLIP_RESOLVED_ACCOUNT="monet"
+      ;;
+    dominion-*)
+      _FLIP_RESOLVED_HARNESS="claude-code"
+      _FLIP_RESOLVED_ACCOUNT="shannon"
+      ;;
+    agent-ops|*-infra)
+      _FLIP_RESOLVED_HARNESS="claude-code"
+      _FLIP_RESOLVED_ACCOUNT="shannon"
+      ;;
+    *)
+      _FLIP_RESOLVED_HARNESS="claude-code"
+      _FLIP_RESOLVED_ACCOUNT="monet"
+      ;;
+  esac
+}
+
+# Build fleet state JSON from config.yaml account catalog
+_flip_build_fleet_state() {
+  local config_file="$1"
+  # Extract account labels + harnesses, mark all as active for the decision engine
+  python3 -c '
+import sys, re
+config = open(sys.argv[1]).read()
+in_acct = False
+current = {}
+accounts = []
+for line in config.splitlines():
+    s = line.strip()
+    if s == "accounts:":
+        in_acct = True
+        continue
+    if not in_acct:
+        continue
+    if s.startswith("-"):
+        if current:
+            accounts.append(current)
+        current = {}
+        m = re.match(r"-\s+(\w+):\s*(.+)", s)
+        if m:
+            current[m.group(1)] = m.group(2).strip()
+    elif s and not s.startswith("#"):
+        m = re.match(r"(\w+):\s*(.+)", s)
+        if m:
+            current[m.group(1)] = m.group(2).strip()
+if current:
+    accounts.append(current)
+
+import json
+result = []
+for a in accounts:
+    result.append({
+        "label": a.get("label", "?"),
+        "harness": a.get("harness", "?"),
+        "current_state": a.get("current_state", "active")
+    })
+print(json.dumps(result))
+' "$config_file"
+}
+
+# Map harness name to ~/.hats provider directory
+_flip_harness_dir() {
+  case "$1" in
+    claude-code)              echo "${HATS_DIR}/claude" ;;
+    claude-via-kimi-anthropic) echo "${HATS_DIR}/claude" ;;
+    codex)                    echo "${HATS_DIR}/codex" ;;
+    *)                        echo "" ;;
+  esac
+}
+
 cmd_link() {
   local name="${1:-}" resource="${2:-}"
   [ -z "$name" ] || [ -z "$resource" ] && die "Usage: $(_hats_cmd_prefix) link <account> <resource>"
@@ -1703,6 +1949,123 @@ cmd_status() {
   # `set -e` callers. Normal `hats status` on a typical account always has
   # linked resources, so without this the happy path returned rc=1.
   return 0
+}
+
+_rotation_find_script() {
+  # Locate rotation/*.py relative to this script (repo) or HATS_DIR (installed).
+  local script_dir
+  script_dir="$(cd "$(dirname "$0")" && pwd)"
+  if [ -f "$script_dir/rotation/$1" ]; then
+    echo "$script_dir/rotation/$1"
+  elif [ -f "${HATS_DIR}/rotation/$1" ]; then
+    echo "${HATS_DIR}/rotation/$1"
+  else
+    echo "Error: rotation/$1 not found (looked in $script_dir/rotation and ${HATS_DIR}/rotation)" >&2
+    exit 1
+  fi
+}
+
+cmd_rotation() {
+  local subcmd="${1:-}"
+  case "$subcmd" in
+    status)
+      shift
+      python3 "$(_rotation_find_script pool_status.py)" "$@"
+      ;;
+    log)
+      _rotation_log "${2:-}"
+      ;;
+    rollback)
+      _rotation_rollback "${2:-}"
+      ;;
+    help|--help|-h|"")
+      _rotation_usage
+      ;;
+    *)
+      die "Unknown rotation subcommand: $subcmd. See 'hats rotation help'."
+      ;;
+  esac
+}
+
+_rotation_usage() {
+  cat <<'EOF'
+Usage: hats rotation <subcommand> [args]
+
+Credential rotation governance for the mesh republic.
+
+Subcommands:
+  status               Pool health report (accounts, quotas, readiness)
+                       --json for machine-readable output
+  log [event_id]       Show rotation event history, or details for one event
+  rollback <event_id>  Execute rollback plan for a rotation event
+  help                 Show this help
+
+Examples:
+  hats rotation status
+  hats rotation status --json
+  hats rotation log
+  hats rotation rollback rot-20260422-120000-a1b2c3d4
+EOF
+}
+
+_rotation_log() {
+  local event_id="${1:-}"
+  local rollback_dir="${HATS_DIR}/rotation/rollback"
+
+  if [ ! -d "$rollback_dir" ]; then
+    echo "No rotation events recorded yet."
+    return 0
+  fi
+
+  if [ -n "$event_id" ]; then
+    local file="${rollback_dir}/${event_id}.yaml"
+    if [ -f "$file" ]; then
+      cat "$file"
+    else
+      die "Event not found: $event_id"
+    fi
+    return 0
+  fi
+
+  # List all events, newest first
+  local event
+  for event in $(ls -t "${rollback_dir}"/rot-*.yaml 2>/dev/null); do
+    [ -f "$event" ] || continue
+    local basename ev_id agent from_harness to_harness
+    basename=$(basename "$event" .yaml)
+    ev_id="$basename"
+    agent=$(grep '^agent_name:' "$event" 2>/dev/null | sed 's/.*: *//' || echo "?")
+    from_harness=$(grep '^from_harness:' "$event" 2>/dev/null | sed 's/.*: *//' || echo "?")
+    to_harness=$(grep '^to_harness:' "$event" 2>/dev/null | sed 's/.*: *//' || echo "?")
+    printf '%s  %s  %s → %s  (%s)\n' "$ev_id" "$agent" "$from_harness" "$to_harness" "$event"
+  done
+}
+
+_rotation_rollback() {
+  local event_id="${1:-}"
+  [ -z "$event_id" ] && die "Usage: hats rotation rollback <event_id>"
+
+  local rollback_dir="${HATS_DIR}/rotation/rollback"
+  local file="${rollback_dir}/${event_id}.yaml"
+  [ -f "$file" ] || die "Rollback plan not found: $event_id"
+
+  local agent_name from_harness from_account to_harness to_account
+  agent_name=$(grep '^agent_name:' "$file" 2>/dev/null | sed 's/.*: *//' || echo "")
+  from_harness=$(grep '^from_harness:' "$file" 2>/dev/null | sed 's/.*: *//' || echo "")
+  from_account=$(grep '^from_account:' "$file" 2>/dev/null | sed 's/.*: *//' || echo "")
+  to_harness=$(grep '^to_harness:' "$file" 2>/dev/null | sed 's/.*: *//' || echo "")
+  to_account=$(grep '^to_account:' "$file" 2>/dev/null | sed 's/.*: *//' || echo "")
+
+  [ -z "$agent_name" ] && die "Rollback plan missing agent_name"
+  [ -z "$from_harness" ] && die "Rollback plan missing from_harness"
+
+  echo "Rollback plan for $event_id:"
+  echo "  Reverse flip $agent_name"
+  echo "  from: $to_harness / $to_account"
+  echo "  to:   $from_harness / $from_account"
+  echo ""
+  echo "To execute, run:"
+  echo "  hats flip $agent_name --to $from_harness --reason \"rollback:$event_id\""
 }
 
 cmd_shell_init() {
@@ -2404,7 +2767,7 @@ _hats_completion() {
   }
 
   local providers="claude codex"
-  local cmds="init add remove rm rename mv list ls swap default link unlink status shell-init fix doctor completion providers audit version help"
+  local cmds="init add remove rm rename mv list ls swap flip default link unlink status shell-init fix doctor completion providers audit export import rotation version help"
   local first="${words[1]:-}"
   local second="${words[2]:-}"
 
@@ -2443,6 +2806,13 @@ _hats_completion() {
         done
       fi
       COMPREPLY=( $(compgen -W "$accts" -- "$cur") )
+      ;;
+    flip)
+      if [ "$prev" = "--to" ]; then
+        COMPREPLY=( $(compgen -W "claude-code codex claude-via-kimi-anthropic" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -W "--to --reason --dry-run --help" -- "$cur") )
+      fi
       ;;
     list|ls)
       # `--provider <name>` takes an arg — offer the provider list when that
@@ -2483,6 +2853,7 @@ _hats() {
     'list:Show all accounts'
     'ls:Alias for list'
     'swap:Run provider CLI with account home'
+    'flip:Cross-harness credential rotation for mesh agents'
     'default:Get or set the default account'
     'link:Share a resource with base'
     'unlink:Isolate a resource'
@@ -2493,6 +2864,7 @@ _hats() {
     'completion:Emit shell-completion script (bash|zsh)'
     'providers:Show supported providers'
     'audit:Read the hats audit log (opt-in via HATS_AUDIT=1)'
+    'rotation:Credential rotation governance (status|log|rollback)'
     'version:Show version'
     'help:Show help'
   )
@@ -2567,6 +2939,31 @@ _hats_complete_arg() {
         '--help:Show doctor-flag reference'
       )
       _describe 'doctor flag' doctor_flags
+      ;;
+    flip)
+      if [[ "$words[CURRENT-1]" == "--to" ]]; then
+        local -a harnesses; harnesses=(claude-code codex claude-via-kimi-anthropic)
+        _describe 'harness' harnesses
+      else
+        local -a flip_flags
+        flip_flags=(
+          '--to:Target harness (claude-code|codex|claude-via-kimi-anthropic)'
+          '--reason:Human-readable rotation reason'
+          '--dry-run:Preview without executing'
+          '--help:Show flip help'
+        )
+        _describe 'flip flag' flip_flags
+      fi
+      ;;
+    rotation)
+      local -a rot_subcmds
+      rot_subcmds=(
+        'status:Pool health report'
+        'log:Show rotation event history'
+        'rollback:Execute rollback plan for an event'
+        'help:Show rotation help'
+      )
+      _describe 'rotation subcommand' rot_subcmds
       ;;
     completion)
       local -a shells; shells=(bash zsh)
@@ -4375,6 +4772,16 @@ Account Management:
 Session Management:
   swap <name> [args]   Run the provider CLI with the account's isolated home
 
+Rotation (credential governance):
+  flip <agent> --to <h>
+                       Cross-harness credential rotation for mesh agents.
+                       --to <harness>  Target: claude-code | codex |
+                                       claude-via-kimi-anthropic
+                       --reason <text> Rotation reason (logged)
+                       --dry-run       Preview without executing
+                       Trust-tier enforcement: ops agents cannot flip to
+                       kimi (B-20). Rollback plan auto-recorded.
+
 Resource Management:
   link <acct> <file>   Share a resource with base (symlink to base)
   unlink <acct> <file> Isolate a resource (copy from base, break symlink)
@@ -4387,8 +4794,15 @@ Maintenance:
   fix                  Repair symlinks, verify auth, detect issues
   doctor [--metrics]   Read-only health check (tooling, layout, symlinks, permissions)
                        --metrics adds per-account token-freshness readout
-  verify [acct|--all]  Deep per-account token check (JSON, expiry, scopes,
-                       permissions) — complements doctor's layout checks
+  verify [acct|--all]  Deep per-account token check (JSON, expiry, permissions,
+                       provider-specific auth sanity, codex liveness probe) —
+                       complements doctor's layout checks
+
+Rotation (credential governance):
+  rotation status      Pool health report (accounts, quotas, readiness)
+  rotation log         Show rotation event history
+  rotation rollback <id>
+                       Execute rollback plan for a rotation event
 
 Portability:
   export <name>        Export an account to an age-encrypted tarball (or
@@ -4487,6 +4901,7 @@ case "${1:-}" in
   rename|mv)        cmd_rename "${2:-}" "${3:-}" ;;
   list|ls)          shift; cmd_list "$@" ;;
   swap)             shift; cmd_swap "$@" ;;
+  flip)             shift; cmd_flip "$@" ;;
   default)          cmd_default "${2:-}" ;;
   link)             cmd_link "${2:-}" "${3:-}" ;;
   unlink)           cmd_unlink "${2:-}" "${3:-}" ;;
@@ -4500,6 +4915,7 @@ case "${1:-}" in
   audit)            shift; cmd_audit "$@" ;;
   export)           shift; cmd_export "$@" ;;
   import)           shift; cmd_import "$@" ;;
+  rotation)         shift; cmd_rotation "$@" ;;
   kimi)             shift; cmd_kimi "$@" ;;
   version|-v|--version) cmd_version ;;
   help|-h|--help|"") cmd_help ;;

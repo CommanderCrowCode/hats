@@ -70,7 +70,7 @@ This copies `hats` to `~/.local/bin/`. Make sure `~/.local/bin` is in your `PATH
 
 ## Harness matrix
 
-`hats` treats each coding-agent harness as first-class. All three support the same core surface (`init / add / swap / list / doctor / shell-init`), and they can coexist on the same machine:
+`hats` treats each coding-agent harness as first-class. All three support the same core surface (`init / add / swap / list / doctor / verify / shell-init`), and they can coexist on the same machine:
 
 | Harness | CLI prefix | Isolation root | Status |
 |---------|-----------|----------------|--------|
@@ -239,6 +239,7 @@ codex_work() { CODEX_HOME="$HOME/.hats/codex/work" codex -c 'cli_auth_credential
 ```bash
 hats fix               # Repair broken symlinks, verify auth, dedupe base/settings.json hooks
 hats doctor            # Read-only health check (tooling, layout, symlinks, permissions)
+hats verify            # Deep per-account auth check (JSON, expiry, provider semantics)
 hats completion bash   # Emit bash completion script; eval "$(...)" in .bashrc
 hats completion zsh    # Emit zsh completion script; eval "$(...)" in .zshrc
 hats providers         # List supported providers and show the default
@@ -262,6 +263,13 @@ integrity without changing anything, then exits non-zero on hard issues. See
 [`docs/doctor-checks.md`](docs/doctor-checks.md) for the full check catalog and
 remediation guide. Works for both providers: `hats doctor` (claude) and
 `hats codex doctor`.
+
+**`hats verify`** is the semantic companion to doctor. It stays read-only, but
+goes deeper into each account's auth material: JSON validity, file mode,
+expiry horizon, refreshability, and provider-specific sanity. On Codex that
+includes `auth_mode` checks, `id_token` JWT expiry / refresh-token freshness,
+`cli_auth_credentials_store = "file"`, and a non-billing `codex login status`
+liveness probe. Works for both providers: `hats verify` and `hats codex verify`.
 
 **`install.sh --check`** runs the smoke-test suite (`tests/smoke.sh`) before
 installing, aborting if any test fails — handy for CI/CD or anyone who wants
@@ -352,6 +360,7 @@ hats v1.1.0 — Claude Code Accounts
 ```
 $ hats list --rc-only              # only RC-scoped tokens
 $ hats list --expired              # only past-expiry tokens (pair with --rc-only if needed)
+$ hats codex list --expired        # codex auth.json id_token expiry, incl. refreshable-expired
 $ hats list --provider codex       # reroute the listing to the codex tree
 $ hats list --rc-only --expired    # AND — RC-scoped AND expired
 ```

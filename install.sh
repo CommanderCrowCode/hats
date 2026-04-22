@@ -65,6 +65,12 @@ mv -f "$INSTALL_DIR/hats.tmp.$$" "$INSTALL_DIR/hats"
 
 echo "Installed hats to $INSTALL_DIR/hats"
 
+# Copy rotation/ auxiliary scripts (pool_status.py, decision.py, etc.)
+if [ -d "$SCRIPT_DIR/rotation" ]; then
+  cp -R "$SCRIPT_DIR/rotation" "$INSTALL_DIR/rotation"
+  echo "Installed rotation scripts to $INSTALL_DIR/rotation"
+fi
+
 # Check if install dir is in PATH
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
   echo ""

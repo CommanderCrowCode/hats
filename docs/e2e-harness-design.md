@@ -112,7 +112,7 @@ Chain-runner that executes the full regression stack in order and aggregates res
 **Already shipped in codex verify suite (160ff35 + doctor-gaps doc):**
 - G1 — id_token JWT expiry + refresh-token presence (codex-only, matches claude JWT-horizon check)
 - G3 — auth_mode sanity (codex-only, no claude analog)
-- G2 — `codex login status` liveness probe (pending; WARN-on-network convention established)
+- G2 — `codex login status` liveness probe (shipped; WARN-on-network convention retained)
 
 **Boundary rule (proposed to codex-engineer via msg 04:00:43Z):**
 - codex-engineer OWNS intra-provider semantic checks (everything in `hats codex verify` / `hats codex doctor`).

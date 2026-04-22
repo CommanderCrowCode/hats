@@ -1,0 +1,173 @@
+schema_version: 1
+
+# Harness catalog — defines execution contexts.
+harnesses:
+  claude-code:
+    command: claude
+    config_dir_env: CLAUDE_CONFIG_DIR
+    quota_resets: {session_5h: 5h, weekly: 7d}
+    mcp_config_surface: per_account
+  codex:
+    command: codex
+    config_dir_env: CODEX_HOME
+    quota_resets: {session_5h: null, weekly: 7d, daily: 24h}
+    mcp_config_surface: user_global
+  claude-via-kimi-anthropic:
+    command: claude
+    config_dir_env: CLAUDE_CONFIG_DIR
+    quota_resets: {usage_based: null}
+    mcp_config_surface: per_account
+    parent_harness: claude-code
+
+# Provider catalog — who owns the tokens.
+providers:
+  anthropic:
+    quota_model: tiered_subscription
+    auth_flow: oauth
+    status_probe: https://api.anthropic.com/v1/health
+  openai:
+    quota_model: api_pay_per_use
+    auth_flow: chatgpt_oauth | api_key
+  moonshot:
+    quota_model: api_pay_per_use
+    auth_flow: api_key
+
+# Account catalog — each row is a (label, harness, provider) triple.
+accounts:
+  - label: shannon
+    harness: claude-code
+    provider: anthropic
+    trust_tier: ops
+    quota_model: max
+    current_state: active
+  - label: monet
+    harness: claude-code
+    provider: anthropic
+    trust_tier: ops
+    quota_model: max
+    current_state: active
+  - label: debussy
+    harness: claude-code
+    provider: anthropic
+    trust_tier: ops
+    quota_model: max
+    current_state: active
+  - label: kimi
+    harness: claude-via-kimi-anthropic
+    provider: moonshot
+    trust_tier: content
+    quota_model: api_pay_per_use
+    current_state: active
+  - label: astartes
+    harness: codex
+    provider: openai
+    trust_tier: ops
+    quota_model: chatgpt_subscription
+    current_state: active
+  - label: slaanesh
+    harness: codex
+    provider: openai
+    trust_tier: ops
+    quota_model: chatgpt_subscription
+    current_state: active
+
+# Trust tiers — symbolic levels with policy.
+trust_tiers:
+  ops:
+    description: "Server admin, Infisical, SSH/sudo, secrets-handling roles"
+    allowed_accounts: [shannon, monet, debussy, astartes, slaanesh]
+    # kimi excluded per B-20
+  content:
+    description: "Content authoring, research, canary, low-risk"
+    allowed_accounts: [shannon, monet, debussy, astartes, slaanesh, kimi]
+
+# Role -> trust-tier map (agent name patterns).
+role_trust_map:
+  - pattern: "^(praetor|praetor-.*|hats-lead|hats-.*-engineer|dominion-.*|agent-ops|.*-infra)$"
+    tier: ops
+  - pattern: "^(lumilingua-.*|.*-content.*|.*-canary|.*-research)$"
+    tier: content
+  - pattern: ".*"
+    tier: content
+
+# Triggers — events that enter the engine.
+triggers:
+  user_quota_5h:
+    detected_by: session_cap_banner | 429_throttle_burst
+    urgency: normal
+  user_quota_weekly:
+    detected_by: weekly_limit_banner
+    urgency: high
+  user_quota_daily:
+    detected_by: daily_limit_banner
+    urgency: normal
+  platform_throttle:
+    detected_by: persistent_429_post_cooldown | server_temporarily_limiting_banner
+    urgency: high
+  manual:
+    detected_by: hats_flip_cli
+    urgency: normal
+  security_incident:
+    detected_by: operator_signal | key_leak_detector
+    urgency: urgent
+  dead_man:
+    detected_by: heartbeat_missed_3x
+    urgency: urgent
+
+# Decision table — rows matched top-to-bottom, first match wins.
+decisions:
+  - trigger: user_quota_5h
+    from_trust_tier: "*"
+    action: rotate_within_harness
+    fallback: pause_not_respawn
+    note: "Session cap typically resets in ~1h; prefer rotate + retry later"
+
+  - trigger: user_quota_weekly
+    from_trust_tier: ops
+    action: flip_cross_harness
+    target_harness_priority: [codex, claude-code]
+    fallback: manual_escalate
+    note: "Weekly wall is hard; flip to codex-astartes or remaining-healthy claude cred"
+
+  - trigger: user_quota_weekly
+    from_trust_tier: content
+    action: flip_cross_harness
+    target_harness_priority: [codex, claude-via-kimi-anthropic, claude-code]
+    fallback: manual_escalate
+
+  - trigger: platform_throttle
+    from_trust_tier: ops
+    action: flip_cross_harness
+    target_harness_priority: [codex]
+    fallback: pause_not_respawn
+    note: "Ops can only go codex when platform_throttle; kimi-excluded"
+
+  - trigger: platform_throttle
+    from_trust_tier: content
+    action: flip_cross_harness
+    target_harness_priority: [codex, claude-via-kimi-anthropic]
+    fallback: pause_not_respawn
+
+  - trigger: manual
+    from_trust_tier: "*"
+    action: flip_cross_harness
+    target_harness: from_cli_arg
+    fallback: refuse
+    note: "Operator specifies target; trust-tier filter still applies"
+
+  - trigger: security_incident
+    from_trust_tier: "*"
+    action: pause_not_respawn
+    note: "Never auto-rotate on security; operator must investigate"
+
+  - trigger: dead_man
+    from_role: "^(praetor|praetor-comms-engineer)$"
+    from_trust_tier: ops
+    action: flip_cross_harness
+    target_harness: codex
+    note: "B-21 praetor-resilience; auto-flip without ACK"
+
+  - trigger: dead_man
+    from_trust_tier: "*"
+    action: respawn_preserve_identity
+    fallback: manual_escalate

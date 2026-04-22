@@ -1,25 +1,29 @@
 #!/usr/bin/env bash
 # hats-e2e-probe — fleet-wide live-credential canary probe.
 #
-# Design doc: docs/e2e-harness-design.md (signed off by hats-lead 2026-04-21
-# msg-cbd2d3feb1a71fea). MVP scope per hats-lead's C1→C5 gate:
-# claude-scope single-provider prototype; codex + kimi scopes expand in
-# follow-up slices.
-#
 # Contract:
-#   - Emits bounded-time probes ("Reply with exactly the three characters:
-#     ok.") against each registered credential; compares rc + output.
-#   - PASS iff rc=0 AND stdout contains the 2-char token "ok".
-#   - WARN on rc=124 (timeout), rc=000 (network/DNS fail), or any rc where
-#     stderr clearly indicates network/endpoint rather than auth/token
-#     failure. Offline-tolerant per kimi doctor §3 + codex verify G2.
-#   - FAIL on explicit auth/token failure (non-network non-timeout rc).
-#   - Default lenient for developer runs; --strict escalates WARN→FAIL for CI.
+#   - Emits bounded-time probes against each registered credential and
+#     compares rc + output.
+#   - Claude/Codex use a live minimal prompt ("Reply with exactly the three
+#     characters: ok.") so the token path is exercised for real.
+#   - Kimi reports truth via the shipped operational surfaces:
+#       * `hats kimi doctor` for the working claude-kimi path
+#       * `hats codex kimi doctor` for the codex-kimi status, which is
+#         explicitly marked disabled unless an operator has installed a proxy
+#         workaround and bypassed the compat check
+#   - PASS iff rc=0 AND stdout contains the 2-char token "ok" (Claude/Codex)
+#     or the doctor surface exits cleanly (Kimi).
+#   - WARN on rc=124 (timeout), rc=000 (network/DNS fail), or explicit
+#     codex-kimi disabled state. Offline-tolerant by default.
+#   - FAIL on explicit auth/setup failure (non-network non-timeout rc).
 #
 # Usage:
-#   hats-e2e-probe                         # scope=claude (MVP), human output
-#   hats-e2e-probe --scope claude          # explicit
-#   hats-e2e-probe --account <name>        # single account
+#   hats-e2e-probe                         # scope=claude, human output
+#   hats-e2e-probe --scope claude          # live claude probe
+#   hats-e2e-probe --scope codex           # live codex probe
+#   hats-e2e-probe --scope kimi            # truth via hats kimi doctor surfaces
+#   hats-e2e-probe --scope all             # claude + codex + kimi
+#   hats-e2e-probe --account <name>        # single claude/codex account
 #   hats-e2e-probe --json                  # machine-readable
 #   hats-e2e-probe --quiet                 # summary line only
 #   hats-e2e-probe --strict                # escalate WARN→FAIL (CI intent)
@@ -27,28 +31,10 @@
 #   hats-e2e-probe --probe-timeout <sec>   # override 30s per-probe timeout
 #   hats-e2e-probe -h|--help
 #
-# Strict/lenient invariant (per hats-lead msg-cbd2d3feb1a71fea):
-#   Developer-run defaults to LENIENT (network WARN does not fail the probe).
-#   CI explicitly opts into --strict. api.kimi.com/coding/ has DNS-flake
-#   history; strict-by-default would false-fail developer probes offline.
-#
-# Account enumeration:
-#   Per hats-lead msg-cbd2d3feb1a71fea: use `hats list --json` when present;
-#   fall back to `$HATS_DIR/<provider>/` directory scan as soft-degrade
-#   with a WARN log so operators know they're on the older path. MVP uses
-#   the directory-scan fallback (hats list --json not yet shipped).
-#
-# Cost budget: default model is the minimum-cost variant per provider (e.g.
-# claude-haiku-4-5 for claude). ~$0.03 per claude probe; ~$0.10 per fleet
-# run with 3 claude accounts.
-#
 # Exit codes:
 #   0  all PASS (or WARN in lenient mode)
 #   1  any FAIL, or any WARN in strict mode
 #   2  usage / env error
-#
-# Author: hats-e2e-engineer (ag-7aeab07b8639266a), 2026-04-21.
-# Ship-signal: C2 of C1→C5 (claude-scope MVP; codex+kimi follow-up).
 
 set -u
 
@@ -60,10 +46,30 @@ STRICT=0
 PROBE_TIMEOUT=30
 WALL_TIMEOUT=180
 CLAUDE_MODEL="${HATS_E2E_CLAUDE_MODEL:-claude-haiku-4-5-20251001}"
+CODEX_MODEL="${HATS_E2E_CODEX_MODEL:-gpt-5}"
 PROBE_PROMPT='Reply with exactly the three characters: ok.'
 PROBE_TOKEN="ok"
 
-# Parse flags. Two-token flags get the value in the next $2.
+# shellcheck disable=SC1007
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1007
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+HATS_BIN="${HATS_E2E_HATS_BIN:-$REPO_ROOT/hats}"
+HATS_ROOT="${HATS_DIR:-$HOME/.hats}"
+CLAUDE_ROOT="$HATS_ROOT/claude"
+CODEX_ROOT="$HATS_ROOT/codex"
+
+CLAUDE_BIN=""
+CODEX_BIN=""
+
+pass=0
+warn=0
+fail=0
+probed_any=0
+wall_exhausted=0
+wall_start=0
+first_result=1
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --scope)
@@ -82,60 +88,90 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -lt 2 ] && { echo "--probe-timeout needs a value" >&2; exit 2; }
       PROBE_TIMEOUT="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
 
 case "$SCOPE" in
-  claude) ;;  # MVP scope
-  codex|kimi|all) echo "scope '$SCOPE' not yet implemented in MVP — claude-scope only" >&2; exit 2 ;;
-  *) echo "unknown scope: $SCOPE (expected: claude)" >&2; exit 2 ;;
+  claude|codex|kimi|all) ;;
+  *) echo "unknown scope: $SCOPE (expected: claude|codex|kimi|all)" >&2; exit 2 ;;
 esac
 
 case "$PROBE_TIMEOUT$WALL_TIMEOUT" in
   *[!0-9]*) echo "timeouts must be integer seconds" >&2; exit 2 ;;
 esac
 
-HATS_ROOT="${HATS_DIR:-$HOME/.hats}"
-CLAUDE_ROOT="$HATS_ROOT/claude"
-
-[ -d "$CLAUDE_ROOT" ] || { echo "claude layout missing: $CLAUDE_ROOT (run 'hats init')" >&2; exit 2; }
-
-# Locate the claude binary. Probe via PATH so the probe exercises the
-# operator-experience path (same reasoning as test_install_then_invoke_through_PATH).
-CLAUDE_BIN="${HATS_E2E_CLAUDE_BIN:-$(command -v claude 2>/dev/null || true)}"
-if [ -z "$CLAUDE_BIN" ] || [ ! -x "$CLAUDE_BIN" ]; then
-  echo "claude binary not found on PATH (set HATS_E2E_CLAUDE_BIN to override)" >&2
+if [ -n "$ACCOUNT" ] && [ "$SCOPE" = "kimi" ] && [ "$ACCOUNT" != "kimi" ]; then
+  echo "--scope kimi only supports --account kimi" >&2
   exit 2
 fi
 
-# Discover accounts. MVP: directory-scan fallback with WARN log. When
-# `hats list --json` ships, swap this for the JSON parse.
-discover_accounts() {
-  if [ -n "$ACCOUNT" ]; then
-    [ -d "$CLAUDE_ROOT/$ACCOUNT" ] || { echo "account '$ACCOUNT' not found under $CLAUDE_ROOT" >&2; exit 2; }
-    echo "$ACCOUNT"
-    return
-  fi
-  [ "$VERBOSITY" = "loud" ] && echo "[probe] WARN using directory-scan fallback — hats list --json not yet shipped (hats-lead msg-cbd2d3feb1a71fea)" >&2
-  for d in "$CLAUDE_ROOT"/*/; do
-    local name; name=$(basename "$d")
-    case "$name" in
-      base|kimi) continue ;;  # base is the template; kimi is a separate slot
-    esac
-    [ -f "$d/.credentials.json" ] || continue  # skip uninitialized dirs
-    echo "$name"
-  done
+log_warn() {
+  [ "$VERBOSITY" = "loud" ] && echo "[probe] WARN $*" >&2
 }
 
-# Classify a probe result. Inputs: rc, stdout, stderr (via stderr_file).
-#
-# Outputs to stdout (space-separated): <status> <category>
-#   status   = pass|warn|fail
-#   category = token_hit|timeout|network|auth|empty|unknown
-classify() {
+check_wall_budget() {
+  local elapsed=$(( $(date +%s) - wall_start ))
+  if [ "$elapsed" -ge "$WALL_TIMEOUT" ]; then
+    log_warn "wall-timeout reached ($WALL_TIMEOUT s) — skipping remaining probes"
+    wall_exhausted=1
+    return 1
+  fi
+  return 0
+}
+
+excerpt_file() {
+  local file="$1" limit="${2:-500}"
+  [ -s "$file" ] || return 0
+  head -c "$limit" "$file" 2>/dev/null | tr '"\n' "'  "
+}
+
+token_hit_bool() {
+  [ "$1" = "token_hit" ] && echo true || echo false
+}
+
+effective_status() {
+  local status="$1"
+  if [ "$STRICT" -eq 1 ] && [ "$status" = "warn" ]; then
+    echo "fail"
+  else
+    echo "$status"
+  fi
+}
+
+emit_result() {
+  local provider="$1" account="$2" path_label="$3" status="$4" effective="$5"
+  local category="$6" rc="$7" duration_ms="$8" token_hit="$9" excerpt="${10}"
+  local display="$provider/$account"
+  [ -n "$path_label" ] && display="$display [$path_label]"
+
+  if [ "$OUT" = "json" ]; then
+    [ "$first_result" -eq 0 ] && printf ','
+    printf '\n  {"provider":"%s","account":"%s","status":"%s","effective_status":"%s","category":"%s","rc":%d,"duration_ms":%d,"probe_token_hit":%s' \
+      "$provider" "$account" "$status" "$effective" "$category" "$rc" "$duration_ms" "$token_hit"
+    if [ -n "$path_label" ]; then
+      printf ',"path":"%s"' "$path_label"
+    fi
+    printf ',"err_excerpt":"%s"}' "$excerpt"
+  elif [ "$VERBOSITY" = "loud" ]; then
+    printf '[probe] %s %s (rc=%d, %dms, %s)\n' \
+      "$(echo "$effective" | tr '[:lower:]' '[:upper:]')" \
+      "$display" "$rc" "$duration_ms" "$category"
+  fi
+  first_result=0
+}
+
+record_effective_status() {
+  case "$1" in
+    pass) pass=$((pass + 1)) ;;
+    warn) warn=$((warn + 1)) ;;
+    *)    fail=$((fail + 1)) ;;
+  esac
+}
+
+classify_cli_probe() {
   local rc="$1" stdout="$2" stderr_file="$3"
   local stderr_excerpt=""
   [ -s "$stderr_file" ] && stderr_excerpt=$(head -c 2000 "$stderr_file" 2>/dev/null || true)
@@ -144,13 +180,11 @@ classify() {
     if printf '%s' "$stdout" | grep -qiF "$PROBE_TOKEN"; then
       echo "pass token_hit"
     else
-      # rc=0 but missing token — likely model drift or format surprise; warn.
       echo "warn empty"
     fi
     return
   fi
 
-  # rc != 0 — classify by network vs auth signals.
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
     echo "warn timeout"
     return
@@ -169,93 +203,311 @@ classify() {
   echo "fail unknown"
 }
 
-# Probe a single account. Emits either a human line or a JSON blob on stdout;
-# returns 0 on pass, 1 on warn, 2 on fail (internal contract; caller aggregates).
-probe_account() {
+classify_doctor_probe() {
+  local rc="$1" output_file="$2"
+  local out=""
+  [ -s "$output_file" ] && out=$(head -c 4000 "$output_file" 2>/dev/null || true)
+
+  if printf '%s' "$out" | grep -q 'FAIL codex-kimi DISABLED'; then
+    echo "warn disabled"
+    return
+  fi
+
+  if [ "$rc" -eq 0 ]; then
+    echo "pass doctor_ok"
+    return
+  fi
+
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    echo "warn timeout"
+    return
+  fi
+
+  if printf '%s' "$out" | grep -qiE 'could not resolve|name or service not known|no route to host|connection refused|timed out|network is unreachable|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|unreachable'; then
+    echo "warn network"
+    return
+  fi
+
+  if printf '%s' "$out" | grep -q 'FAIL '; then
+    echo "fail doctor_fail"
+    return
+  fi
+
+  echo "fail unknown"
+}
+
+ensure_runtime_bin() {
+  local provider="$1"
+  case "$provider" in
+    claude)
+      [ -n "$CLAUDE_BIN" ] && return 0
+      CLAUDE_BIN="${HATS_E2E_CLAUDE_BIN:-$(command -v claude 2>/dev/null || true)}"
+      if [ -z "$CLAUDE_BIN" ] || [ ! -x "$CLAUDE_BIN" ]; then
+        echo "claude binary not found on PATH (set HATS_E2E_CLAUDE_BIN to override)" >&2
+        exit 2
+      fi
+      ;;
+    codex)
+      [ -n "$CODEX_BIN" ] && return 0
+      CODEX_BIN="${HATS_E2E_CODEX_BIN:-$(command -v codex 2>/dev/null || true)}"
+      if [ -z "$CODEX_BIN" ] || [ ! -x "$CODEX_BIN" ]; then
+        echo "codex binary not found on PATH (set HATS_E2E_CODEX_BIN to override)" >&2
+        exit 2
+      fi
+      ;;
+  esac
+}
+
+discover_provider_accounts() {
+  local provider="$1" allow_empty="$2"
+  local root="" auth_primary="" auth_secondary="" init_hint=""
+
+  case "$provider" in
+    claude)
+      root="$CLAUDE_ROOT"
+      auth_primary=".credentials.json"
+      auth_secondary=".oauth-token"
+      init_hint="hats init"
+      ;;
+    codex)
+      root="$CODEX_ROOT"
+      auth_primary="auth.json"
+      init_hint="hats codex init"
+      ;;
+  esac
+
+  if [ ! -d "$root" ]; then
+    if [ "$allow_empty" = "1" ]; then
+      log_warn "$provider layout missing: $root (run '$init_hint')"
+      return 0
+    fi
+    echo "$provider layout missing: $root (run '$init_hint')" >&2
+    exit 2
+  fi
+
+  if [ -n "$ACCOUNT" ]; then
+    case "$ACCOUNT" in
+      kimi)
+        if [ "$allow_empty" = "1" ]; then
+          return 0
+        fi
+        echo "account 'kimi' is a backend alias; use --scope kimi" >&2
+        exit 2
+        ;;
+    esac
+
+    if [ ! -d "$root/$ACCOUNT" ]; then
+      if [ "$allow_empty" = "1" ]; then
+        return 0
+      fi
+      echo "account '$ACCOUNT' not found under $root" >&2
+      exit 2
+    fi
+    if [ -f "$root/$ACCOUNT/$auth_primary" ] || { [ -n "$auth_secondary" ] && [ -f "$root/$ACCOUNT/$auth_secondary" ]; }; then
+      echo "$ACCOUNT"
+      return 0
+    fi
+    if [ "$allow_empty" = "1" ]; then
+      return 0
+    fi
+    echo "account '$ACCOUNT' missing $auth_primary under $root" >&2
+    exit 2
+  fi
+
+  log_warn "using directory-scan fallback for $provider accounts"
+  for d in "$root"/*/; do
+    [ -d "$d" ] || continue
+    local name
+    name=$(basename "$d")
+    case "$name" in
+      base|kimi) continue ;;
+    esac
+    if [ -f "$d/$auth_primary" ] || { [ -n "$auth_secondary" ] && [ -f "$d/$auth_secondary" ]; }; then
+      echo "$name"
+    fi
+  done
+}
+
+probe_claude_account() {
   local acct="$1"
   local acct_dir="$CLAUDE_ROOT/$acct"
-  local stderr_file stdout_file start_ms end_ms duration_ms rc=0 status category
+  local stderr_file stdout_file stdout start_ms end_ms duration_ms rc=0 status category effective excerpt
   stderr_file=$(mktemp "${TMPDIR:-/tmp}/hats-e2e-stderr-XXXXXX")
   stdout_file=$(mktemp "${TMPDIR:-/tmp}/hats-e2e-stdout-XXXXXX")
 
   start_ms=$(( $(date +%s%N 2>/dev/null || echo "$(date +%s)000000000") / 1000000 ))
-
-  # Bounded-time invocation. `timeout` exits 124 on hard timeout.
-  # CLAUDE_CONFIG_DIR points claude at the account's isolated config.
   CLAUDE_CONFIG_DIR="$acct_dir" \
   timeout "$PROBE_TIMEOUT" "$CLAUDE_BIN" --model "$CLAUDE_MODEL" -p "$PROBE_PROMPT" \
     </dev/null >"$stdout_file" 2>"$stderr_file" || rc=$?
-
   end_ms=$(( $(date +%s%N 2>/dev/null || echo "$(date +%s)000000000") / 1000000 ))
   duration_ms=$((end_ms - start_ms))
 
-  local stdout; stdout=$(head -c 2000 "$stdout_file" 2>/dev/null || true)
-  read -r status category <<< "$(classify "$rc" "$stdout" "$stderr_file")"
-
-  # Strict mode escalates warn→fail for non-pass results.
-  local effective_status="$status"
-  if [ "$STRICT" -eq 1 ] && [ "$status" = "warn" ]; then
-    effective_status="fail"
-  fi
-
-  if [ "$OUT" = "json" ]; then
-    local err_excerpt=""
-    [ "$status" != "pass" ] && err_excerpt=$(head -c 500 "$stderr_file" 2>/dev/null | tr '"\n' "'  ")
-    printf '  {"provider":"claude","account":"%s","status":"%s","effective_status":"%s","category":"%s","rc":%d,"duration_ms":%d,"probe_token_hit":%s,"err_excerpt":"%s"}' \
-      "$acct" "$status" "$effective_status" "$category" "$rc" "$duration_ms" \
-      "$([ "$status" = pass ] && echo true || echo false)" \
-      "$err_excerpt"
-  elif [ "$VERBOSITY" = "loud" ]; then
-    printf '[probe] %s claude/%s (rc=%d, %dms, %s)\n' \
-      "$(echo "$effective_status" | tr '[:lower:]' '[:upper:]')" \
-      "$acct" "$rc" "$duration_ms" "$category"
-  fi
+  stdout=$(head -c 2000 "$stdout_file" 2>/dev/null || true)
+  read -r status category <<< "$(classify_cli_probe "$rc" "$stdout" "$stderr_file")"
+  effective=$(effective_status "$status")
+  excerpt=""
+  [ "$status" != "pass" ] && excerpt=$(excerpt_file "$stderr_file")
+  emit_result "claude" "$acct" "" "$status" "$effective" "$category" "$rc" "$duration_ms" "$(token_hit_bool "$category")" "$excerpt"
 
   rm -f "$stderr_file" "$stdout_file"
-
-  case "$effective_status" in
-    pass) return 0 ;;
-    warn) return 1 ;;
-    fail) return 2 ;;
-  esac
+  record_effective_status "$effective"
+  probed_any=$((probed_any + 1))
 }
 
-# Main loop with wall-clock budget.
-accounts=$(discover_accounts)
-if [ -z "$accounts" ]; then
-  echo "no claude accounts under $CLAUDE_ROOT (run 'hats add <name>')" >&2
-  exit 2
-fi
+probe_codex_account() {
+  local acct="$1"
+  local acct_dir="$CODEX_ROOT/$acct"
+  local stderr_file stdout_file stdout start_ms end_ms duration_ms rc=0 status category effective excerpt
+  stderr_file=$(mktemp "${TMPDIR:-/tmp}/hats-e2e-stderr-XXXXXX")
+  stdout_file=$(mktemp "${TMPDIR:-/tmp}/hats-e2e-stdout-XXXXXX")
 
-pass=0 warn=0 fail=0
-wall_start=$(date +%s)
+  start_ms=$(( $(date +%s%N 2>/dev/null || echo "$(date +%s)000000000") / 1000000 ))
+  if [ -n "$CODEX_MODEL" ]; then
+    CODEX_HOME="$acct_dir" \
+    timeout "$PROBE_TIMEOUT" "$CODEX_BIN" exec \
+      -c 'cli_auth_credentials_store="file"' \
+      --sandbox read-only \
+      --skip-git-repo-check \
+      --color never \
+      --model "$CODEX_MODEL" \
+      --output-last-message "$stdout_file" \
+      "$PROBE_PROMPT" \
+      >/dev/null 2>"$stderr_file" || rc=$?
+  else
+    CODEX_HOME="$acct_dir" \
+    timeout "$PROBE_TIMEOUT" "$CODEX_BIN" exec \
+      -c 'cli_auth_credentials_store="file"' \
+      --sandbox read-only \
+      --skip-git-repo-check \
+      --color never \
+      --output-last-message "$stdout_file" \
+      "$PROBE_PROMPT" \
+      >/dev/null 2>"$stderr_file" || rc=$?
+  fi
+  end_ms=$(( $(date +%s%N 2>/dev/null || echo "$(date +%s)000000000") / 1000000 ))
+  duration_ms=$((end_ms - start_ms))
 
-[ "$OUT" = "json" ] && printf '{"schema_version":1,"started_at":"%s","scope":"%s","strict":%s,"results":[' \
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SCOPE" "$([ $STRICT -eq 1 ] && echo true || echo false)"
+  stdout=$(head -c 2000 "$stdout_file" 2>/dev/null || true)
+  read -r status category <<< "$(classify_cli_probe "$rc" "$stdout" "$stderr_file")"
+  effective=$(effective_status "$status")
+  excerpt=""
+  [ "$status" != "pass" ] && excerpt=$(excerpt_file "$stderr_file")
+  emit_result "codex" "$acct" "" "$status" "$effective" "$category" "$rc" "$duration_ms" "$(token_hit_bool "$category")" "$excerpt"
 
-first_result=1
-for acct in $accounts; do
-  elapsed=$(( $(date +%s) - wall_start ))
-  if [ "$elapsed" -ge "$WALL_TIMEOUT" ]; then
-    [ "$VERBOSITY" = "loud" ] && echo "[probe] WARN wall-timeout reached ($WALL_TIMEOUT s) — skipping remaining accounts" >&2
-    break
+  rm -f "$stderr_file" "$stdout_file"
+  record_effective_status "$effective"
+  probed_any=$((probed_any + 1))
+}
+
+probe_doctor_surface() {
+  local provider="$1" account="$2" path_label="$3"
+  shift 3
+  local output_file start_ms end_ms duration_ms rc=0 status category effective excerpt
+  output_file=$(mktemp "${TMPDIR:-/tmp}/hats-e2e-doctor-XXXXXX")
+
+  start_ms=$(( $(date +%s%N 2>/dev/null || echo "$(date +%s)000000000") / 1000000 ))
+  timeout "$PROBE_TIMEOUT" "$@" >"$output_file" 2>&1 || rc=$?
+  end_ms=$(( $(date +%s%N 2>/dev/null || echo "$(date +%s)000000000") / 1000000 ))
+  duration_ms=$((end_ms - start_ms))
+
+  read -r status category <<< "$(classify_doctor_probe "$rc" "$output_file")"
+  effective=$(effective_status "$status")
+  excerpt=""
+  [ "$status" != "pass" ] && excerpt=$(excerpt_file "$output_file")
+  emit_result "$provider" "$account" "$path_label" "$status" "$effective" "$category" "$rc" "$duration_ms" false "$excerpt"
+
+  rm -f "$output_file"
+  record_effective_status "$effective"
+  probed_any=$((probed_any + 1))
+}
+
+run_claude_scope() {
+  local allow_empty="$1"
+  local accounts
+  accounts=$(discover_provider_accounts claude "$allow_empty")
+  if [ -z "$accounts" ]; then
+    if [ "$allow_empty" = "1" ]; then
+      log_warn "no claude accounts found under $CLAUDE_ROOT"
+      return
+    fi
+    echo "no claude accounts under $CLAUDE_ROOT (run 'hats add <name>')" >&2
+    exit 2
+  fi
+  ensure_runtime_bin claude
+  local acct
+  for acct in $accounts; do
+    check_wall_budget || return
+    probe_claude_account "$acct"
+  done
+}
+
+run_codex_scope() {
+  local allow_empty="$1"
+  local accounts
+  accounts=$(discover_provider_accounts codex "$allow_empty")
+  if [ -z "$accounts" ]; then
+    if [ "$allow_empty" = "1" ]; then
+      log_warn "no codex accounts found under $CODEX_ROOT"
+      return
+    fi
+    echo "no codex accounts under $CODEX_ROOT (run 'hats codex add <name>')" >&2
+    exit 2
+  fi
+  ensure_runtime_bin codex
+  local acct
+  for acct in $accounts; do
+    check_wall_budget || return
+    probe_codex_account "$acct"
+  done
+}
+
+run_kimi_scope() {
+  local allow_empty="$1"
+  if [ -n "$ACCOUNT" ] && [ "$ACCOUNT" != "kimi" ]; then
+    if [ "$allow_empty" = "1" ]; then
+      return
+    fi
+    echo "--scope kimi only supports --account kimi" >&2
+    exit 2
   fi
 
-  [ "$OUT" = "json" ] && [ "$first_result" -eq 0 ] && printf ','
-  [ "$OUT" = "json" ] && printf '\n'
+  if [ ! -x "$HATS_BIN" ]; then
+    if [ "$allow_empty" = "1" ]; then
+      log_warn "hats binary not executable at $HATS_BIN"
+      return
+    fi
+    echo "hats binary not executable at $HATS_BIN (set HATS_E2E_HATS_BIN to override)" >&2
+    exit 2
+  fi
 
-  # shellcheck disable=SC2310  # intentional: we inspect return code below
-  probe_account "$acct" && rc_probe=0 || rc_probe=$?
-  case "$rc_probe" in
-    0) pass=$((pass+1)) ;;
-    1) warn=$((warn+1)) ;;
-    *) fail=$((fail+1)) ;;
-  esac
-  first_result=0
-done
+  check_wall_budget || return
+  probe_doctor_surface "claude" "kimi" "claude-kimi" "$HATS_BIN" kimi doctor
+  check_wall_budget || return
+  probe_doctor_surface "codex" "kimi" "codex-kimi" "$HATS_BIN" codex kimi doctor
+}
+
+wall_start=$(date +%s)
+[ "$OUT" = "json" ] && printf '{"schema_version":1,"started_at":"%s","scope":"%s","strict":%s,"results":[' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SCOPE" "$([ "$STRICT" -eq 1 ] && echo true || echo false)"
+
+case "$SCOPE" in
+  claude) run_claude_scope 0 ;;
+  codex)  run_codex_scope 0 ;;
+  kimi)   run_kimi_scope 0 ;;
+  all)
+    run_claude_scope 1
+    [ "$wall_exhausted" -eq 0 ] && run_codex_scope 1
+    [ "$wall_exhausted" -eq 0 ] && run_kimi_scope 1
+    ;;
+esac
+
+[ "$probed_any" -gt 0 ] || {
+  [ "$OUT" = "json" ] && printf '\n],"summary":{"pass":0,"warn":0,"fail":0,"duration_sec":0}}\n'
+  echo "no probe targets discovered for scope '$SCOPE'" >&2
+  exit 2
+}
 
 wall_total=$(( $(date +%s) - wall_start ))
-
 if [ "$OUT" = "json" ]; then
   printf '\n],"summary":{"pass":%d,"warn":%d,"fail":%d,"duration_sec":%d}}\n' \
     "$pass" "$warn" "$fail" "$wall_total"
@@ -263,7 +515,6 @@ else
   printf '[probe] summary: %d pass, %d warn, %d fail (%ds)\n' "$pass" "$warn" "$fail" "$wall_total"
 fi
 
-# Exit code: fails fail the run; warns fail only in strict.
 if [ "$fail" -gt 0 ]; then exit 1; fi
 if [ "$STRICT" -eq 1 ] && [ "$warn" -gt 0 ]; then exit 1; fi
 exit 0

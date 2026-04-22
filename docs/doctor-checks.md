@@ -163,6 +163,9 @@ loops per account.
 
 - **What.** Each account must have its primary auth file
   (`.credentials.json` for claude, `auth.json` for codex).
+- **Kimi exception.** The Claude-side `kimi` slot is API-key-backed and
+  intentionally has no `.credentials.json`; doctor reports this as
+  `OK   Kimi API-key account — no .credentials.json expected`.
 - **Remediate FAIL.** Re-authenticate the account. For claude:
   `hats swap <name>` then `/login`; exit. For codex: `hats codex add <name>
   --chatgpt|--api-key|--device-auth`.

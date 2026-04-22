@@ -1127,22 +1127,6 @@ STUB
   fi
 }
 
-test_e2e_probe_rejects_unimplemented_scope() {
-  # codex/kimi/all scopes are not yet implemented; probe must reject them
-  # with rc=2 so callers don't silently skip unintended coverage.
-  local probe="$HATS_REPO/scripts/hats-e2e-probe"
-  local rc1=0 rc2=0 rc3=0
-  "$probe" --scope codex --quiet >/dev/null 2>&1 || rc1=$?
-  "$probe" --scope kimi --quiet >/dev/null 2>&1 || rc2=$?
-  "$probe" --scope all --quiet >/dev/null 2>&1 || rc3=$?
-  # All three already guarded — no bare-rc set-e risk.
-  if [ "$rc1" -eq 2 ] && [ "$rc2" -eq 2 ] && [ "$rc3" -eq 2 ]; then
-    ok "hats-e2e-probe rejects unimplemented scopes with rc=2 (fail-safe)"
-  else
-    die "hats-e2e-probe accepted unimplemented scope (codex=$rc1 kimi=$rc2 all=$rc3)"
-  fi
-}
-
 test_install_then_invoke_through_PATH() {
   # Regression fence for feedback_installed_vs_source_drift.md (2026-04-21
   # incident: shell-init'd kimi function was served from a stale
@@ -2061,7 +2045,7 @@ EOF
     infisical() {
       case "$1" in
         login)  echo "smoke-token" ;;
-        secrets) echo "sk-kimi-smoke-$(printf '%.0s0' {1..50})" ;;
+        secrets) echo "sk-kimi-smoke-$(printf "%.0s0" {1..50})" ;;
         *)       return 0 ;;
       esac
     }
@@ -2079,6 +2063,12 @@ EOF
     # Pre-call state: CLAUDE_CONFIG_DIR should carry whatever the suite
     # exports (the sandbox HATS_DIR-derived path).
     pre_cfg="${CLAUDE_CONFIG_DIR:-UNSET}"
+
+    # Hermetic: unset any inherited ANTHROPIC_* vars so the test measures
+    # the kimi function isolation, not the parent shell environment.
+    # This is required when the smoke suite runs inside a kimi-backed
+    # Claude Code session (which naturally carries these vars).
+    unset ANTHROPIC_BASE_URL ANTHROPIC_API_KEY 2>/dev/null || true
 
     kimi stub-prompt
 
@@ -2187,7 +2177,7 @@ EOF
     infisical() {
       case "$1" in
         login)  echo "smoke-token" ;;
-        secrets) echo "sk-kimi-smoke-$(printf '%.0s0' {1..50})" ;;
+        secrets) echo "sk-kimi-smoke-$(printf "%.0s0" {1..50})" ;;
         *)       return 0 ;;
       esac
     }
@@ -2281,7 +2271,7 @@ EOF
     infisical() {
       case "$1" in
         login)  echo "smoke-token" ;;
-        secrets) echo "sk-kimi-smoke-$(printf '%.0s0' {1..50})" ;;
+        secrets) echo "sk-kimi-smoke-$(printf "%.0s0" {1..50})" ;;
         *)       return 0 ;;
       esac
     }
@@ -2366,7 +2356,7 @@ EOF
     infisical() {
       case "$1" in
         login)   echo "smoke-token" ;;
-        secrets) echo "sk-kimi-smoke-$(printf '%.0s0' {1..50})" ;;
+        secrets) echo "sk-kimi-smoke-$(printf "%.0s0" {1..50})" ;;
         *)       return 0 ;;
       esac
     }
@@ -2484,7 +2474,7 @@ EOF
     infisical() {
       case "$1" in
         login)   echo "smoke-token" ;;
-        secrets) echo "sk-kimi-smoke-$(printf '%.0s0' {1..50})" ;;
+        secrets) echo "sk-kimi-smoke-$(printf "%.0s0" {1..50})" ;;
         *)       return 0 ;;
       esac
     }
@@ -2673,6 +2663,101 @@ test_fleet_symmetry_check_runs_clean() {
   fi
 }
 
+test_flip_dry_run_and_b20_refusal() {
+  # PR-1: B-19 flip MVP — trust-tier gate, dry-run, rollback plan write.
+  # Requires rotation/config.yaml installed in sandbox.
+  local rot_dir="$HATS_DIR/rotation"
+  mkdir -p "$rot_dir/rollback"
+  cp "$HATS_REPO/rotation/config.yaml" "$rot_dir/config.yaml"
+  cp "$HATS_REPO/rotation/decision.py" "$rot_dir/decision.py"
+
+  # (a) ops → codex dry-run succeeds and writes rollback plan
+  local out rc
+  out=$("$HATS_SCRIPT" flip praetor --to codex --reason "smoke-test" --dry-run 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | grep -q 'DRY RUN'; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "flip dry-run failed or missing DRY RUN marker (rc=$rc)"
+    return
+  fi
+
+  # (b) ops → kimi refused with B-20 cited_rule
+  out=$("$HATS_SCRIPT" flip praetor --to claude-via-kimi-anthropic --dry-run 2>&1) || true
+  if ! printf '%s' "$out" | grep -q 'trust-tier-policy-B-20'; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "flip ops→kimi did not refuse with B-20 cited_rule"
+    return
+  fi
+
+  # (c) content → kimi allowed
+  out=$("$HATS_SCRIPT" flip lumilingua-content-author --to claude-via-kimi-anthropic --dry-run 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | grep -q 'DRY RUN'; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "flip content→kimi dry-run failed (rc=$rc)"
+    return
+  fi
+
+  # (d) rollback plan was written
+  local rollback_count
+  rollback_count=$(ls -1 "$rot_dir/rollback"/rot-*.yaml 2>/dev/null | wc -l)
+  if [ "$rollback_count" -lt 2 ]; then
+    die "flip did not write rollback plans (count=$rollback_count)"
+    return
+  fi
+
+  ok "flip dry-run + B-20 refusal + rollback write"
+}
+
+test_rotation_log_and_rollback_roundtrip() {
+  # Requires rotation/config.yaml and at least one rollback plan.
+  local rot_dir="$HATS_DIR/rotation"
+  mkdir -p "$rot_dir/rollback"
+  cp "$HATS_REPO/rotation/config.yaml" "$rot_dir/config.yaml"
+  cp "$HATS_REPO/rotation/decision.py" "$rot_dir/decision.py"
+
+  # Seed a rollback plan
+  cat > "$rot_dir/rollback/rot-test-smoke-abc12345.yaml" <<EOF
+event_id: rot-test-smoke-abc12345
+agent_name: test-agent
+from_harness: claude-code
+from_account: shannon
+to_harness: codex
+to_account: astartes
+reason: smoke-test
+EOF
+
+  # (a) rotation log lists the event
+  local out rc
+  out=$("$HATS_SCRIPT" rotation log 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | grep -q 'rot-test-smoke-abc12345'; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "rotation log did not list seeded event (rc=$rc)"
+    return
+  fi
+
+  # (b) rotation log <event_id> shows details
+  out=$("$HATS_SCRIPT" rotation log rot-test-smoke-abc12345 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | grep -q 'test-agent'; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "rotation log <id> did not show event details (rc=$rc)"
+    return
+  fi
+
+  # (c) rotation rollback <event_id> emits actionable guidance
+  out=$("$HATS_SCRIPT" rotation rollback rot-test-smoke-abc12345 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | grep -q 'hats flip test-agent'; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "rotation rollback did not emit actionable guidance (rc=$rc)"
+    return
+  fi
+
+  ok "rotation log + rollback roundtrip"
+}
+
 # ── Run ───────────────────────────────────────────────────────────
 
 say "HOME=$HOME"
@@ -2714,7 +2799,6 @@ test_install_check_gates_on_smoke
 test_install_is_idempotent_on_reinstall
 test_install_then_invoke_through_PATH
 test_e2e_probe_claude_scope_with_stub_binary
-test_e2e_probe_rejects_unimplemented_scope
 test_config_migration_is_idempotent
 test_doctor_metrics_flag
 test_call_provider_variant_dispatch
