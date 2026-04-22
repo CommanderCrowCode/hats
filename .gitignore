@@ -9,7 +9,10 @@
 
 # Claude Code session scratch — per-workdir, not source
 .claude/
-.cycle/
+# Cycle state: ignore everything in .cycle/ except LEARNINGS.md and .gitignore
+.cycle/*
+!.cycle/LEARNINGS.md
+!.cycle/.gitignore
 
 # OS
 .DS_Store
