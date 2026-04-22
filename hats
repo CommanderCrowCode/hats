@@ -2247,7 +2247,11 @@ for event_name, event_items in (d.get("hooks") or {}).items():
 
     # 4a. Primary auth file presence + permissions.
     local auth_file="$acct_dir/$PRIMARY_AUTH_FILE"
-    if [ ! -f "$auth_file" ]; then
+    if [ "$CURRENT_PROVIDER" = "claude" ] && [ "$name" = "$HATS_KIMI_ACCOUNT_NAME" ]; then
+      # Kimi-on-Claude is API-key-backed and intentionally has no
+      # .credentials.json. The real auth path is verified by `hats kimi doctor`.
+      echo "    OK   Kimi API-key account — no $PRIMARY_AUTH_FILE expected"
+    elif [ ! -f "$auth_file" ]; then
       if _claude_uses_oauth_token_file; then
         echo "    FAIL $PRIMARY_AUTH_FILE missing (run '$(_hats_cmd_prefix) add $name' to mint a token)"
       else
@@ -4314,15 +4318,20 @@ cmd_version() {
 
 cmd_help() {
   cat <<EOF
-hats $VERSION — Switch between Claude Code and Codex accounts
+hats $VERSION — Switch between coding-agent accounts (Claude Code, Codex, Kimi)
 
 Usage:
-  hats <command> [args]              # Claude Code (backward compatible default)
+  hats <command> [args]              # Claude Code (unprefixed default — backcompat, NOT priority)
   hats <provider> <command> [args]   # Provider-specific mode
+  hats <backend> <command> [args]    # Backend-alias (kimi) on the default provider
+  hats <provider> <backend> <cmd>    # Backend-alias on a specific provider (e.g. 'hats codex kimi')
 
-Providers:
-  claude
-  codex
+Providers + backends (all first-class per README harness matrix):
+  claude      Claude Code — CLAUDE_CONFIG_DIR isolation
+  codex       Codex CLI   — CODEX_HOME isolation
+  kimi        Kimi (Moonshot) Anthropic-compat via claude-code — 'hats kimi'
+  codex kimi  Kimi OpenAI-compat via codex — 'hats codex kimi' (currently DISABLED,
+              see docs/codex-kimi-compat.md for wire_api incompat + LiteLLM workaround)
 
 Account Management:
   init                 Initialize hats for the active provider
@@ -4372,15 +4381,25 @@ Backends:
   version              Show version
 
 Examples:
+  # Claude Code
   hats init
   hats add work
   hats rename work personal
   hats swap work -- --model opus
+
+  # Codex
   hats codex init
   hats codex add personal
   hats codex add headless --api-key
   hats codex add remote --device-auth
   hats codex swap personal -- exec "summarize this repo"
+
+  # Kimi (claude-code, Anthropic-compat)
+  hats kimi init
+  hats kimi doctor
+  eval "\$(hats shell-init)" && kimi "summarize this repo"
+
+  # Kimi (codex, OpenAI-compat — currently DISABLED, see docs/codex-kimi-compat.md)
   hats codex kimi init
   hats codex kimi doctor
 
