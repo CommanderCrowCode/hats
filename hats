@@ -1767,7 +1767,7 @@ ${fn_name}() {
 }
 KIMICODEXFN
     elif [ "$CURRENT_PROVIDER" = "codex" ]; then
-      echo "${fn_name}() { $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND -c 'cli_auth_credentials_store=\"file\"' \"\$@\"; }"
+      echo "${fn_name}() { ( $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND -c 'cli_auth_credentials_store=\"file\"' \"\$@\" ); }"
     elif [ "$CURRENT_PROVIDER" = "claude" ] && [ "$name" = "$HATS_KIMI_ACCOUNT_NAME" ]; then
       # Kimi is API-key-backed, not OAuth — emit the specialized env-isolated
       # function instead of the generic CLAUDE_CONFIG_DIR-swap one-liner. The
@@ -1824,16 +1824,18 @@ ${fn_name}() {
   local _hats_token
   _hats_token=\$(cat "\$_hats_token_file" 2>/dev/null)
   [ -n "\$_hats_token" ] || { echo "hats: empty token file for '$name' (\$_hats_token_file)" >&2; unset _hats_token _hats_token_file; return 1; }
-  CLAUDE_CODE_OAUTH_TOKEN="\$_hats_token" \\
-  CLAUDE_CONFIG_DIR="$acct_dir" \\
-    $RUNTIME_COMMAND${extra_args} "\$@"
+  (
+    CLAUDE_CODE_OAUTH_TOKEN="\$_hats_token" \\
+    CLAUDE_CONFIG_DIR="$acct_dir" \\
+      $RUNTIME_COMMAND${extra_args} "\$@"
+  )
   local _rc=\$?
   unset _hats_token _hats_token_file
   return \$_rc
 }
 CLAUDEOAUTHFN
     else
-      echo "${fn_name}() { $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND${extra_args} \"\$@\"; }"
+      echo "${fn_name}() { ( $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND${extra_args} \"\$@\" ); }"
     fi
   done
 }
