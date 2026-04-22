@@ -1,19 +1,19 @@
 # hats
 
-![hats — Switch between Claude Code accounts like changing hats](banner.png)
+![hats — switch between coding-agent accounts like changing hats](banner.png)
 
-Switch between coding-tool accounts like changing hats.
+Switch between coding-agent accounts like changing hats.
 
-Run multiple Claude Code and Codex accounts on the same machine — including concurrently — with per-account home/config isolation and flexible resource sharing.
+Run multiple Claude Code, Codex, and Kimi accounts on the same machine — including concurrently — with per-account home/config isolation and flexible resource sharing. All three harnesses are first-class; see the [harness matrix](#harness-matrix) below.
 
 ## Why
 
-Claude Code stores credentials at `~/.claude/.credentials.json` — one file, one account. Codex stores local auth and runtime state under `~/.codex/`. If you have multiple subscriptions or workspaces, switching accounts means swapping a shared home/config root. Running concurrent sessions is even harder.
+Each coding-agent CLI — Claude Code, Codex, Kimi, etc. — stores credentials and runtime state in a single shared home/config root (`~/.claude/.credentials.json`, `~/.codex/`, and so on). One file, one account. Multiple subscriptions or workspaces means swapping that root, and concurrent sessions are harder still.
 
-**hats** solves this by giving each account its own provider-specific root (`CLAUDE_CONFIG_DIR` for Claude, `CODEX_HOME` for Codex):
+**hats** solves this by giving each account its own harness-specific root (`CLAUDE_CONFIG_DIR` for Claude Code, `CODEX_HOME` for Codex, endpoint + API-key isolation for Kimi):
 - Each account gets an isolated home/config directory with its own credentials
 - Concurrent sessions are inherently safe — no file swapping, no locking, no races
-- Shared resources are symlinked to a provider-specific `base/` template
+- Shared resources are symlinked to a harness-specific `base/` template
 - Any resource can be selectively isolated per account with `hats unlink`
 - Shell functions let you type the account name as a command
 
@@ -68,19 +68,24 @@ This copies `hats` to `~/.local/bin/`. Make sure `~/.local/bin` is in your `PATH
 - Claude Code installed (`claude` on PATH)
 - Codex CLI installed (`codex` on PATH) for Codex accounts
 
-## Providers
+## Harness matrix
 
-`hats` supports:
+`hats` treats each coding-agent harness as first-class. All three support the same core surface (`init / add / swap / list / doctor / shell-init`), and they can coexist on the same machine:
 
-- `claude` — default provider for backward compatibility
-- `codex` — uses isolated `CODEX_HOME` directories
+| Harness | CLI prefix | Isolation root | Status |
+|---------|-----------|----------------|--------|
+| Claude Code | `hats …` (unprefixed, default for backcompat) | `CLAUDE_CONFIG_DIR` | Stable |
+| Codex | `hats codex …` | `CODEX_HOME` | Stable |
+| Kimi (Moonshot, Anthropic-compat via claude-code) | `hats kimi …` | `CLAUDE_CONFIG_DIR` under an isolated account dir + inlined `ANTHROPIC_BASE_URL` + Infisical-backed API key | Stable, doctor 5/5 green |
+| Kimi (Moonshot, OpenAI-compat via codex) | `hats codex kimi …` | `CODEX_HOME` + per-account `config.toml` with `[model_providers.kimi]` | **Disabled** — codex v0.118.0+ requires `wire_api="responses"` and Kimi serves `/chat/completions` only. See [docs/codex-kimi-compat.md](docs/codex-kimi-compat.md) for the vendor-state receipts and LiteLLM-proxy workaround. |
 
-Use `hats codex ...` to manage Codex accounts.
+Unprefixed `hats …` targets Claude Code because that was the original integration; this is a backcompat default, not a priority hierarchy. Same-shape commands exist for every harness, and cross-harness tooling (e.g. `hats flip`, see [docs/rotation-framework.md](docs/rotation-framework.md)) is designed around that parity.
 
-### Backend aliases
+### Known parity gaps (tracked)
 
-- `hats kimi ...` — Kimi (Moonshot) via the Anthropic-compat endpoint, routed through claude-code. Working, doctor 5/5 green. See `hats kimi --help`.
-- `hats codex kimi ...` — Kimi via codex. **Currently disabled** at the doctor level: codex v0.118.0+ requires `wire_api="responses"` and Kimi serves `/chat/completions` only. Use `hats kimi` for Kimi access today. See [docs/codex-kimi-compat.md](docs/codex-kimi-compat.md) for the vendor-state receipts and LiteLLM-proxy workaround.
+- **Shell-function naming is asymmetric.** `hats shell-init` emits bare names for claude accounts (`work()`) and `codex_`-prefixed names for codex accounts (`codex_work()`) to avoid name collisions. Claude takes the bare namespace only by convention — not by design superiority. See [Shell Integration](#shell-integration).
+- **`hats init` with no harness arg defaults to claude.** Harness-first-class `hats init <label>` (where the harness is derived from the label's rotation config) is designed in [docs/rotation-framework.md](docs/rotation-framework.md) §4.1 as a future command.
+- **Kimi is routed through a parent harness (claude-code or codex)** rather than standing alone. This reflects Moonshot's wire-protocol reality — Kimi is a backend endpoint, not a CLI — but it does mean Kimi accounts inherit their parent harness's shell-function shape.
 
 ## How It Works
 
@@ -222,7 +227,7 @@ eval "$(hats codex shell-init)"
 eval "$(hats shell-init --skip-permissions)"
 ```
 
-This generates a function for each account. Claude keeps bare account names. Codex defaults to a `codex_` prefix to avoid name collisions:
+This generates a function for each account. Claude accounts get the bare namespace (`work`, `personal`) and Codex accounts get a `codex_` prefix (`codex_work`) to avoid collisions when both are present. The asymmetry is a namespace-collision workaround, not a priority hierarchy — see [Known parity gaps](#known-parity-gaps-tracked):
 ```bash
 work() { CLAUDE_CONFIG_DIR="$HOME/.hats/claude/work" claude "$@"; }
 personal() { CLAUDE_CONFIG_DIR="$HOME/.hats/claude/personal" claude "$@"; }
