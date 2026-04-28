@@ -1738,6 +1738,12 @@ cmd_list() {
   local count=0 matched=0
 
   for name in $(_accounts); do
+    # kimi is a backend-alias slot physically nested under claude/ and codex/
+    # but owned by `hats kimi`; surface it only via `hats kimi list`, never
+    # via the host provider's listing.
+    if [ "$CURRENT_PROVIDER" != "kimi" ] && [ "$name" = "$HATS_KIMI_ACCOUNT_NAME" ]; then
+      continue
+    fi
     count=$((count + 1))
     if _account_passes_list_filters "$name" "$want_rc" "$want_expired"; then
       matched=$((matched + 1))
