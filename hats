@@ -857,7 +857,9 @@ _unlink_resource() {
 
 _token_info_claude() {
   local file="$1"
-  if _claude_uses_oauth_token_file; then
+  # OAuth token file path is macOS-only; fall back to JSON parsing when the
+  # token file doesn't exist (e.g. smoke-test sandboxes, mixed environments).
+  if _claude_uses_oauth_token_file && [ -f "$file" ]; then
     local acct_dir
     acct_dir=$(dirname "$file")
     python3 - "$file" "$acct_dir" <<'PYEOF' 2>/dev/null
@@ -1809,7 +1811,11 @@ cmd_swap() {
 cmd_flip() {
   # hats flip <agent> --to <harness> [--reason <r>] [--dry-run]
   # Cross-harness credential rotation per rotation-framework.md PR-1.
-  local agent_name="" target_harness="" reason="" dry_run=0
+  local agent_name="" target_harness="" reason="" dry_run=0 json_mode=0
+  local flip_start_ms flip_end_ms duration_ms
+  # Portable millis: python3 works on both GNU/Linux and BSD/macOS.
+  # `date +%s%3N` is GNU-only; `%N` is absent on BSD date.
+  flip_start_ms=$(python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || echo "0")
 
   # Parse positional + flags
   while [ "$#" -gt 0 ]; do
@@ -1817,19 +1823,20 @@ cmd_flip() {
       --to)      target_harness="$2"; shift 2 ;;
       --reason)  reason="$2"; shift 2 ;;
       --dry-run) dry_run=1; shift ;;
+      --json)    json_mode=1; shift ;;
       --help|-h) _flip_usage; return 0 ;;
       --*)       die "Unknown flip flag: $1"; ;;
       *)
         if [ -z "$agent_name" ]; then
           agent_name="$1"
         else
-          die "Usage: hats flip <agent> --to <harness> [--reason <r>] [--dry-run]"
+          die "Usage: hats flip <agent> --to <harness> [--reason <r>] [--dry-run] [--json]"
         fi
         shift ;;
     esac
   done
 
-  [ -z "$agent_name" ] && die "Usage: hats flip <agent> --to <harness> [--reason <r>] [--dry-run]"
+  [ -z "$agent_name" ] && die "Usage: hats flip <agent> --to <harness> [--reason <r>] [--dry-run] [--json]"
   [ -z "$target_harness" ] && die "Missing --to <harness>. See 'hats flip --help'."
 
   # Derive current harness/account from agent name via config.yaml
@@ -1874,7 +1881,8 @@ cmd_flip() {
 
   decision_action=$(printf '%s' "$decision_json" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("action","unknown"))' 2>/dev/null || echo "unknown")
   if [ "$decision_action" != "flip_cross_harness" ]; then
-    die "flip refused: decision action='$decision_action' (expected flip_cross_harness)"
+    decision_cited=$(printf '%s' "$decision_json" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("cited_rule","unknown"))' 2>/dev/null || echo "unknown")
+    die "flip refused: action='$decision_action' (expected flip_cross_harness) cited_rule='$decision_cited'"
   fi
 
   local target_account
@@ -1910,11 +1918,19 @@ reason: ${reason:-manual}
 ROLLBACK
 
   if [ "$dry_run" -eq 1 ]; then
-    echo "DRY RUN: would flip $agent_name"
-    echo "  from: $current_harness / $current_account"
-    echo "  to:   $target_harness / $target_account"
-    echo "  rollback plan: $rollback_file"
-    echo "  memory rsync: ${from_dir}/projects/* → ${to_dir}/projects/*"
+    if [ "$json_mode" -eq 1 ]; then
+      python3 - "$agent_name" "$current_harness" "$current_account" "$target_harness" "$target_account" "$event_id" "$rollback_file" <<'PYJSON' 2>/dev/null || true
+import sys, json
+[agent, from_h, from_a, to_h, to_a, ev_id, rb_file] = sys.argv[1:]
+print(json.dumps({"dry_run": True, "agent": agent, "from_harness": from_h, "from_account": from_a, "to_harness": to_h, "to_account": to_a, "event_id": ev_id, "rollback_plan": rb_file}))
+PYJSON
+    else
+      echo "DRY RUN: would flip $agent_name"
+      echo "  from: $current_harness / $current_account"
+      echo "  to:   $target_harness / $target_account"
+      echo "  rollback plan: $rollback_file"
+      echo "  memory rsync: ${from_dir}/projects/* → ${to_dir}/projects/*"
+    fi
     return 0
   fi
 
@@ -1936,9 +1952,60 @@ ROLLBACK
   # Record the rotation event
   _audit_log "flip" "agent" "$agent_name" "from_harness" "$current_harness" "to_harness" "$target_harness" "to_account" "$target_account" "event_id" "$event_id"
 
-  echo "Flipped $agent_name: $current_harness/$current_account → $target_harness/$target_account"
-  echo "Rollback plan: $rollback_file"
-  echo "Event ID: $event_id"
+  # Emit structured event for mesh consumers (praetor-comms-engineer)
+  flip_end_ms=$(python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || echo "0")
+  if [ "$flip_start_ms" -gt 0 ] && [ "$flip_end_ms" -gt 0 ]; then
+    duration_ms=$((flip_end_ms - flip_start_ms))
+  else
+    duration_ms=0
+  fi
+
+  local event_dir="${HATS_DIR}/rotation/events"
+  mkdir -p "$event_dir"
+  local event_file="${event_dir}/${event_id}.json"
+
+  python3 - "$event_file" "$event_id" "$agent_name" "$current_harness" "$current_account" "$target_harness" "$target_account" "${reason:-manual}" "$duration_ms" "$rollback_file" <<'PYEVENT' 2>/dev/null || true
+import sys, json, datetime
+
+event_file = sys.argv[1]
+[event_id, agent_name, from_harness, from_account,
+ to_harness, to_account, reason, duration_ms, rollback_file] = sys.argv[2:]
+
+event = {
+    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "event_id": event_id,
+    "agent_name": agent_name,
+    "agent_id_before": None,
+    "agent_id_after": None,
+    "from_harness": from_harness,
+    "from_account": from_account,
+    "to_harness": to_harness,
+    "to_account": to_account,
+    "trigger": "manual",
+    "decision_rule": "manual-operator-flip",
+    "outcome": "success",
+    "duration_ms": int(duration_ms),
+    "rollback_plan_id": event_id,
+    "reason": reason,
+}
+
+with open(event_file, "w") as f:
+    json.dump(event, f, indent=2)
+    f.write("\n")
+PYEVENT
+
+  if [ "$json_mode" -eq 1 ]; then
+    python3 - "$agent_name" "$current_harness" "$current_account" "$target_harness" "$target_account" "$event_id" "$rollback_file" "$event_file" "$duration_ms" <<'PYJSON' 2>/dev/null || true
+import sys, json
+[agent, from_h, from_a, to_h, to_a, ev_id, rb_file, ev_file, dur_ms] = sys.argv[1:]
+print(json.dumps({"flipped": True, "agent": agent, "from_harness": from_h, "from_account": from_a, "to_harness": to_h, "to_account": to_a, "event_id": ev_id, "rollback_plan": rb_file, "event_file": ev_file, "duration_ms": int(dur_ms)}))
+PYJSON
+  else
+    echo "Flipped $agent_name: $current_harness/$current_account → $target_harness/$target_account"
+    echo "Rollback plan: $rollback_file"
+    echo "Event ID: $event_id"
+    echo "Event: $event_file"
+  fi
 }
 
 _flip_usage() {
@@ -1951,11 +2018,13 @@ Flags:
   --to <harness>       Target harness: claude-code | codex | claude-via-kimi-anthropic
   --reason <text>      Human-readable reason for the rotation
   --dry-run            Show what would happen without executing
+  --json               Machine-readable JSON output
   --help               Show this help
 
 Examples:
   hats flip praetor --to codex --reason "weekly quota hit"
   hats flip lumilingua-author --to claude-via-kimi-anthropic --dry-run
+  hats flip praetor --to codex --json | jq '.'
 
 Trust-tier enforcement (B-20):
   ops-tier agents (praetor, hats-*, dominion-*, agent-ops, *-infra)
@@ -1963,7 +2032,12 @@ Trust-tier enforcement (B-20):
 EOF
 }
 
-# Resolve agent name to (harness, account) via rotation/config.yaml role_trust_map
+# Resolve agent name to (harness, account) via hardcoded defaults.
+# These are operator conventions, not config.yaml-driven, because the
+# mapping from agent role to preferred account is a deployment-time choice
+# (e.g., praetor always starts on shannon, hats engineers on debussy).
+# Future: move to rotation/config.yaml agent_defaults once the mapping
+# stabilizes across deployments.
 _flip_resolve_agent() {
   local agent_name="$1" config_file="$2"
   _FLIP_RESOLVED_HARNESS=""
@@ -2044,10 +2118,11 @@ print(json.dumps(result))
 # Map harness name to ~/.hats provider directory
 _flip_harness_dir() {
   case "$1" in
-    claude-code)              echo "${HATS_DIR}/claude" ;;
+    claude-code)               echo "${HATS_DIR}/claude" ;;
     claude-via-kimi-anthropic) echo "${HATS_DIR}/claude" ;;
-    codex)                    echo "${HATS_DIR}/codex" ;;
-    *)                        echo "" ;;
+    codex)                     echo "${HATS_DIR}/codex" ;;
+    codex-via-kimi-openai)     echo "${HATS_DIR}/codex" ;;
+    *)                         echo "" ;;
   esac
 }
 
@@ -2174,6 +2249,9 @@ _rotation_find_script() {
 cmd_rotation() {
   local subcmd="${1:-}"
   case "$subcmd" in
+    init)
+      _rotation_init
+      ;;
     status)
       shift
       python3 "$(_rotation_find_script pool_status.py)" "$@"
@@ -2184,6 +2262,10 @@ cmd_rotation() {
     rollback)
       _rotation_rollback "${2:-}"
       ;;
+    emit)
+      shift
+      python3 "$(_rotation_find_script emit_event.py)" "$@"
+      ;;
     help|--help|-h|"")
       _rotation_usage
       ;;
@@ -2193,6 +2275,56 @@ cmd_rotation() {
   esac
 }
 
+_rotation_init() {
+  local rot_dir="${HATS_DIR}/rotation"
+  mkdir -p "$rot_dir"
+
+  local script_dir
+  script_dir="$(cd "$(dirname "$0")" && pwd)"
+
+  # Copy config.yaml if not present
+  if [ ! -f "$rot_dir/config.yaml" ]; then
+    if [ -f "$script_dir/rotation/config.yaml" ]; then
+      cp "$script_dir/rotation/config.yaml" "$rot_dir/config.yaml"
+      echo "Installed rotation/config.yaml"
+    else
+      echo "Warning: source rotation/config.yaml not found at $script_dir/rotation/config.yaml" >&2
+    fi
+  else
+    echo "rotation/config.yaml already exists at $rot_dir/config.yaml"
+  fi
+
+  # Copy decision.py if not present
+  if [ ! -f "$rot_dir/decision.py" ]; then
+    if [ -f "$script_dir/rotation/decision.py" ]; then
+      cp "$script_dir/rotation/decision.py" "$rot_dir/decision.py"
+      echo "Installed rotation/decision.py"
+    else
+      echo "Warning: source rotation/decision.py not found at $script_dir/rotation/decision.py" >&2
+    fi
+  else
+    echo "rotation/decision.py already exists at $rot_dir/decision.py"
+  fi
+
+  # Copy events.schema.json if not present
+  if [ ! -f "$rot_dir/events.schema.json" ]; then
+    if [ -f "$script_dir/rotation/events.schema.json" ]; then
+      cp "$script_dir/rotation/events.schema.json" "$rot_dir/events.schema.json"
+      echo "Installed rotation/events.schema.json"
+    else
+      echo "Warning: source rotation/events.schema.json not found at $script_dir/rotation/events.schema.json" >&2
+    fi
+  else
+    echo "rotation/events.schema.json already exists at $rot_dir/events.schema.json"
+  fi
+
+  # Create events directory
+  mkdir -p "$rot_dir/events" "$rot_dir/rollback"
+  echo ""
+  echo "Done. Rotation framework initialized at $rot_dir"
+  echo "Edit $rot_dir/config.yaml to customize accounts, trust tiers, and decision rules."
+}
+
 _rotation_usage() {
   cat <<'EOF'
 Usage: hats rotation <subcommand> [args]
@@ -2200,17 +2332,22 @@ Usage: hats rotation <subcommand> [args]
 Credential rotation governance for the mesh republic.
 
 Subcommands:
+  init                 Initialize rotation framework (copy config + decision engine)
   status               Pool health report (accounts, quotas, readiness)
                        --json for machine-readable output
   log [event_id]       Show rotation event history, or details for one event
   rollback <event_id>  Execute rollback plan for a rotation event
+  emit [--dry-run] [--latest]  Emit queued rotation events to mesh
   help                 Show this help
 
 Examples:
+  hats rotation init
   hats rotation status
   hats rotation status --json
   hats rotation log
   hats rotation rollback rot-20260422-120000-a1b2c3d4
+  hats rotation emit --latest         # emit most recent event
+  hats rotation emit --dry-run        # validate without moving files
 EOF
 }
 
@@ -2469,8 +2606,13 @@ cmd_fix() {
     acct_dir=$(_account_dir "$name")
 
     if [ ! -f "$acct_dir/$PRIMARY_AUTH_FILE" ]; then
-      echo "  $name: MISSING credentials"
-      issues=$((issues + 1))
+      # macOS fallback: .oauth-token may be absent while .credentials.json exists
+      if _claude_uses_oauth_token_file && [ -f "$acct_dir/.credentials.json" ]; then
+        :  # account has JSON credentials, not OAuth token — valid
+      else
+        echo "  $name: MISSING credentials"
+        issues=$((issues + 1))
+      fi
     fi
 
     for item in "$acct_dir"/* "$acct_dir"/.*; do

@@ -2789,7 +2789,21 @@ test_flip_dry_run_and_b20_refusal() {
     return
   fi
 
-  ok "flip dry-run + B-20 refusal + rollback write"
+  # (e) --json flag produces valid JSON
+  out=$("$HATS_SCRIPT" flip praetor --to codex --dry-run --json 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | python3 -c 'import sys,json; json.load(sys.stdin)' 2>/dev/null; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "flip --json did not produce valid JSON (rc=$rc)"
+    return
+  fi
+  if ! printf '%s' "$out" | grep -q '"dry_run": true'; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "flip --json missing dry_run marker"
+    return
+  fi
+
+  ok "flip dry-run + B-20 refusal + rollback write + --json"
 }
 
 test_rotation_log_and_rollback_roundtrip() {
@@ -2839,6 +2853,116 @@ EOF
   fi
 
   ok "rotation log + rollback roundtrip"
+}
+
+test_rotation_init() {
+  # `hats rotation init` copies config files from repo to HATS_DIR/rotation
+  # and is idempotent on re-run.
+  local rot_dir="$HATS_DIR/rotation"
+  rm -rf "$rot_dir"
+
+  # (a) First run installs everything
+  local out rc
+  out=$("$HATS_SCRIPT" rotation init 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ ! -f "$rot_dir/config.yaml" ] || [ ! -f "$rot_dir/decision.py" ] || [ ! -f "$rot_dir/events.schema.json" ]; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "rotation init did not install required files (rc=$rc)"
+    return
+  fi
+  if [ ! -d "$rot_dir/events" ] || [ ! -d "$rot_dir/rollback" ]; then
+    die "rotation init did not create events/ or rollback/ directories"
+    return
+  fi
+
+  # (b) Second run is idempotent
+  out=$("$HATS_SCRIPT" rotation init 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | grep -q 'already exists'; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "rotation init second run did not report idempotent skip"
+    return
+  fi
+
+  ok "rotation init installs files and is idempotent"
+}
+
+test_rotation_emit_event() {
+  # Rotation event emission pipeline: write valid event JSON, validate
+  # with --dry-run, emit with real run (moves to events_sent/), reject
+  # invalid events with clear errors.
+  local rot_dir="$HATS_DIR/rotation"
+  mkdir -p "$rot_dir/events"
+  cp "$HATS_REPO/rotation/events.schema.json" "$rot_dir/events.schema.json"
+
+  # (a) Valid event passes validation on --dry-run
+  cat > "$rot_dir/events/rot-20260422-170000-a1b2c3d4.json" <<'EOF'
+{
+  "ts": "2026-04-22T17:00:00Z",
+  "event_id": "rot-20260422-170000-a1b2c3d4",
+  "agent_name": "test-agent",
+  "agent_id_before": null,
+  "agent_id_after": null,
+  "from_harness": "claude-code",
+  "from_account": "shannon",
+  "to_harness": "codex",
+  "to_account": "astartes",
+  "trigger": "manual",
+  "decision_rule": "test",
+  "outcome": "success",
+  "duration_ms": 100,
+  "rollback_plan_id": "rot-20260422-170000-a1b2c3d4",
+  "reason": "test"
+}
+EOF
+
+  local out rc
+  out=$("$HATS_SCRIPT" rotation emit --dry-run 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | grep -q 'rot-20260422-170000-a1b2c3d4'; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "rotation emit --dry-run did not validate and print event (rc=$rc)"
+    return
+  fi
+
+  # (b) Real emit moves file to events_sent/
+  out=$("$HATS_SCRIPT" rotation emit 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ ! -f "$rot_dir/events_sent/rot-20260422-170000-a1b2c3d4.json" ]; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "rotation emit did not move event to events_sent/ (rc=$rc)"
+    return
+  fi
+
+  # (c) Invalid event (bad event_id pattern) is rejected
+  cat > "$rot_dir/events/rot-bad-id.json" <<'EOF'
+{
+  "ts": "2026-04-22T17:00:00Z",
+  "event_id": "rot-bad-id",
+  "agent_name": "test-agent",
+  "agent_id_before": null,
+  "agent_id_after": null,
+  "from_harness": "claude-code",
+  "from_account": "shannon",
+  "to_harness": "codex",
+  "to_account": "astartes",
+  "trigger": "manual",
+  "decision_rule": "test",
+  "outcome": "success",
+  "duration_ms": 100,
+  "rollback_plan_id": "rot-bad-id",
+  "reason": "test"
+}
+EOF
+
+  out=$("$HATS_SCRIPT" rotation emit --dry-run 2>&1) || true
+  if ! printf '%s' "$out" | grep -q 'validation failed'; then
+    printf 'got:\n%s\n' "$out" >&2
+    die "rotation emit did not reject invalid event with 'validation failed'"
+    return
+  fi
+
+  ok "rotation emit validates, emits, and rejects invalid events"
 }
 
 # ── Run ───────────────────────────────────────────────────────────
@@ -2902,6 +3026,10 @@ test_codex_kimi_doctor_flags_wire_api_incompat
 test_codex_kimi_bypass_env_gate_allows_emit
 test_codex_list_shows_expiry_markers
 test_list_filter_flags
+test_flip_dry_run_and_b20_refusal
+test_rotation_log_and_rollback_roundtrip
+test_rotation_init
+test_rotation_emit_event
 test_fleet_symmetry_check_runs_clean
 
 say "summary: $pass pass, $fail fail"

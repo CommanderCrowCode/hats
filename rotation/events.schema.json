@@ -1,0 +1,90 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "HatsRotationEvent",
+  "description": "Schema for rotation events emitted by hats flip. Consumed by praetor-comms-engineer and mesh dashboard.",
+  "type": "object",
+  "required": [
+    "ts",
+    "event_id",
+    "agent_name",
+    "from_harness",
+    "from_account",
+    "to_harness",
+    "to_account",
+    "trigger",
+    "decision_rule",
+    "outcome",
+    "duration_ms",
+    "rollback_plan_id"
+  ],
+  "properties": {
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 UTC timestamp of event emission"
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^rot-[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$",
+      "description": "Unique rotation event identifier"
+    },
+    "agent_name": {
+      "type": "string",
+      "description": "Mesh agent name that was rotated"
+    },
+    "agent_id_before": {
+      "type": ["string", "null"],
+      "description": "Relay-mesh agent_id before rotation (null if unknown to hats CLI)"
+    },
+    "agent_id_after": {
+      "type": ["string", "null"],
+      "description": "Relay-mesh agent_id after rotation (null if unknown to hats CLI)"
+    },
+    "from_harness": {
+      "type": "string",
+      "enum": ["claude-code", "codex", "claude-via-kimi-anthropic", "codex-via-kimi-openai"],
+      "description": "Source harness"
+    },
+    "from_account": {
+      "type": "string",
+      "description": "Source account label"
+    },
+    "to_harness": {
+      "type": "string",
+      "enum": ["claude-code", "codex", "claude-via-kimi-anthropic", "codex-via-kimi-openai"],
+      "description": "Target harness"
+    },
+    "to_account": {
+      "type": "string",
+      "description": "Target account label"
+    },
+    "trigger": {
+      "type": "string",
+      "enum": ["manual", "user_quota_5h", "user_quota_weekly", "user_quota_daily", "platform_throttle", "security_incident", "dead_man"],
+      "description": "Trigger class that initiated the rotation"
+    },
+    "decision_rule": {
+      "type": "string",
+      "description": "ID or description of the decision rule that selected this action"
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["success", "failure", "refused", "dry_run"],
+      "description": "Result of the rotation action"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Wall-clock duration of the rotation in milliseconds"
+    },
+    "rollback_plan_id": {
+      "type": "string",
+      "description": "Reference to the rollback plan YAML file"
+    },
+    "reason": {
+      "type": "string",
+      "description": "Human-readable reason provided by operator or trigger"
+    }
+  },
+  "additionalProperties": false
+}

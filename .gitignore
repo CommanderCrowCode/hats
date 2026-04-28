@@ -6,6 +6,8 @@
 !docs/backups/*.json
 # Exceptions — provider-rules lint data for AGENTS.md mirror tooling
 !docs/provider-rules/*.json
+# Exceptions — rotation event schema (source, not credentials)
+!rotation/events.schema.json
 
 # Claude Code session scratch — per-workdir, not source
 .claude/
