@@ -57,7 +57,7 @@ test_help() {
 }
 
 test_init_creates_layout() {
-  "$HATS_SCRIPT" init >/dev/null
+  "$HATS_SCRIPT" claude init >/dev/null
   if [ -d "$HATS_DIR/claude/base" ] && [ -f "$HATS_DIR/config.toml" ]; then
     ok "init creates claude/base + config.toml"
   else
@@ -66,7 +66,7 @@ test_init_creates_layout() {
 }
 
 test_list_empty_does_not_crash() {
-  if "$HATS_SCRIPT" list >/dev/null 2>&1; then
+  if "$HATS_SCRIPT" claude list >/dev/null 2>&1; then
     ok "list exits 0 with no accounts"
   else
     die "list crashed on empty state"
@@ -83,7 +83,7 @@ test_fixture_account_and_default() {
 
   # Setting default writes default_claude to config.toml + maintains $HOME/.claude.
   local out
-  out=$("$HATS_SCRIPT" default foo 2>&1)
+  out=$("$HATS_SCRIPT" claude default foo 2>&1)
   case "$out" in
     *foo*) ok "'default foo' accepts fixture account" ;;
     *) die "'default foo' unexpected output: $out" ;;
@@ -102,7 +102,7 @@ test_fix_on_fresh_sandbox() {
   # header line on a fresh sandbox. After the _ensure_provider_defaults fix,
   # it must complete and reach the "Done." tail.
   local out rc=0
-  out=$("$HATS_SCRIPT" fix 2>&1) || rc=$?
+  out=$("$HATS_SCRIPT" claude fix 2>&1) || rc=$?
   case "$out" in
     *Done.*)
       ok "fix reaches 'Done.' on fresh sandbox (rc=$rc)"
@@ -115,7 +115,7 @@ test_fix_on_fresh_sandbox() {
 
 test_doctor_runs_after_fixture() {
   local rc=0
-  "$HATS_SCRIPT" doctor >/dev/null 2>&1 || rc=$?
+  "$HATS_SCRIPT" claude doctor >/dev/null 2>&1 || rc=$?
   # In the sandboxed HATS_DIR the ~/.claude symlink on the host still points
   # elsewhere, which doctor will flag — accept rc!=0 as long as the command
   # ran to completion and didn't crash with a bash error.
@@ -134,11 +134,11 @@ test_doctor_catches_invalid_json() {
   # mask real results.
   echo '{}' > "$cfg"
   local out_valid
-  out_valid=$("$HATS_SCRIPT" doctor 2>/dev/null || true)
+  out_valid=$("$HATS_SCRIPT" claude doctor 2>/dev/null || true)
 
   echo '{broken' > "$cfg"
   local out_broken
-  out_broken=$("$HATS_SCRIPT" doctor 2>/dev/null || true)
+  out_broken=$("$HATS_SCRIPT" claude doctor 2>/dev/null || true)
 
   # Restore a valid state so any subsequent tests don't inherit corruption.
   echo '{}' > "$cfg"
@@ -176,7 +176,7 @@ test_doctor_catches_missing_hook_command() {
 EOF
 
   local out_bad
-  out_bad=$("$HATS_SCRIPT" doctor 2>/dev/null || true)
+  out_bad=$("$HATS_SCRIPT" claude doctor 2>/dev/null || true)
 
   # Now point it at a real executable (/bin/sh).
   cat > "$cfg" <<'EOF'
@@ -195,7 +195,7 @@ EOF
 EOF
 
   local out_good
-  out_good=$("$HATS_SCRIPT" doctor 2>/dev/null || true)
+  out_good=$("$HATS_SCRIPT" claude doctor 2>/dev/null || true)
 
   # Restore baseline (empty hooks block so no other tests are affected).
   echo '{}' > "$cfg"
@@ -229,7 +229,7 @@ test_doctor_catches_duplicate_hooks() {
 }
 EOF
   local out_dup
-  out_dup=$("$HATS_SCRIPT" doctor 2>/dev/null || true)
+  out_dup=$("$HATS_SCRIPT" claude doctor 2>/dev/null || true)
 
   # Unique matchers → no dup warning.
   cat > "$cfg" <<'EOF'
@@ -242,7 +242,7 @@ EOF
 }
 EOF
   local out_unique
-  out_unique=$("$HATS_SCRIPT" doctor 2>/dev/null || true)
+  out_unique=$("$HATS_SCRIPT" claude doctor 2>/dev/null || true)
 
   echo '{}' > "$cfg"
 
@@ -282,10 +282,10 @@ test_fix_dedupes_duplicate_hooks() {
 EOF
 
   local out_fix
-  out_fix=$("$HATS_SCRIPT" fix 2>/dev/null || true)
+  out_fix=$("$HATS_SCRIPT" claude fix 2>/dev/null || true)
 
   local out_doctor
-  out_doctor=$("$HATS_SCRIPT" doctor 2>/dev/null || true)
+  out_doctor=$("$HATS_SCRIPT" claude doctor 2>/dev/null || true)
 
   # Content checks: fix must report removal counts; doctor must now be clean;
   # the unique Edit entry and exactly one Bash entry must remain.
@@ -363,7 +363,7 @@ test_doctor_flags_suspicious_symlink() {
   local out rc=0
   # Capture rc in the current shell — `rc=$?` inside `$()` is a subshell
   # modification and is lost (SC2030/SC2031).
-  out=$("$HATS_SCRIPT" doctor 2>&1) || rc=$?
+  out=$("$HATS_SCRIPT" claude doctor 2>&1) || rc=$?
 
   rm -f "$base/sneaky_link" "$outside"
 
@@ -379,7 +379,7 @@ test_no_color_flag() {
   # When stdout is a pipe (as here), colors are already auto-disabled — but
   # --no-color must ALSO disable them if TTY detection is ever overridden.
   local out
-  out=$("$HATS_SCRIPT" --no-color doctor 2>&1 || true)
+  out=$("$HATS_SCRIPT" --no-color claude doctor 2>&1 || true)
   if printf '%s' "$out" | grep -q $'\033\[[0-9]*m'; then
     die "ANSI escape codes leaked through --no-color"
   else
@@ -397,7 +397,7 @@ test_link_unlink_resource_validation() {
   # pipefail` would mask the grep success if we piped directly.
   local rejects=0 out
   for bad in '../etc/shadow' '*' '..' '.' 'foo/bar' '?x'; do
-    out=$("$HATS_SCRIPT" link foo "$bad" 2>&1 || true)
+    out=$("$HATS_SCRIPT" claude link foo "$bad" 2>&1 || true)
     if echo "$out" | grep -q 'Invalid resource name'; then
       rejects=$((rejects + 1))
     fi
@@ -497,7 +497,7 @@ EOF
   chmod 600 "$acct/.credentials.json"
 
   local out
-  out=$("$HATS_SCRIPT" list 2>&1)
+  out=$("$HATS_SCRIPT" claude list 2>&1)
 
   # Locate the line for the `parsed` account. Must carry `ok (expires ...)`
   # and `[rc]` — these only print when expired/has_refresh/has_rc/exp_date
@@ -550,13 +550,13 @@ test_init_idempotent_and_status_iterator() {
   # (b) `hats status` with no argument iterates all accounts. At this point
   #     only `foo` is left on the claude side after CRUD tests cleaned up.
   local out_reinit rc_reinit=0
-  out_reinit=$("$HATS_SCRIPT" init 2>&1) || rc_reinit=$?
+  out_reinit=$("$HATS_SCRIPT" claude init 2>&1) || rc_reinit=$?
   local reinit_ok=0
   [ "$rc_reinit" -eq 0 ] && echo "$out_reinit" | grep -q "already initialized" \
     && [ -d "$HATS_DIR/claude/foo" ] && reinit_ok=1
 
   local out_status rc_status=0
-  out_status=$("$HATS_SCRIPT" status 2>&1) || rc_status=$?
+  out_status=$("$HATS_SCRIPT" claude status 2>&1) || rc_status=$?
   local status_iter_ok=0
   [ "$rc_status" -eq 0 ] \
     && echo "$out_status" | grep -q "Provider: claude" \
@@ -579,9 +579,9 @@ test_rejection_paths_exit_nonzero() {
   # (b) `hats default <missing>` — account not found.
   # (c) `hats status <missing>` — account not found.
   local rc_a=0 rc_b=0 rc_c=0
-  "$HATS_SCRIPT" add probe --api-key        >/dev/null 2>&1 || rc_a=$?
-  "$HATS_SCRIPT" default nosuchaccount      >/dev/null 2>&1 || rc_b=$?
-  "$HATS_SCRIPT" status  nosuchaccount      >/dev/null 2>&1 || rc_c=$?
+  "$HATS_SCRIPT" claude add probe --api-key        >/dev/null 2>&1 || rc_a=$?
+  "$HATS_SCRIPT" claude default nosuchaccount      >/dev/null 2>&1 || rc_b=$?
+  "$HATS_SCRIPT" claude status  nosuchaccount      >/dev/null 2>&1 || rc_c=$?
 
   if [ "$rc_a" -ne 0 ] && [ "$rc_b" -ne 0 ] && [ "$rc_c" -ne 0 ]; then
     ok "add/default/status reject invalid input with non-zero rc"
@@ -603,7 +603,7 @@ test_doctor_flags_missing_auth_and_broken_symlink() {
   ln -s /nonexistent/target "$acct/dangling"
 
   local out rc=0
-  out=$("$HATS_SCRIPT" doctor 2>&1) || rc=$?
+  out=$("$HATS_SCRIPT" claude doctor 2>&1) || rc=$?
 
   rm -rf "$acct"
 
@@ -640,18 +640,18 @@ test_audit_log_opt_in_records_mutations_and_skips_reads() {
 
   # (1) Silent when HATS_AUDIT is unset.
   rm -f "$audit_log"
-  (unset HATS_AUDIT; "$HATS_SCRIPT" default auditprobe >/dev/null 2>&1)
+  (unset HATS_AUDIT; "$HATS_SCRIPT" claude default auditprobe >/dev/null 2>&1)
   local silent_ok=0
   [ ! -f "$audit_log" ] && silent_ok=1
 
   # (2) Mutations log when HATS_AUDIT=1.
-  HATS_AUDIT=1 "$HATS_SCRIPT" default auditprobe >/dev/null 2>&1
-  HATS_AUDIT=1 "$HATS_SCRIPT" rename auditprobe auditprobe2 >/dev/null 2>&1
+  HATS_AUDIT=1 "$HATS_SCRIPT" claude default auditprobe >/dev/null 2>&1
+  HATS_AUDIT=1 "$HATS_SCRIPT" claude rename auditprobe auditprobe2 >/dev/null 2>&1
   # stage base/scratchaudit so link target exists
   echo "content" > "$HATS_DIR/claude/base/scratchaudit"
-  HATS_AUDIT=1 "$HATS_SCRIPT" link   auditprobe2 scratchaudit >/dev/null 2>&1
-  HATS_AUDIT=1 "$HATS_SCRIPT" unlink auditprobe2 scratchaudit >/dev/null 2>&1
-  HATS_AUDIT=1 "$HATS_SCRIPT" remove auditprobe2 >/dev/null 2>&1
+  HATS_AUDIT=1 "$HATS_SCRIPT" claude link   auditprobe2 scratchaudit >/dev/null 2>&1
+  HATS_AUDIT=1 "$HATS_SCRIPT" claude unlink auditprobe2 scratchaudit >/dev/null 2>&1
+  HATS_AUDIT=1 "$HATS_SCRIPT" claude remove auditprobe2 >/dev/null 2>&1
 
   local mutations_ok=0
   if [ -f "$audit_log" ]; then
@@ -668,9 +668,9 @@ test_audit_log_opt_in_records_mutations_and_skips_reads() {
   # (3) Read-only commands must not grow the log.
   local lines_before lines_after
   lines_before=$(wc -l < "$audit_log")
-  HATS_AUDIT=1 "$HATS_SCRIPT" list    >/dev/null 2>&1
-  HATS_AUDIT=1 "$HATS_SCRIPT" doctor  >/dev/null 2>&1 || true
-  HATS_AUDIT=1 "$HATS_SCRIPT" status  >/dev/null 2>&1 || true
+  HATS_AUDIT=1 "$HATS_SCRIPT" claude list    >/dev/null 2>&1
+  HATS_AUDIT=1 "$HATS_SCRIPT" claude doctor  >/dev/null 2>&1 || true
+  HATS_AUDIT=1 "$HATS_SCRIPT" claude status  >/dev/null 2>&1 || true
   HATS_AUDIT=1 "$HATS_SCRIPT" version >/dev/null 2>&1
   HATS_AUDIT=1 "$HATS_SCRIPT" help    >/dev/null 2>&1
   lines_after=$(wc -l < "$audit_log")
@@ -707,10 +707,10 @@ test_swap_error_paths() {
   # NOTE: no .credentials.json
 
   local out_missing rc_missing=0
-  out_missing=$("$HATS_SCRIPT" swap does-not-exist 2>&1) || rc_missing=$?
+  out_missing=$("$HATS_SCRIPT" claude swap does-not-exist 2>&1) || rc_missing=$?
 
   local out_nocred rc_nocred=0
-  out_nocred=$("$HATS_SCRIPT" swap nocred 2>&1) || rc_nocred=$?
+  out_nocred=$("$HATS_SCRIPT" claude swap nocred 2>&1) || rc_nocred=$?
 
   rm -rf "$acct"
 
@@ -725,6 +725,56 @@ test_swap_error_paths() {
   fi
 }
 
+test_provider_prefix_required() {
+  local out rc=0
+  out=$("$HATS_SCRIPT" swap foo 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ] && echo "$out" | grep -q "Provider required" && echo "$out" | grep -q "hats claude swap"; then
+    ok "provider-scoped commands require explicit provider prefix"
+  else
+    die "bare provider command was not rejected correctly (rc=$rc out=$out)"
+  fi
+}
+
+test_swap_scrubs_kimi_env_for_normal_accounts() {
+  # A normal Claude swap must not inherit Kimi's endpoint/API-key env from the
+  # caller. This catches the "hats swap monet starts with Kimi endpoint" class
+  # of regression.
+  local stub_bin="$SANDBOX_ROOT/swap-scrub-bin"
+  mkdir -p "$stub_bin"
+  cat > "$stub_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-UNSET}"
+echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-UNSET}"
+echo "ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN:-UNSET}"
+echo "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-UNSET}"
+echo "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-UNSET}"
+EOF
+  chmod +x "$stub_bin/claude"
+  printf 'fixture-oauth-token' > "$HATS_DIR/claude/foo/.oauth-token"
+  chmod 600 "$HATS_DIR/claude/foo/.oauth-token"
+
+  local out rc=0
+  out=$(ANTHROPIC_BASE_URL="https://api.kimi.com/coding/" \
+        ANTHROPIC_API_KEY="sk-kimi-leak" \
+        ANTHROPIC_AUTH_TOKEN="sk-kimi-auth-leak" \
+        PATH="$stub_bin:$PATH" \
+        "$HATS_SCRIPT" claude swap foo 2>&1) || rc=$?
+  rm -f "$HATS_DIR/claude/foo/.oauth-token"
+
+  local base_ok=0 key_ok=0 auth_ok=0 cfg_ok=0
+  [ "$rc" -eq 0 ] && echo "$out" | grep -q 'ANTHROPIC_BASE_URL=UNSET' && base_ok=1
+  echo "$out" | grep -q 'ANTHROPIC_API_KEY=UNSET' && key_ok=1
+  echo "$out" | grep -q 'ANTHROPIC_AUTH_TOKEN=UNSET' && auth_ok=1
+  echo "$out" | grep -q 'CLAUDE_CONFIG_DIR=.*/.hats/claude/foo' && cfg_ok=1
+
+  if [ "$base_ok" -eq 1 ] && [ "$key_ok" -eq 1 ] && [ "$auth_ok" -eq 1 ] && [ "$cfg_ok" -eq 1 ]; then
+    ok "swap scrubs Kimi ANTHROPIC env before launching normal Claude accounts"
+  else
+    printf 'got:\n%s\n' "$out" >&2
+    die "swap did not scrub Kimi env (rc=$rc base=$base_ok key=$key_ok auth=$auth_ok cfg=$cfg_ok)"
+  fi
+}
+
 test_command_aliases() {
   # Aliases `ls`, `rm`, `mv` for list / remove / rename — listed in help + the
   # completion scripts but previously untested. Verifies the main-dispatch
@@ -736,21 +786,21 @@ test_command_aliases() {
   echo '{}' > "$acct/.claude.json"
 
   # ls: equivalent to list
-  local ls_out; ls_out=$("$HATS_SCRIPT" ls 2>&1)
+  local ls_out; ls_out=$("$HATS_SCRIPT" claude ls 2>&1)
   local ls_ok=0
   echo "$ls_out" | grep -q "hats v.* — Claude Code Accounts" \
     && echo "$ls_out" | grep -q "aliastest" && ls_ok=1
 
   # mv: equivalent to rename
   local rc_mv=0
-  "$HATS_SCRIPT" mv aliastest aliastest2 >/dev/null 2>&1 || rc_mv=$?
+  "$HATS_SCRIPT" claude mv aliastest aliastest2 >/dev/null 2>&1 || rc_mv=$?
   local mv_ok=0
   [ "$rc_mv" -eq 0 ] && [ -d "$HATS_DIR/claude/aliastest2" ] \
     && [ ! -d "$HATS_DIR/claude/aliastest" ] && mv_ok=1
 
   # rm: equivalent to remove
   local rc_rm=0
-  "$HATS_SCRIPT" rm aliastest2 >/dev/null 2>&1 || rc_rm=$?
+  "$HATS_SCRIPT" claude rm aliastest2 >/dev/null 2>&1 || rc_rm=$?
   local rm_ok=0
   [ "$rc_rm" -eq 0 ] && [ ! -d "$HATS_DIR/claude/aliastest2" ] && rm_ok=1
 
@@ -778,7 +828,7 @@ test_link_unlink_happy_path() {
 
   # link: symlink points to ../base/<resource>
   local rc_link=0
-  "$HATS_SCRIPT" link foo "$resource" >/dev/null 2>&1 || rc_link=$?
+  "$HATS_SCRIPT" claude link foo "$resource" >/dev/null 2>&1 || rc_link=$?
   local is_symlink=0 target_ok=0
   if [ -L "$acct_file" ]; then
     is_symlink=1
@@ -787,11 +837,11 @@ test_link_unlink_happy_path() {
 
   # link again must fail — "already linked"
   local rc_relink=0
-  "$HATS_SCRIPT" link foo "$resource" >/dev/null 2>&1 || rc_relink=$?
+  "$HATS_SCRIPT" claude link foo "$resource" >/dev/null 2>&1 || rc_relink=$?
 
   # unlink: replaces the symlink with a copy of base content
   local rc_unlink=0
-  "$HATS_SCRIPT" unlink foo "$resource" >/dev/null 2>&1 || rc_unlink=$?
+  "$HATS_SCRIPT" claude unlink foo "$resource" >/dev/null 2>&1 || rc_unlink=$?
   local is_file=0 content_ok=0
   if [ -f "$acct_file" ] && [ ! -L "$acct_file" ]; then
     is_file=1
@@ -800,7 +850,7 @@ test_link_unlink_happy_path() {
 
   # unlink again must fail — "already isolated"
   local rc_reunlink=0
-  "$HATS_SCRIPT" unlink foo "$resource" >/dev/null 2>&1 || rc_reunlink=$?
+  "$HATS_SCRIPT" claude unlink foo "$resource" >/dev/null 2>&1 || rc_reunlink=$?
 
   # Cleanup leaves base seeded for downstream tests — remove the fixture we added.
   rm -f "$base_file" "$acct_file"
@@ -820,7 +870,7 @@ test_providers_and_default_getter() {
   # small surface commands with zero prior coverage.
   local prov_out def_out
   prov_out=$("$HATS_SCRIPT" providers 2>&1)
-  def_out=$("$HATS_SCRIPT" default 2>&1)
+  def_out=$("$HATS_SCRIPT" claude default 2>&1)
 
   local prov_ok=0 def_ok=0
   echo "$prov_out" | grep -q "claude" \
@@ -842,16 +892,16 @@ test_shell_init_emits_functions_per_account() {
   # dir. Zero prior coverage. After the fixture + CRUD tests run, `foo` is
   # the only remaining claude account.
   local out
-  out=$("$HATS_SCRIPT" shell-init 2>&1)
+  out=$("$HATS_SCRIPT" claude shell-init 2>&1)
   local has_header=0 has_foo_fn=0 has_env_var=0
   echo "$out" | grep -q "Generated by hats shell-init for claude" && has_header=1
-  # Claude shim: `foo() { CLAUDE_CONFIG_DIR="..." claude "$@"; }`
-  echo "$out" | grep -qE '^foo\(\).*CLAUDE_CONFIG_DIR=.*claude/foo.*claude.*"\$@"' && has_foo_fn=1
+  # Claude shim uses `function foo` so zsh aliases do not corrupt parsing.
+  echo "$out" | grep -qE '^function foo \{' && has_foo_fn=1
   echo "$out" | grep -q 'CLAUDE_CONFIG_DIR=' && has_env_var=1
 
   # --skip-permissions injects `--dangerously-skip-permissions` for claude
   local out_skip
-  out_skip=$("$HATS_SCRIPT" shell-init --skip-permissions 2>&1)
+  out_skip=$("$HATS_SCRIPT" claude shell-init --skip-permissions 2>&1)
   local has_skip_flag=0
   echo "$out_skip" | grep -q -- '--dangerously-skip-permissions' && has_skip_flag=1
 
@@ -867,7 +917,7 @@ test_shell_init_emits_functions_per_account() {
   out_codex=$("$HATS_SCRIPT" codex shell-init 2>&1)
   local has_codex_env=0 has_codex_fn=0
   echo "$out_codex" | grep -q 'CODEX_HOME=.*codex/cx1' && has_codex_env=1
-  echo "$out_codex" | grep -qE '^codex_cx1\(\)' && has_codex_fn=1
+  echo "$out_codex" | grep -qE '^function codex_cx1' && has_codex_fn=1
 
   # codex shell-init must reject --skip-permissions (claude-only)
   local rc_codex_skip=0
@@ -875,12 +925,20 @@ test_shell_init_emits_functions_per_account() {
 
   rm -rf "$codex_acct"
 
+  # zsh expands aliases while parsing `eval` input; `name()` definitions trip
+  # on a same-named alias. The emitted `unalias` + `function name` form must
+  # survive that common operator setup.
+  local zsh_alias_ok=1
+  if command -v zsh >/dev/null 2>&1; then
+    zsh -ic 'alias foo="echo stale"; eval "$1"; type foo | grep -q "shell function"' _ "$out_skip" >/dev/null 2>&1 || zsh_alias_ok=0
+  fi
+
   if [ "$has_header" -eq 1 ] && [ "$has_foo_fn" -eq 1 ] && [ "$has_env_var" -eq 1 ] \
      && [ "$has_skip_flag" -eq 1 ] && [ "$has_codex_env" -eq 1 ] && [ "$has_codex_fn" -eq 1 ] \
-     && [ "$rc_codex_skip" -ne 0 ]; then
-    ok "shell-init emits per-account shims (claude+codex, codex_<name> prefix) and rejects codex --skip-permissions"
+     && [ "$rc_codex_skip" -ne 0 ] && [ "$zsh_alias_ok" -eq 1 ]; then
+    ok "shell-init emits alias-safe per-account shims (claude+codex, codex_<name> prefix) and rejects codex --skip-permissions"
   else
-    die "shell-init broken (header=$has_header foo=$has_foo_fn env=$has_env_var skip=$has_skip_flag codex=$has_codex_env codex_fn=$has_codex_fn codex_skip_rc=$rc_codex_skip)"
+    die "shell-init broken (header=$has_header foo=$has_foo_fn env=$has_env_var skip=$has_skip_flag codex=$has_codex_env codex_fn=$has_codex_fn codex_skip_rc=$rc_codex_skip zsh_alias=$zsh_alias_ok)"
   fi
 }
 
@@ -895,20 +953,20 @@ test_account_crud_roundtrip() {
   chmod 600 "$acct/.credentials.json"
   echo '{}' > "$acct/.claude.json"
 
-  local list_out; list_out=$("$HATS_SCRIPT" list 2>&1)
+  local list_out; list_out=$("$HATS_SCRIPT" claude list 2>&1)
   local list_ok=0
   echo "$list_out" | grep -q "foo" && echo "$list_out" | grep -q "bar" \
     && echo "$list_out" | grep -q "2 account" && list_ok=1
 
   # rename bar → baz
   local rename_out rc_rename=0
-  rename_out=$("$HATS_SCRIPT" rename bar baz 2>&1) || rc_rename=$?
+  rename_out=$("$HATS_SCRIPT" claude rename bar baz 2>&1) || rc_rename=$?
   local rename_ok=0
   [ "$rc_rename" -eq 0 ] && [ -d "$HATS_DIR/claude/baz" ] && [ ! -d "$HATS_DIR/claude/bar" ] \
     && echo "$rename_out" | grep -q "renamed to 'baz'" && rename_ok=1
 
   # status baz must print Provider/Account/Directory headers
-  local status_out; status_out=$("$HATS_SCRIPT" status baz 2>&1)
+  local status_out; status_out=$("$HATS_SCRIPT" claude status baz 2>&1)
   local status_ok=0
   echo "$status_out" | grep -q "Provider: claude" \
     && echo "$status_out" | grep -q "Account: baz" \
@@ -917,20 +975,20 @@ test_account_crud_roundtrip() {
 
   # rename validates: rejects unknown source, rejects existing target
   local rc_unknown=0 rc_collision=0
-  "$HATS_SCRIPT" rename nope also-nope >/dev/null 2>&1 || rc_unknown=$?
-  "$HATS_SCRIPT" rename baz foo       >/dev/null 2>&1 || rc_collision=$?
+  "$HATS_SCRIPT" claude rename nope also-nope >/dev/null 2>&1 || rc_unknown=$?
+  "$HATS_SCRIPT" claude rename baz foo       >/dev/null 2>&1 || rc_collision=$?
   local rename_validate_ok=0
   [ "$rc_unknown" -ne 0 ] && [ "$rc_collision" -ne 0 ] && rename_validate_ok=1
 
   # remove baz
   local rc_remove=0
-  "$HATS_SCRIPT" remove baz >/dev/null 2>&1 || rc_remove=$?
+  "$HATS_SCRIPT" claude remove baz >/dev/null 2>&1 || rc_remove=$?
   local remove_ok=0
   [ "$rc_remove" -eq 0 ] && [ ! -d "$HATS_DIR/claude/baz" ] && remove_ok=1
 
   # remove on nonexistent must fail
   local rc_remove_missing=0
-  "$HATS_SCRIPT" remove baz >/dev/null 2>&1 || rc_remove_missing=$?
+  "$HATS_SCRIPT" claude remove baz >/dev/null 2>&1 || rc_remove_missing=$?
   local remove_missing_ok=0
   [ "$rc_remove_missing" -ne 0 ] && remove_missing_ok=1
 
@@ -968,6 +1026,31 @@ test_codex_provider_routing() {
   else
     die "codex provider routing broken (rc_init=$rc_init codex_base=$have_codex_base claude_ok=$have_claude_untouched rc_list=$rc_list header=$header_ok no_accts=$no_accts_ok)"
   fi
+}
+
+test_first_class_kimi_and_opencode_surfaces() {
+  # Kimi and OpenCode are provider names, not second-class special cases.
+  # This verifies provider dispatch, provider listing, shell-init naming, and
+  # OpenCode's isolated config root without requiring real OpenCode auth.
+  local providers_out
+  providers_out=$("$HATS_SCRIPT" providers 2>&1)
+  echo "$providers_out" | grep -q 'kimi' || { die "providers output missing kimi"; return; }
+  echo "$providers_out" | grep -q 'opencode' || { die "providers output missing opencode"; return; }
+
+  local kimi_init kimi_shell
+  kimi_init=$("$HATS_SCRIPT" kimi init 2>&1) || { printf 'got:\n%s\n' "$kimi_init" >&2; die "hats kimi init failed"; return; }
+  kimi_shell=$("$HATS_SCRIPT" kimi shell-init 2>&1) || { printf 'got:\n%s\n' "$kimi_shell" >&2; die "hats kimi shell-init failed"; return; }
+  echo "$kimi_shell" | grep -qE '^function kimi' || { printf 'got:\n%s\n' "$kimi_shell" >&2; die "hats kimi shell-init did not emit kimi function"; return; }
+  echo "$kimi_shell" | grep -q 'ANTHROPIC_BASE_URL=' || { printf 'got:\n%s\n' "$kimi_shell" >&2; die "hats kimi shell-init missing Kimi endpoint env"; return; }
+
+  local op_init op_add op_shell
+  op_init=$("$HATS_SCRIPT" opencode init 2>&1) || { printf 'got:\n%s\n' "$op_init" >&2; die "hats opencode init failed"; return; }
+  op_add=$("$HATS_SCRIPT" opencode add work 2>&1) || { printf 'got:\n%s\n' "$op_add" >&2; die "hats opencode add failed"; return; }
+  op_shell=$("$HATS_SCRIPT" opencode shell-init 2>&1) || { printf 'got:\n%s\n' "$op_shell" >&2; die "hats opencode shell-init failed"; return; }
+  echo "$op_shell" | grep -qE '^function opencode_work' || { printf 'got:\n%s\n' "$op_shell" >&2; die "hats opencode shell-init did not emit prefixed function"; return; }
+  echo "$op_shell" | grep -q 'OPENCODE_CONFIG_DIR=.*/.hats/opencode/work' || { printf 'got:\n%s\n' "$op_shell" >&2; die "hats opencode shell-init missing isolated config dir"; return; }
+
+  ok "kimi and opencode are first-class provider surfaces"
 }
 
 test_codex_completion_emits_script() {
@@ -1166,12 +1249,12 @@ test_install_then_invoke_through_PATH() {
   chmod 600 "$kimi_acct/.credentials.json"
   echo '{"hasCompletedOnboarding":true}' > "$kimi_acct/.claude.json"
 
-  src_out=$("$HATS_SCRIPT" shell-init 2>/dev/null) || {
+  src_out=$("$HATS_SCRIPT" claude shell-init 2>/dev/null) || {
     rm -rf "$dest"
     die "source shell-init exited non-zero"
     return
   }
-  inst_out=$(PATH="$dest:$PATH" "$dest/hats" shell-init 2>/dev/null) || {
+  inst_out=$(PATH="$dest:$PATH" "$dest/hats" claude shell-init 2>/dev/null) || {
     rm -rf "$dest"
     die "installed shell-init exited non-zero"
     return
@@ -1317,7 +1400,7 @@ EOF
 
   # (a) --help
   local out rc
-  out=$("$HATS_SCRIPT" verify --help 2>&1)
+  out=$("$HATS_SCRIPT" claude verify --help 2>&1)
   rc=$?
   if [ "$rc" -ne 0 ] || ! echo "$out" | grep -q -- '--all' \
      || ! echo "$out" | grep -qi 'token internals'; then
@@ -1327,7 +1410,7 @@ EOF
   fi
 
   # (b) healthy account -> rc=0, no FAIL lines
-  out=$("$HATS_SCRIPT" verify verifyok 2>&1) || true
+  out=$("$HATS_SCRIPT" claude verify verifyok 2>&1) || true
   if ! echo "$out" | grep -q 'PASS token expiry' \
      || ! echo "$out" | grep -q 'PASS remote-control scope present' \
      || ! echo "$out" | grep -q '0 issue'; then
@@ -1338,7 +1421,7 @@ EOF
 
   # (c) expired-with-refresh -> WARN (not FAIL), rc=0
   rc=0
-  out=$("$HATS_SCRIPT" verify verifyexp 2>&1) || rc=$?
+  out=$("$HATS_SCRIPT" claude verify verifyexp 2>&1) || rc=$?
   if [ "$rc" -ne 0 ] \
      || ! echo "$out" | grep -q 'WARN access token expired' \
      || echo "$out" | grep -Eq '^\s+FAIL'; then
@@ -1349,7 +1432,7 @@ EOF
 
   # (d) non-JSON -> FAIL, rc=1
   rc=0
-  out=$("$HATS_SCRIPT" verify verifybad 2>&1) || rc=$?
+  out=$("$HATS_SCRIPT" claude verify verifybad 2>&1) || rc=$?
   if [ "$rc" -eq 0 ] \
      || ! echo "$out" | grep -q 'FAIL credentials file is not valid JSON'; then
     printf 'got:\n%s\n' "$out" >&2
@@ -1359,7 +1442,7 @@ EOF
 
   # (e) unknown flag
   rc=0
-  out=$("$HATS_SCRIPT" verify --bogus 2>&1) || rc=$?
+  out=$("$HATS_SCRIPT" claude verify --bogus 2>&1) || rc=$?
   if [ "$rc" -eq 0 ] || ! echo "$out" | grep -qi 'Unknown verify flag'; then
     printf 'got:\n%s\n' "$out" >&2
     die "verify --bogus should reject (rc=$rc)"
@@ -1368,7 +1451,7 @@ EOF
 
   # (f) nonexistent account
   rc=0
-  out=$("$HATS_SCRIPT" verify does-not-exist 2>&1) || rc=$?
+  out=$("$HATS_SCRIPT" claude verify does-not-exist 2>&1) || rc=$?
   if [ "$rc" -eq 0 ] || ! echo "$out" | grep -q "not found"; then
     printf 'got:\n%s\n' "$out" >&2
     die "verify on nonexistent account should reject (rc=$rc)"
@@ -1664,7 +1747,7 @@ EOF
   printf '{"ver":1,"marker":"smoke"}' > "$src/.claude.json"
 
   local bundle="$SANDBOX_ROOT/exptest.tar"
-  "$HATS_SCRIPT" export exptest --no-encrypt --out "$bundle" >/dev/null 2>&1 \
+  "$HATS_SCRIPT" claude export exptest --no-encrypt --out "$bundle" >/dev/null 2>&1 \
     || { die "export --no-encrypt failed"; return; }
   [ -s "$bundle" ] || { die "exported tarball is empty"; return; }
 
@@ -1677,8 +1760,8 @@ EOF
   local target_home="$target_root"
   mkdir -p "$target_home"
 
-  env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" init >/dev/null 2>&1
-  env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" import "$bundle" >/dev/null 2>&1 \
+  env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" claude init >/dev/null 2>&1
+  env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" claude import "$bundle" >/dev/null 2>&1 \
     || { die "import-base failed"; return; }
 
   local imp="$target_hats/claude/exptest"
@@ -1691,13 +1774,13 @@ EOF
   [ "$mode" = "600" ] || { die "credentials mode after import = $mode (expected 600)"; return; }
 
   # --as rename
-  env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" import "$bundle" --as renamed >/dev/null 2>&1 \
+  env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" claude import "$bundle" --as renamed >/dev/null 2>&1 \
     || { die "import --as failed"; return; }
   [ -d "$target_hats/claude/renamed" ] || { die "--as did not create renamed dir"; return; }
 
   # --force guard
   local rc=0
-  env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" import "$bundle" >/dev/null 2>&1 || rc=$?
+  env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" claude import "$bundle" >/dev/null 2>&1 || rc=$?
   [ "$rc" -ne 0 ] || { die "import without --force did not refuse existing account"; return; }
 
   # Path-traversal rejection: craft a malicious tarball and confirm refusal.
@@ -1717,7 +1800,7 @@ with tarfile.open(bundle, "w") as tf:
     tf.addfile(ei, io.BytesIO(eb))
 PYEOF
   local rc=0
-  "$HATS_SCRIPT" import "$evil_bundle" >/dev/null 2>&1 || rc=$?
+  "$HATS_SCRIPT" claude import "$evil_bundle" >/dev/null 2>&1 || rc=$?
   if [ "$rc" -eq 0 ]; then
     die "import accepted a tarball with path-traversal entries"
     return
@@ -1763,7 +1846,7 @@ EOF
 
   # (c) export without password should die.
   local rc=0
-  HATS_EXPORT_PASSWORD="" "$HATS_SCRIPT" export opensslsrc --backend openssl --out "$bundle" >/dev/null 2>&1 || rc=$?
+  HATS_EXPORT_PASSWORD="" "$HATS_SCRIPT" claude export opensslsrc --backend openssl --out "$bundle" >/dev/null 2>&1 || rc=$?
   if [ "$rc" -eq 0 ]; then
     die "openssl backend without HATS_EXPORT_PASSWORD should refuse"
     return
@@ -1771,7 +1854,7 @@ EOF
 
   # (a)+(b) export with password and verify magic + roundtrip.
   HATS_EXPORT_PASSWORD="smoke-passphrase-not-secret" \
-    "$HATS_SCRIPT" export opensslsrc --backend openssl --out "$bundle" >/dev/null 2>&1 \
+    "$HATS_SCRIPT" claude export opensslsrc --backend openssl --out "$bundle" >/dev/null 2>&1 \
     || { die "openssl-backed export failed"; return; }
   [ -s "$bundle" ] || { die "openssl bundle is empty"; return; }
   local magic
@@ -1782,10 +1865,10 @@ EOF
   local target_hats="$target_root/.hats"
   local target_home="$target_root"
   mkdir -p "$target_home"
-  env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" init >/dev/null 2>&1
+  env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" claude init >/dev/null 2>&1
   env HATS_DIR="$target_hats" HOME="$target_home" \
     HATS_EXPORT_PASSWORD="smoke-passphrase-not-secret" \
-    "$HATS_SCRIPT" import "$bundle" >/dev/null 2>&1 \
+    "$HATS_SCRIPT" claude import "$bundle" >/dev/null 2>&1 \
     || { die "openssl-backed import failed"; return; }
 
   cmp "$src/.credentials.json" "$target_hats/claude/opensslsrc/.credentials.json" \
@@ -1793,12 +1876,12 @@ EOF
 
   # (d) bogus backend
   rc=0
-  "$HATS_SCRIPT" export opensslsrc --backend bogus --out "$bundle" >/dev/null 2>&1 || rc=$?
+  "$HATS_SCRIPT" claude export opensslsrc --backend bogus --out "$bundle" >/dev/null 2>&1 || rc=$?
   [ "$rc" -ne 0 ] || { die "--backend bogus should refuse"; return; }
 
   # (e) --backend + --no-encrypt mutex
   rc=0
-  "$HATS_SCRIPT" export opensslsrc --backend age --no-encrypt --out "$bundle" >/dev/null 2>&1 || rc=$?
+  "$HATS_SCRIPT" claude export opensslsrc --backend age --no-encrypt --out "$bundle" >/dev/null 2>&1 || rc=$?
   [ "$rc" -ne 0 ] || { die "--backend + --no-encrypt should refuse"; return; }
 
   rm -rf "$src"
@@ -1839,7 +1922,7 @@ EOF
 
   # (a) bare doctor — no Metrics header in output.
   local plain
-  plain=$("$HATS_SCRIPT" doctor 2>&1) || true
+  plain=$("$HATS_SCRIPT" claude doctor 2>&1) || true
   if echo "$plain" | grep -q "Metrics — token freshness"; then
     printf 'got:\n%s\n' "$plain" >&2
     die "bare 'hats doctor' unexpectedly printed metrics section"
@@ -1849,7 +1932,7 @@ EOF
   # (b)+(c) doctor --metrics — section header + per-account lines + dormancy
   # tags on the backdated accounts.
   local m
-  m=$("$HATS_SCRIPT" doctor --metrics 2>&1) || true
+  m=$("$HATS_SCRIPT" claude doctor --metrics 2>&1) || true
   if ! echo "$m" | grep -q "Metrics — token freshness"; then
     printf 'got:\n%s\n' "$m" >&2
     die "doctor --metrics missing 'Metrics — token freshness' header"
@@ -1874,7 +1957,7 @@ EOF
   # (d) bogus flag rejection — capture with `|| rc=$?` so set -e doesn't
   # propagate the intentional non-zero exit.
   local rc=0 out
-  out=$("$HATS_SCRIPT" doctor --bogus 2>&1) || rc=$?
+  out=$("$HATS_SCRIPT" claude doctor --bogus 2>&1) || rc=$?
   if [ "$rc" -eq 0 ] || ! echo "$out" | grep -qi "Unknown doctor flag"; then
     printf 'got:\n%s\n' "$out" >&2
     die "doctor --bogus should reject (rc=$rc)"
@@ -1923,7 +2006,7 @@ EOF
   local out rc
 
   # (a) --help documents flags
-  out=$("$HATS_SCRIPT" list --help 2>&1)
+  out=$("$HATS_SCRIPT" claude list --help 2>&1)
   rc=$?
   if ! { [ "$rc" -eq 0 ] && echo "$out" | grep -q -- '--rc-only' && echo "$out" | grep -q -- '--expired' && echo "$out" | grep -q -- '--provider'; }; then
     printf 'got: %s\n' "$out" >&2
@@ -1933,7 +2016,7 @@ EOF
 
   # (b) --rc-only matches rctest + expiredtest (both carry the RC scope), NOT
   # the bare fixture accounts (foo etc.) whose parser errors out.
-  out=$("$HATS_SCRIPT" list --rc-only 2>&1)
+  out=$("$HATS_SCRIPT" claude list --rc-only 2>&1)
   rc=$?
   if [ "$rc" -ne 0 ] \
      || ! echo "$out" | grep -q 'Filters: --rc-only' \
@@ -1948,7 +2031,7 @@ EOF
   # (c) --expired matches expiredtest, NOT rctest. Check the matched-count
   # summary ("1 of N") as the authoritative signal — parsing a specific
   # non-match line out of list output is regex-fragile.
-  out=$("$HATS_SCRIPT" list --expired 2>&1)
+  out=$("$HATS_SCRIPT" claude list --expired 2>&1)
   rc=$?
   if [ "$rc" -ne 0 ] \
      || ! echo "$out" | grep -q 'expiredtest' \
@@ -1959,7 +2042,7 @@ EOF
   fi
 
   # (d) Combined --rc-only --expired: AND semantics — only expiredtest.
-  out=$("$HATS_SCRIPT" list --rc-only --expired 2>&1)
+  out=$("$HATS_SCRIPT" claude list --rc-only --expired 2>&1)
   rc=$?
   if [ "$rc" -ne 0 ] \
      || ! echo "$out" | grep -q 'Filters: --rc-only --expired' \
@@ -1972,7 +2055,7 @@ EOF
   # (e) Unknown flag rejection — capture with `|| rc=$?` so set -e doesn't
   # propagate the intentional non-zero exit from hats.
   rc=0
-  out=$("$HATS_SCRIPT" list --bogus 2>&1) || rc=$?
+  out=$("$HATS_SCRIPT" claude list --bogus 2>&1) || rc=$?
   if [ "$rc" -eq 0 ] || ! echo "$out" | grep -qi "Unknown list flag"; then
     printf 'got: %s\n' "$out" >&2
     die "hats list --bogus should reject with non-zero rc (rc=$rc)"
@@ -1982,7 +2065,7 @@ EOF
   # (f) --provider override: init codex tree so `hats list --provider codex`
   # can route to it. No codex accounts yet, so header check is enough.
   "$HATS_SCRIPT" codex init >/dev/null 2>&1 || true
-  out=$("$HATS_SCRIPT" list --provider codex 2>&1)
+  out=$("$HATS_SCRIPT" claude list --provider codex 2>&1)
   rc=$?
   if [ "$rc" -ne 0 ] || ! echo "$out" | grep -qi "Codex Accounts"; then
     printf 'got: %s\n' "$out" >&2
@@ -2032,7 +2115,7 @@ EOF
 
   # Shell-init reads HATS_KIMI_ENV_FILE env var override at emission time.
   local emitted
-  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" shell-init 2>/dev/null)
+  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" claude shell-init 2>/dev/null)
 
   # Source + stub infisical + stub claude, inside a bash -c so we can
   # inspect the post-call env without contaminating the smoke suite.
@@ -2164,7 +2247,7 @@ INFISICAL_UNIVERSAL_AUTH_CLIENT_ID=smoke-client-id
 INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=smoke-client-secret
 EOF
   local emitted
-  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" shell-init 2>/dev/null)
+  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" claude shell-init 2>/dev/null)
 
   # In production the emitted kimi function calls bare `hats kimi init` via
   # the auto-init guard, and operators have hats on PATH (install.sh ships it
@@ -2262,7 +2345,7 @@ INFISICAL_UNIVERSAL_AUTH_CLIENT_ID=smoke-client-id
 INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=smoke-client-secret
 EOF
   local emitted
-  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" shell-init 2>/dev/null)
+  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" claude shell-init 2>/dev/null)
 
   local probe_out probe_rc
   probe_out=$(PATH="$HATS_REPO:$PATH" bash -c '
@@ -2779,6 +2862,7 @@ test_no_color_flag
 test_link_unlink_resource_validation
 test_account_crud_roundtrip
 test_codex_provider_routing
+test_first_class_kimi_and_opencode_surfaces
 test_codex_completion_emits_script
 test_show_account_status_parses_without_grep_P
 test_codex_doctor_runs_clean_on_fresh_init
@@ -2787,6 +2871,8 @@ test_init_idempotent_and_status_iterator
 test_rejection_paths_exit_nonzero
 test_doctor_flags_missing_auth_and_broken_symlink
 test_swap_error_paths
+test_provider_prefix_required
+test_swap_scrubs_kimi_env_for_normal_accounts
 test_command_aliases
 test_link_unlink_happy_path
 test_providers_and_default_getter

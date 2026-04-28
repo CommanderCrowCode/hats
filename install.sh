@@ -81,5 +81,5 @@ fi
 
 echo ""
 echo "Get started:"
-echo "  hats init"
-echo "  hats list"
+echo "  hats claude init"
+echo "  hats claude list"

@@ -18,6 +18,11 @@ harnesses:
     quota_resets: {usage_based: null}
     mcp_config_surface: per_account
     parent_harness: claude-code
+  opencode:
+    command: opencode
+    config_dir_env: OPENCODE_CONFIG_DIR
+    quota_resets: {usage_based: null}
+    mcp_config_surface: config_dir
 
 # Provider catalog — who owns the tokens.
 providers:
@@ -31,6 +36,9 @@ providers:
   moonshot:
     quota_model: api_pay_per_use
     auth_flow: api_key
+  opencode:
+    quota_model: provider_dependent
+    auth_flow: external_provider_config
 
 # Account catalog — each row is a (label, harness, provider) triple.
 accounts:

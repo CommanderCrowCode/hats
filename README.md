@@ -4,17 +4,17 @@
 
 Switch between coding-agent accounts like changing hats.
 
-Run multiple Claude Code, Codex, and Kimi accounts on the same machine — including concurrently — with per-account home/config isolation and flexible resource sharing. All three harnesses are first-class; see the [harness matrix](#harness-matrix) below.
+Run multiple Claude Code, Codex, Kimi, and OpenCode accounts on the same machine — including concurrently — with per-account home/config isolation and flexible resource sharing. The harnesses are first-class; see the [harness matrix](#harness-matrix) below.
 
 ## Why
 
 Each coding-agent CLI — Claude Code, Codex, Kimi, etc. — stores credentials and runtime state in a single shared home/config root (`~/.claude/.credentials.json`, `~/.codex/`, and so on). One file, one account. Multiple subscriptions or workspaces means swapping that root, and concurrent sessions are harder still.
 
-**hats** solves this by giving each account its own harness-specific root (`CLAUDE_CONFIG_DIR` for Claude Code, `CODEX_HOME` for Codex, endpoint + API-key isolation for Kimi):
+**hats** solves this by giving each account its own harness-specific root (`CLAUDE_CONFIG_DIR` for Claude Code, `CODEX_HOME` for Codex, `OPENCODE_CONFIG_DIR` for OpenCode, endpoint + API-key isolation for Kimi):
 - Each account gets an isolated home/config directory with its own credentials
 - Concurrent sessions are inherently safe — no file swapping, no locking, no races
 - Shared resources are symlinked to a harness-specific `base/` template
-- Any resource can be selectively isolated per account with `hats unlink`
+- Any resource can be selectively isolated per account with `hats <provider> unlink`
 - Shell functions let you type the account name as a command
 
 ## Quick Start
@@ -24,22 +24,22 @@ Each coding-agent CLI — Claude Code, Codex, Kimi, etc. — stores credentials 
 git clone https://github.com/CommanderCrowCode/hats.git
 cd hats && ./install.sh
 
-# Initialize (migrates existing ~/.claude/ if present)
-hats init
+# Initialize Claude Code (migrates existing ~/.claude/ if present)
+hats claude init
 
 # Create accounts (opens claude for /login authentication)
-hats add work
-hats add personal
+hats claude add work
+hats claude add personal
 
 # Set your default (bare `claude` runs as this account)
-hats default work
+hats claude default work
 
 # Use it
-hats swap personal              # starts claude as "personal"
-hats swap work -- --model opus  # pass flags to claude
+hats claude swap personal              # starts claude as "personal"
+hats claude swap work -- --model opus  # pass flags to claude
 
 # Or add shell functions to your .zshrc/.bashrc
-eval "$(hats shell-init)"
+eval "$(hats claude shell-init)"
 personal                        # just type the account name
 work --model opus               # with arguments
 
@@ -49,6 +49,13 @@ hats codex add work
 hats codex swap work
 eval "$(hats codex shell-init)"
 codex_work
+
+# OpenCode support
+hats opencode init
+hats opencode add work
+hats opencode swap work
+eval "$(hats opencode shell-init)"
+opencode_work
 ```
 
 ## Install
@@ -67,25 +74,26 @@ This copies `hats` to `~/.local/bin/`. Make sure `~/.local/bin` is in your `PATH
 - `python3` (for token inspection)
 - Claude Code installed (`claude` on PATH)
 - Codex CLI installed (`codex` on PATH) for Codex accounts
+- OpenCode CLI installed (`opencode` on PATH) for OpenCode accounts
 
 ## Harness matrix
 
-`hats` treats each coding-agent harness as first-class. All three support the same core surface (`init / add / swap / list / doctor / verify / shell-init`), and they can coexist on the same machine:
+`hats` treats each coding-agent harness as first-class. Claude, Codex, Kimi, and OpenCode support the same core surface (`init / add / swap / list / doctor / verify / shell-init`), and they can coexist on the same machine:
 
 | Harness | CLI prefix | Isolation root | Status |
 |---------|-----------|----------------|--------|
-| Claude Code | `hats …` (unprefixed, default for backcompat) | `CLAUDE_CONFIG_DIR` | Stable |
+| Claude Code | `hats claude …` | `CLAUDE_CONFIG_DIR` | Stable |
 | Codex | `hats codex …` | `CODEX_HOME` | Stable |
 | Kimi (Moonshot, Anthropic-compat via claude-code) | `hats kimi …` | `CLAUDE_CONFIG_DIR` under an isolated account dir + inlined `ANTHROPIC_BASE_URL` + Infisical-backed API key | Stable, doctor 5/5 green |
+| OpenCode | `hats opencode …` | `OPENCODE_CONFIG_DIR` | Stable |
 | Kimi (Moonshot, OpenAI-compat via codex) | `hats codex kimi …` | `CODEX_HOME` + per-account `config.toml` with `[model_providers.kimi]` | **Disabled** — codex v0.118.0+ requires `wire_api="responses"` and Kimi serves `/chat/completions` only. See [docs/codex-kimi-compat.md](docs/codex-kimi-compat.md) for the vendor-state receipts and LiteLLM-proxy workaround. |
 
-Unprefixed `hats …` targets Claude Code because that was the original integration; this is a backcompat default, not a priority hierarchy. Same-shape commands exist for every harness, and cross-harness tooling (e.g. `hats flip`, see [docs/rotation-framework.md](docs/rotation-framework.md)) is designed around that parity.
+Provider commands always use `hats <provider> …`; Claude Code is `hats claude …`, not a privileged unprefixed default. Cross-harness tooling (e.g. `hats flip`, see [docs/rotation-framework.md](docs/rotation-framework.md)) is designed around that parity.
 
 ### Known parity gaps (tracked)
 
-- **Shell-function naming is asymmetric.** `hats shell-init` emits bare names for claude accounts (`work()`) and `codex_`-prefixed names for codex accounts (`codex_work()`) to avoid name collisions. Claude takes the bare namespace only by convention — not by design superiority. See [Shell Integration](#shell-integration).
-- **`hats init` with no harness arg defaults to claude.** Harness-first-class `hats init <label>` (where the harness is derived from the label's rotation config) is designed in [docs/rotation-framework.md](docs/rotation-framework.md) §4.1 as a future command.
-- **Kimi is routed through a parent harness (claude-code or codex)** rather than standing alone. This reflects Moonshot's wire-protocol reality — Kimi is a backend endpoint, not a CLI — but it does mean Kimi accounts inherit their parent harness's shell-function shape.
+- **Shell-function naming is provider-scoped except for Claude shell aliases.** `hats claude shell-init` emits bare names for claude accounts (`work()`), while other providers use prefixes such as `codex_work()` and `opencode_work()` to avoid name collisions. Kimi emits the fixed `kimi()` function.
+- **Kimi is routed through a parent harness (claude-code or codex)** rather than standing alone at the process level. The working Anthropic-compatible route is first-class as `hats kimi …`; the Codex/OpenAI-compatible route remains available as `hats codex kimi …` but disabled by default pending wire-protocol compatibility.
 
 ## How It Works
 
@@ -163,9 +171,9 @@ By default, shared vs isolated resources depend on the provider:
 
 Selectively isolate any resource:
 ```bash
-hats unlink personal CLAUDE.md    # personal gets its own CLAUDE.md
-hats link personal CLAUDE.md      # re-share with base
-hats status personal              # see what's linked vs isolated
+hats claude unlink personal CLAUDE.md    # personal gets its own CLAUDE.md
+hats claude link personal CLAUDE.md      # re-share with base
+hats claude status personal              # see what's linked vs isolated
 ```
 
 ### Concurrency
@@ -201,9 +209,9 @@ hats <provider> swap <name> [-- provider-args...]
 Runs the provider CLI with the account's isolated home/config root.
 
 ```bash
-hats swap work                        # interactive session
-hats swap work -- --model opus        # pass flags to claude
-hats swap work -- -p "hello"          # print mode
+hats claude swap work                        # interactive session
+hats claude swap work -- --model opus        # pass flags to claude
+hats claude swap work -- -p "hello"          # print mode
 ```
 
 ### Resource Management
@@ -218,28 +226,37 @@ hats <provider> status [account]
 
 ```bash
 # Claude functions:
-eval "$(hats shell-init)"
+eval "$(hats claude shell-init)"
 
 # Codex functions:
 eval "$(hats codex shell-init)"
 
+# Kimi function:
+eval "$(hats kimi shell-init)"
+
+# OpenCode functions:
+eval "$(hats opencode shell-init)"
+
 # With auto-skip permissions:
-eval "$(hats shell-init --skip-permissions)"
+eval "$(hats claude shell-init --skip-permissions)"
 ```
 
-This generates a function for each account. Claude accounts get the bare namespace (`work`, `personal`) and Codex accounts get a `codex_` prefix (`codex_work`) to avoid collisions when both are present. The asymmetry is a namespace-collision workaround, not a priority hierarchy — see [Known parity gaps](#known-parity-gaps-tracked):
+This generates a function for each account. Claude accounts keep the bare namespace (`work`, `personal`) for backcompat. Other providers are prefixed (`codex_work`, `opencode_work`) to avoid collisions, and Kimi emits the fixed `kimi` function.
 ```bash
-work() { CLAUDE_CONFIG_DIR="$HOME/.hats/claude/work" claude "$@"; }
-personal() { CLAUDE_CONFIG_DIR="$HOME/.hats/claude/personal" claude "$@"; }
-codex_work() { CODEX_HOME="$HOME/.hats/codex/work" codex -c 'cli_auth_credentials_store="file"' "$@"; }
+unalias -- work 2>/dev/null || true
+function work { ( env -u ANTHROPIC_BASE_URL -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR="$HOME/.hats/claude/work" claude "$@" ); }
+unalias -- codex_work 2>/dev/null || true
+function codex_work { ( env -u OPENAI_API_KEY -u CODEX_API_KEY CODEX_HOME="$HOME/.hats/codex/work" codex -c 'cli_auth_credentials_store="file"' "$@" ); }
+unalias -- opencode_work 2>/dev/null || true
+function opencode_work { ( OPENCODE_CONFIG_DIR="$HOME/.hats/opencode/work" opencode "$@" ); }
 ```
 
 ### Maintenance
 
 ```bash
-hats fix               # Repair broken symlinks, verify auth, dedupe base/settings.json hooks
-hats doctor            # Read-only health check (tooling, layout, symlinks, permissions)
-hats verify            # Deep per-account auth check (JSON, expiry, provider semantics)
+hats claude fix        # Repair broken symlinks, verify auth, dedupe base/settings.json hooks
+hats claude doctor     # Read-only health check (tooling, layout, symlinks, permissions)
+hats claude verify     # Deep per-account auth check (JSON, expiry, provider semantics)
 hats completion bash   # Emit bash completion script; eval "$(...)" in .bashrc
 hats completion zsh    # Emit zsh completion script; eval "$(...)" in .zshrc
 hats providers         # List supported providers and show the default
@@ -258,18 +275,19 @@ want it. `hats audit -n 20` shows the last 20 entries pretty-printed;
 Global flag: `--no-color` (or `NO_COLOR` / `HATS_NO_COLOR` env var) disables
 ANSI color output for any `hats` invocation.
 
-**`hats doctor`** is a read-only companion to `hats fix` — it verifies layout
+**`hats <provider> doctor`** is a read-only companion to `hats <provider> fix` — it verifies layout
 integrity without changing anything, then exits non-zero on hard issues. See
 [`docs/doctor-checks.md`](docs/doctor-checks.md) for the full check catalog and
-remediation guide. Works for both providers: `hats doctor` (claude) and
-`hats codex doctor`.
+remediation guide. Works across providers, e.g. `hats claude doctor`,
+`hats codex doctor`, `hats kimi doctor`, and `hats opencode doctor`.
 
-**`hats verify`** is the semantic companion to doctor. It stays read-only, but
+**`hats <provider> verify`** is the semantic companion to doctor. It stays read-only, but
 goes deeper into each account's auth material: JSON validity, file mode,
 expiry horizon, refreshability, and provider-specific sanity. On Codex that
 includes `auth_mode` checks, `id_token` JWT expiry / refresh-token freshness,
 `cli_auth_credentials_store = "file"`, and a non-billing `codex login status`
-liveness probe. Works for both providers: `hats verify` and `hats codex verify`.
+liveness probe. Works across providers, e.g. `hats claude verify` and
+`hats codex verify`.
 
 **`install.sh --check`** runs the smoke-test suite (`tests/smoke.sh`) before
 installing, aborting if any test fails — handy for CI/CD or anyone who wants
@@ -282,7 +300,7 @@ accounts are immediately completable without re-sourcing).
 ## Adding a New Account
 
 ```bash
-hats add myaccount
+hats claude add myaccount
 # Claude Code opens — run /login, authenticate, then /exit
 ```
 
@@ -333,12 +351,12 @@ If you override Codex to use `keyring` or `auto`, hats can no longer guarantee t
 
 Claude Code's [Remote Control](https://docs.anthropic.com/en/docs/claude-code/remote-control) feature requires the `user:sessions:claude_code` OAuth scope, which is only granted by the full `/login` flow.
 
-`hats list` shows `[rc]` for accounts with Remote Control support and `[no-rc]` for those without.
+`hats claude list` shows `[rc]` for accounts with Remote Control support and `[no-rc]` for those without.
 
 ## Status Output
 
 ```
-$ hats list
+$ hats claude list
 hats v1.1.0 — Claude Code Accounts
 =======================================
 
@@ -355,14 +373,13 @@ hats v1.1.0 — Claude Code Accounts
 
 ### Filters
 
-`hats list` accepts filter flags to narrow the view on larger fleets:
+`hats <provider> list` accepts filter flags to narrow the view on larger fleets:
 
 ```
-$ hats list --rc-only              # only RC-scoped tokens
-$ hats list --expired              # only past-expiry tokens (pair with --rc-only if needed)
+$ hats claude list --rc-only       # only RC-scoped tokens
+$ hats claude list --expired       # only past-expiry tokens (pair with --rc-only if needed)
 $ hats codex list --expired        # codex auth.json id_token expiry, incl. refreshable-expired
-$ hats list --provider codex       # reroute the listing to the codex tree
-$ hats list --rc-only --expired    # AND — RC-scoped AND expired
+$ hats claude list --rc-only --expired  # AND — RC-scoped AND expired
 ```
 
 When any filter is active, the summary line reports `X of Y account(s) matched`.
@@ -410,7 +427,7 @@ When any filter is active, the summary line reports `X of Y account(s) matched`.
 
 ## Migrating from v0.2.x
 
-`hats init` automatically detects and migrates v0.2.x setups:
+`hats claude init` automatically detects and migrates v0.2.x setups:
 
 1. Moves `~/.claude/` contents to `~/.hats/claude/base/`
 2. Creates per-account directories from existing `.credentials.<name>.json` files
@@ -423,10 +440,10 @@ When any filter is active, the summary line reports `X of Y account(s) matched`.
 The refresh token may have expired. Run `/login` inside a session for that account.
 
 **Wrong identity showing:**
-Each account has its own `.claude.json` state. Run `hats fix` to verify symlinks, or start a fresh session.
+Each account has its own `.claude.json` state. Run `hats claude fix` to verify symlinks, or start a fresh session.
 
 **Broken symlinks after Claude Code update:**
-Run `hats fix` — it detects broken symlinks and repairs them, and adds symlinks for new resources added to base.
+Run `hats claude fix` — it detects broken symlinks and repairs them, and adds symlinks for new resources added to base.
 
 ## License
 

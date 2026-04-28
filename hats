@@ -117,9 +117,13 @@ PYEOF
 
 _is_supported_provider() {
   case "$1" in
-    claude|codex) return 0 ;;
+    claude|codex|kimi|opencode) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+_supported_providers_words() {
+  echo "claude codex kimi opencode"
 }
 
 # Generic provider-aware dispatch. Given a base function name, look up and
@@ -148,16 +152,12 @@ _call_provider_variant() {
 }
 
 _hats_cmd_prefix() {
-  if [ "$CURRENT_PROVIDER" = "claude" ]; then
-    echo "hats"
-  else
-    echo "hats $CURRENT_PROVIDER"
-  fi
+  echo "hats $CURRENT_PROVIDER"
 }
 
 _configure_provider() {
   local provider="${1:-claude}"
-  _is_supported_provider "$provider" || die "Unsupported provider '$provider'. Supported: claude, codex"
+  _is_supported_provider "$provider" || die "Unsupported provider '$provider'. Supported: $(_supported_providers_words)"
 
   CURRENT_PROVIDER="$provider"
   PROVIDER_DIR="$HATS_DIR/$CURRENT_PROVIDER"
@@ -175,6 +175,18 @@ _configure_provider() {
       else
         PRIMARY_AUTH_FILE=".credentials.json"
       fi
+      ISOLATED_PATTERNS=(".credentials.json" ".claude.json" ".oauth-token")
+      SHARED_ALLOWLIST=()
+      ;;
+    kimi)
+      PROVIDER_TITLE="Kimi (Moonshot via Claude Code)"
+      PROVIDER_DIR="$HATS_DIR/claude"
+      BASE_DIR="$PROVIDER_DIR/base"
+      RUNTIME_DIR="$HOME/.claude"
+      RUNTIME_COMMAND="claude"
+      RUNTIME_ENV_VAR="CLAUDE_CONFIG_DIR"
+      DEFAULT_KEY="default_kimi"
+      PRIMARY_AUTH_FILE=""
       ISOLATED_PATTERNS=(".credentials.json" ".claude.json" ".oauth-token")
       SHARED_ALLOWLIST=()
       ;;
@@ -207,6 +219,34 @@ _configure_provider() {
         "skills"
         "version.json"
         ".personality_migration"
+      )
+      ;;
+    opencode)
+      PROVIDER_TITLE="OpenCode"
+      RUNTIME_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+      RUNTIME_COMMAND="opencode"
+      RUNTIME_ENV_VAR="OPENCODE_CONFIG_DIR"
+      DEFAULT_KEY="default_opencode"
+      PRIMARY_AUTH_FILE=""
+      ISOLATED_PATTERNS=(
+        "auth.json"
+        "credentials.json"
+        "state"
+        "sessions"
+        "logs"
+        "cache"
+        ".tmp"
+        "tmp"
+      )
+      SHARED_ALLOWLIST=(
+        "opencode.json"
+        "opencode.jsonc"
+        "agents"
+        "commands"
+        "modes"
+        "plugins"
+        "rules"
+        "prompts"
       )
       ;;
   esac
@@ -379,6 +419,10 @@ _validate_name() {
 
 _accounts() {
   [ -d "$PROVIDER_DIR" ] || return 0
+  if [ "$CURRENT_PROVIDER" = "kimi" ]; then
+    [ -d "$PROVIDER_DIR/$HATS_KIMI_ACCOUNT_NAME" ] && echo "$HATS_KIMI_ACCOUNT_NAME"
+    return 0
+  fi
   for d in "$PROVIDER_DIR"/*/; do
     [ -d "$d" ] || continue
     local name
@@ -401,6 +445,7 @@ _default_account() {
 
 _sync_runtime_symlink() {
   local name="$1"
+  mkdir -p "$(dirname "$RUNTIME_DIR")"
   ln -sfn "$PROVIDER_DIR/$name" "$RUNTIME_DIR"
 }
 
@@ -451,6 +496,14 @@ _ensure_account_defaults_codex() {
   # .claude.json; `_ensure_codex_base_config` already handles base-level
   # defaults. Kept as an explicit function so _call_provider_variant's
   # missing-variant guard stays meaningful.
+  :
+}
+
+_ensure_account_defaults_kimi() {
+  _ensure_account_defaults_claude "$@"
+}
+
+_ensure_account_defaults_opencode() {
   :
 }
 
@@ -563,15 +616,26 @@ _provider_login_hint_codex() {
   esac
 }
 
+_provider_login_hint_kimi() {
+  echo "Kimi is API-key backed via Infisical; hats will provision the fixed 'kimi' account and fetch the key per invocation."
+}
+
+_provider_login_hint_opencode() {
+  echo "OpenCode will run with OPENCODE_CONFIG_DIR pointed at this account directory. Authenticate inside OpenCode if your provider config requires it."
+}
+
 _provider_login_hint() {
   _call_provider_variant provider_login_hint "$@"
 }
 
-_provider_add_failure_hint_claude() { echo "Run: hats add $1"; }
+_provider_add_failure_hint_claude() { echo "Run: hats claude add $1"; }
 _provider_add_failure_hint_codex()  { echo "Run: hats codex add $1"; }
+_provider_add_failure_hint_kimi()   { echo "Run: hats kimi init"; }
+_provider_add_failure_hint_opencode() { echo "Run: hats opencode add $1"; }
 _provider_add_failure_hint() { _call_provider_variant provider_add_failure_hint "$@"; }
 
 _credential_file() {
+  [ -n "$PRIMARY_AUTH_FILE" ] || { echo ""; return 0; }
   echo "$(_account_dir "$1")/$PRIMARY_AUTH_FILE"
 }
 
@@ -903,6 +967,14 @@ PYEOF
   echo "store=$store"
 }
 
+_token_info_kimi() {
+  echo "present=True"
+}
+
+_token_info_opencode() {
+  echo "present=True"
+}
+
 _token_info() {
   # Dispatches to `_token_info_<provider>` via the generic helper — see
   # _call_provider_variant for the convention. Replaces an explicit case
@@ -921,6 +993,11 @@ _show_account_status() {
   [ "$name" = "$default" ] && marker="*"
 
   printf "  %s %-12s " "$marker" "$name"
+
+  if [ -z "$PRIMARY_AUTH_FILE" ]; then
+    echo "configured ($RUNTIME_ENV_VAR=$(_account_dir "$name"))"
+    return
+  fi
 
   if [ ! -f "$cfile" ]; then
     echo "NO CREDENTIALS"
@@ -1009,6 +1086,9 @@ _show_account_status() {
         fi
       fi
       echo "$status"
+      ;;
+    kimi|opencode)
+      echo "configured ($RUNTIME_ENV_VAR=$(_account_dir "$name"))"
       ;;
   esac
 }
@@ -1121,6 +1201,19 @@ _run_provider_login_codex() {
   esac
 }
 
+_run_provider_login_kimi() {
+  _ensure_kimi_account_dir_claude
+}
+
+_run_provider_login_opencode() {
+  local acct_dir="$1"
+  if [ "${HATS_OPENCODE_LOGIN:-0}" = "1" ]; then
+    OPENCODE_CONFIG_DIR="$acct_dir" opencode auth login || true
+  else
+    echo "OpenCode account directory created. Run 'hats opencode swap $(basename "$acct_dir")' to configure provider auth interactively."
+  fi
+}
+
 _run_provider_login() {
   _call_provider_variant run_provider_login "$@"
 }
@@ -1133,15 +1226,40 @@ _run_provider_command_claude() {
     local token
     token=$(cat "$token_file" 2>/dev/null || true)
     [ -n "$token" ] || die "Account '$(basename "$acct_dir")' has an empty token file. Re-run: $(_provider_add_failure_hint "$(basename "$acct_dir")")"
-    CLAUDE_CODE_OAUTH_TOKEN="$token" CLAUDE_CONFIG_DIR="$acct_dir" claude "$@"
+    env -u ANTHROPIC_BASE_URL -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+      CLAUDE_CODE_OAUTH_TOKEN="$token" CLAUDE_CONFIG_DIR="$acct_dir" claude "$@"
     return
   fi
-  CLAUDE_CONFIG_DIR="$acct_dir" claude "$@"
+  env -u ANTHROPIC_BASE_URL -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+    CLAUDE_CONFIG_DIR="$acct_dir" claude "$@"
 }
 
 _run_provider_command_codex() {
   local acct_dir="$1"; shift
-  CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' "$@"
+  env -u OPENAI_API_KEY -u CODEX_API_KEY \
+    CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' "$@"
+}
+
+_run_provider_command_kimi() {
+  local acct_dir="$1"; shift
+  local _kimi_key
+  _kimi_key=$(_kimi_fetch_api_key) || return 1
+  [ -n "$_kimi_key" ] || { echo "kimi: fetched an empty API key" >&2; return 1; }
+  _seed_kimi_claude_config_from_donor "$acct_dir" "$_kimi_key" >/dev/null 2>&1 || true
+  (
+    ANTHROPIC_BASE_URL="$HATS_KIMI_BASE_URL" \
+    ANTHROPIC_API_KEY="$_kimi_key" \
+    CLAUDE_CONFIG_DIR="$acct_dir" \
+      claude --dangerously-skip-permissions "$@"
+  )
+  local _rc=$?
+  unset _kimi_key
+  return $_rc
+}
+
+_run_provider_command_opencode() {
+  local acct_dir="$1"; shift
+  OPENCODE_CONFIG_DIR="$acct_dir" opencode "$@"
 }
 
 _run_provider_command() {
@@ -1237,7 +1355,7 @@ _init_provider_claude() {
     echo "  Creating fresh hats structure..."
     mkdir -p "$BASE_DIR"
     echo ""
-    echo "  Run 'hats add <name>' to create your first account."
+    echo "  Run 'hats claude add <name>' to create your first account."
   fi
 }
 
@@ -1294,9 +1412,74 @@ _init_provider_codex() {
   fi
 }
 
+_init_provider_kimi() {
+  [ -d "$HATS_DIR/claude/base" ] || mkdir -p "$HATS_DIR/claude/base"
+  _ensure_kimi_account_dir_claude
+  _config_set "version" "$VERSION"
+  _config_set "default_provider" "kimi"
+  _config_set "$DEFAULT_KEY" "$HATS_KIMI_ACCOUNT_NAME"
+  echo "  Kimi account ready: $(_account_dir "$HATS_KIMI_ACCOUNT_NAME")"
+  echo "  Shell function: eval \"\$(hats kimi shell-init)\""
+}
+
+_init_provider_opencode() {
+  local opencode_dir="$RUNTIME_DIR"
+  mkdir -p "$BASE_DIR"
+
+  if [ -d "$opencode_dir" ] && [ ! -L "$opencode_dir" ]; then
+    echo "  Found existing $opencode_dir/ directory"
+    echo "  Migrating current OpenCode config into hats account 'default'..."
+    echo ""
+
+    local default_name="default"
+    local acct_dir
+    acct_dir=$(_account_dir "$default_name")
+    mkdir -p "$acct_dir"
+
+    for item in "$opencode_dir"/* "$opencode_dir"/.*; do
+      [ -e "$item" ] || [ -L "$item" ] || continue
+      local bn
+      bn=$(basename "$item")
+      [[ "$bn" == "." || "$bn" == ".." ]] && continue
+
+      if _is_shared_by_default "$bn"; then
+        mv "$item" "$BASE_DIR/$bn"
+      else
+        mv "$item" "$acct_dir/$bn"
+      fi
+    done
+
+    _setup_account_dir "$default_name"
+    rm -rf "$opencode_dir"
+    _set_default "$default_name"
+
+    echo "  Created account: $default_name"
+    echo "  Default account: $default_name"
+    echo "  $RUNTIME_DIR -> $PROVIDER_DIR/$default_name/"
+    echo ""
+    echo "  1 account(s) migrated."
+  else
+    echo "  No existing $opencode_dir/ directory found."
+    echo "  Creating fresh hats structure..."
+    mkdir -p "$BASE_DIR"
+    echo ""
+    echo "  Run 'hats opencode add <name>' to create your first OpenCode account."
+  fi
+}
+
 # ── Commands ─────────────────────────────────────────────────────
 
 cmd_init() {
+  if [ "$CURRENT_PROVIDER" = "kimi" ]; then
+    echo "Initializing hats v$VERSION for $PROVIDER_TITLE..."
+    echo ""
+    _init_provider_kimi
+    echo ""
+    echo "Done. Structure: $(_account_dir "$HATS_KIMI_ACCOUNT_NAME")"
+    echo "Run 'hats kimi doctor' to verify Kimi."
+    return
+  fi
+
   if [ -d "$PROVIDER_DIR" ] && [ -d "$BASE_DIR" ]; then
     echo "hats is already initialized for $CURRENT_PROVIDER at $PROVIDER_DIR"
     echo ""
@@ -1328,6 +1511,12 @@ cmd_init() {
 }
 
 cmd_add() {
+  if [ "$CURRENT_PROVIDER" = "kimi" ]; then
+    [ -z "${1:-}" ] || [ "${1:-}" = "$HATS_KIMI_ACCOUNT_NAME" ] || die "Kimi uses the fixed account label '$HATS_KIMI_ACCOUNT_NAME'. Run 'hats kimi init'."
+    cmd_init
+    return
+  fi
+
   local name="${1:-}"
   [ -z "$name" ] && die "Usage: $(_hats_cmd_prefix) add <name>"
 
@@ -1381,7 +1570,13 @@ cmd_add() {
   echo ""
   _run_provider_login "$acct_dir" "$auth_mode" "$name"
 
-  if [ -f "$(_credential_file "$name")" ]; then
+  if [ -z "$PRIMARY_AUTH_FILE" ]; then
+    echo ""
+    echo "Account '$name' added."
+    _sync_new_account_defaults "$name"
+    _show_account_status "$name" "$(_default_account)"
+    _audit_log "add" "account" "$name"
+  elif [ -f "$(_credential_file "$name")" ]; then
     chmod 600 "$(_credential_file "$name")" 2>/dev/null || true
     echo ""
     echo "Account '$name' added."
@@ -1451,7 +1646,7 @@ cmd_rename() {
 
 _list_usage() {
   cat <<EOF
-Usage: $(_hats_cmd_prefix) list [--rc-only] [--expired] [--provider <claude|codex>]
+Usage: $(_hats_cmd_prefix) list [--rc-only] [--expired] [--provider <provider>]
 
   --rc-only            Show only accounts whose token carries the Claude Code
                        remote-control scope. Codex accounts have no RC concept
@@ -1467,11 +1662,7 @@ EOF
 _hats_cmd_prefix_of() {
   # Like _hats_cmd_prefix but for an explicitly-named provider, used in help
   # strings where CURRENT_PROVIDER may not be the relevant one yet.
-  case "${1:-claude}" in
-    claude) echo "hats" ;;
-    codex)  echo "hats codex" ;;
-    *)      echo "hats $1" ;;
-  esac
+  echo "hats ${1:-claude}"
 }
 
 _account_passes_list_filters() {
@@ -1525,7 +1716,7 @@ cmd_list() {
   # so downstream helpers resolve against the correct tree.
   if [ -n "$override_provider" ]; then
     _is_supported_provider "$override_provider" \
-      || die "Unsupported provider '$override_provider'. Supported: claude, codex"
+      || die "Unsupported provider '$override_provider'. Supported: $(_supported_providers_words)"
     _configure_provider "$override_provider"
   fi
 
@@ -1584,8 +1775,19 @@ cmd_default() {
 
 cmd_swap() {
   local name="${1:-}"
+  if [ "$CURRENT_PROVIDER" = "kimi" ] && { [ -z "$name" ] || [ "$name" = "--" ] || [ "$name" = "$HATS_KIMI_ACCOUNT_NAME" ]; }; then
+    if [ "$name" = "$HATS_KIMI_ACCOUNT_NAME" ]; then
+      shift || true
+      [ "${1:-}" = "--" ] && shift
+    elif [ "$name" = "--" ]; then
+      shift
+    fi
+    name="$HATS_KIMI_ACCOUNT_NAME"
+  fi
   [ -z "$name" ] && die "Usage: $(_hats_cmd_prefix) swap <name> [-- args...]"
-  shift
+  if [ "$CURRENT_PROVIDER" != "kimi" ]; then
+    shift
+  fi
 
   [ "${1:-}" = "--" ] && shift
 
@@ -1594,7 +1796,9 @@ cmd_swap() {
   local acct_dir
   acct_dir=$(_account_dir "$name")
 
-  [ -f "$(_credential_file "$name")" ] || die "Account '$name' has no credentials. $(_provider_add_failure_hint "$name")"
+  if [ -n "$PRIMARY_AUTH_FILE" ]; then
+    [ -f "$(_credential_file "$name")" ] || die "Account '$name' has no credentials. $(_provider_add_failure_hint "$name")"
+  fi
   # Log the swap BEFORE exec — _run_provider_command exec-chains into the
   # provider CLI, so anything after this line doesn't execute in the
   # parent shell.
@@ -2077,7 +2281,7 @@ cmd_shell_init() {
   for arg in "$@"; do
     case "$arg" in
       --skip-permissions)
-        if [ "$CURRENT_PROVIDER" = "claude" ]; then
+        if [ "$CURRENT_PROVIDER" = "claude" ] || [ "$CURRENT_PROVIDER" = "kimi" ]; then
           extra_args=" --dangerously-skip-permissions"
         else
           die "--skip-permissions is only supported for Claude Code shell shims."
@@ -2093,8 +2297,7 @@ cmd_shell_init() {
 HEADER
 
   if [ "$CURRENT_PROVIDER" = "claude" ]; then
-    echo "#   eval \"\$(hats shell-init)\""
-    echo "#   eval \"\$(hats shell-init --skip-permissions)\"  # to auto-skip permission prompts"
+    echo "#   eval \"\$(hats claude shell-init --skip-permissions)\"  # to auto-skip permission prompts"
   fi
   echo ""
 
@@ -2103,6 +2306,8 @@ HEADER
     acct_dir=$(_account_dir "$name")
     local fn_name="$name"
     [ "$CURRENT_PROVIDER" = "codex" ] && fn_name="codex_$name"
+    [ "$CURRENT_PROVIDER" = "opencode" ] && fn_name="opencode_$name"
+    [ "$CURRENT_PROVIDER" = "kimi" ] && fn_name="kimi"
     if [ "$CURRENT_PROVIDER" = "codex" ] && [ "$name" = "$HATS_KIMI_ACCOUNT_NAME" ]; then
       # Kimi codex backend-alias — OpenAI-compatible endpoint. Unlike
       # claude-kimi, codex does NOT honor OPENAI_BASE_URL env var
@@ -2116,7 +2321,8 @@ HEADER
 # Kimi codex backend-alias function — see 'hats codex kimi --help'.
 # Critical safety: OPENAI_API_KEY + CODEX_HOME are inlined on the codex
 # invocation, NEVER exported. Verified by 'hats codex kimi doctor'.
-${fn_name}() {
+unalias -- ${fn_name} 2>/dev/null || true
+function ${fn_name} {
   # Auto-restore the codex-kimi config.toml provider block if absent.
   # Covers operator cleanup / reinstall / manual edits that wiped the
   # model_providers.kimi stanza. Contract: hats must be on PATH (install.sh
@@ -2157,8 +2363,9 @@ ${fn_name}() {
 }
 KIMICODEXFN
     elif [ "$CURRENT_PROVIDER" = "codex" ]; then
-      echo "${fn_name}() { ( $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND -c 'cli_auth_credentials_store=\"file\"' \"\$@\" ); }"
-    elif [ "$CURRENT_PROVIDER" = "claude" ] && [ "$name" = "$HATS_KIMI_ACCOUNT_NAME" ]; then
+      echo "unalias -- ${fn_name} 2>/dev/null || true"
+      echo "function ${fn_name} { ( env -u OPENAI_API_KEY -u CODEX_API_KEY $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND -c 'cli_auth_credentials_store=\"file\"' \"\$@\" ); }"
+    elif { [ "$CURRENT_PROVIDER" = "claude" ] || [ "$CURRENT_PROVIDER" = "kimi" ]; } && [ "$name" = "$HATS_KIMI_ACCOUNT_NAME" ]; then
       # Kimi is API-key-backed, not OAuth — emit the specialized env-isolated
       # function instead of the generic CLAUDE_CONFIG_DIR-swap one-liner. The
       # env vars are inline-prefixed on the claude command (never exported)
@@ -2169,7 +2376,8 @@ KIMICODEXFN
 # Kimi backend-alias function — see 'hats kimi --help'.
 # Critical safety: ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY are inlined on the
 # claude invocation, NEVER exported. Verified by 'hats kimi doctor'.
-${fn_name}() {
+unalias -- ${fn_name} 2>/dev/null || true
+function ${fn_name} {
   local _kimi_key
   _kimi_key=\$(
     set +u
@@ -2194,7 +2402,7 @@ ${fn_name}() {
   # mcpServers + customApiKeyResponses.approved[key-suffix]. Consolidated
   # into one call. Non-fatal on failure — claude will fall back to prompting
   # interactively (annoying but not a hard block); doctor surfaces the gap.
-  $(_hats_cmd_prefix) kimi _approve_key "\$_kimi_key" >/dev/null 2>&1 || true
+  hats kimi _approve_key "\$_kimi_key" >/dev/null 2>&1 || true
   (
     ANTHROPIC_BASE_URL="$HATS_KIMI_BASE_URL" \\
     ANTHROPIC_API_KEY="\$_kimi_key" \\
@@ -2208,13 +2416,15 @@ ${fn_name}() {
 KIMIFN
     elif [ "$CURRENT_PROVIDER" = "claude" ] && _claude_uses_oauth_token_file; then
       cat <<CLAUDEOAUTHFN
-${fn_name}() {
+unalias -- ${fn_name} 2>/dev/null || true
+function ${fn_name} {
   local _hats_token_file="$acct_dir/$PRIMARY_AUTH_FILE"
   [ -f "\$_hats_token_file" ] || { echo "hats: missing token file for '$name' (\$_hats_token_file)" >&2; return 1; }
   local _hats_token
   _hats_token=\$(cat "\$_hats_token_file" 2>/dev/null)
   [ -n "\$_hats_token" ] || { echo "hats: empty token file for '$name' (\$_hats_token_file)" >&2; unset _hats_token _hats_token_file; return 1; }
   (
+    env -u ANTHROPIC_BASE_URL -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \\
     CLAUDE_CODE_OAUTH_TOKEN="\$_hats_token" \\
     CLAUDE_CONFIG_DIR="$acct_dir" \\
       $RUNTIME_COMMAND${extra_args} "\$@"
@@ -2224,8 +2434,12 @@ ${fn_name}() {
   return \$_rc
 }
 CLAUDEOAUTHFN
+    elif [ "$CURRENT_PROVIDER" = "opencode" ]; then
+      echo "unalias -- ${fn_name} 2>/dev/null || true"
+      echo "function ${fn_name} { ( $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND \"\$@\" ); }"
     else
-      echo "${fn_name}() { ( $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND${extra_args} \"\$@\" ); }"
+      echo "unalias -- ${fn_name} 2>/dev/null || true"
+      echo "function ${fn_name} { ( env -u ANTHROPIC_BASE_URL -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND${extra_args} \"\$@\" ); }"
     fi
   done
 }
@@ -2423,7 +2637,7 @@ accounts untouched in >30d / >90d).
 EOF
         return 0
         ;;
-      *) die "Unknown doctor flag '$1'. Try 'hats doctor --help'." ;;
+      *) die "Unknown doctor flag '$1'. Try '$(_hats_cmd_prefix) doctor --help'." ;;
     esac
     shift || true
   done
@@ -2643,7 +2857,9 @@ for event_name, event_items in (d.get("hooks") or {}).items():
 
     # 4a. Primary auth file presence + permissions.
     local auth_file="$acct_dir/$PRIMARY_AUTH_FILE"
-    if [ "$CURRENT_PROVIDER" = "claude" ] && [ "$name" = "$HATS_KIMI_ACCOUNT_NAME" ]; then
+    if [ -z "$PRIMARY_AUTH_FILE" ]; then
+      echo "    OK   no provider-owned auth file expected"
+    elif [ "$CURRENT_PROVIDER" = "claude" ] && [ "$name" = "$HATS_KIMI_ACCOUNT_NAME" ]; then
       # Kimi-on-Claude is API-key-backed and intentionally has no
       # .credentials.json. The real auth path is verified by `hats kimi doctor`.
       echo "    OK   Kimi API-key account — no $PRIMARY_AUTH_FILE expected"
@@ -2769,8 +2985,9 @@ _hats_completion() {
     cword=$COMP_CWORD
   }
 
-  local providers="claude codex"
+  local providers="claude codex kimi opencode"
   local cmds="init add remove rm rename mv list ls swap flip default link unlink status shell-init fix doctor completion providers audit export import rotation version help"
+  local global_cmds="flip completion providers audit rotation version help"
   local first="${words[1]:-}"
   local second="${words[2]:-}"
 
@@ -2782,9 +2999,10 @@ _hats_completion() {
   fi
   local cmd="${words[$cmd_idx]:-}"
 
-  # Position 1: providers + commands (commands repeated for backward-compat).
+  # Position 1: providers + global commands. Provider-scoped account/session
+  # commands are offered only after an explicit provider.
   if [ "$cword" -eq 1 ]; then
-    COMPREPLY=( $(compgen -W "$providers $cmds" -- "$cur") )
+    COMPREPLY=( $(compgen -W "$providers $global_cmds" -- "$cur") )
     return
   fi
 
@@ -2812,7 +3030,7 @@ _hats_completion() {
       ;;
     flip)
       if [ "$prev" = "--to" ]; then
-        COMPREPLY=( $(compgen -W "claude-code codex claude-via-kimi-anthropic" -- "$cur") )
+        COMPREPLY=( $(compgen -W "claude-code codex claude-via-kimi-anthropic opencode" -- "$cur") )
       else
         COMPREPLY=( $(compgen -W "--to --reason --dry-run --help" -- "$cur") )
       fi
@@ -2844,8 +3062,17 @@ _print_zsh_completion() {
 # hats — zsh tab completion
 # Emitted by `hats completion zsh`. Source via `eval "$(hats completion zsh)"`.
 _hats() {
-  local -a cmds providers
-  providers=(claude codex)
+  local -a cmds providers global_cmds
+  providers=(claude codex kimi opencode)
+  global_cmds=(
+    'flip:Cross-harness credential rotation for mesh agents'
+    'completion:Emit shell-completion script (bash|zsh)'
+    'providers:Show supported providers'
+    'audit:Read the hats audit log (opt-in via HATS_AUDIT=1)'
+    'rotation:Credential rotation governance (status|log|rollback)'
+    'version:Show version'
+    'help:Show help'
+  )
   cmds=(
     'init:Initialize hats for the active provider'
     'add:Create a new account'
@@ -2887,7 +3114,7 @@ _hats() {
 
   case $state in
     first)
-      _describe 'hats commands' cmds
+      _describe 'global commands' global_cmds
       _values 'provider' ${providers[@]}
       ;;
     second)
@@ -2922,14 +3149,14 @@ _hats_complete_arg() {
       # `--provider <name>` takes an arg; offer provider names when that flag
       # was the previous word, otherwise offer the flag set itself.
       if [[ "$words[CURRENT-1]" == "--provider" ]]; then
-        local -a provs; provs=(claude codex)
+        local -a provs; provs=(claude codex kimi opencode)
         _describe 'provider' provs
       else
         local -a list_flags
         list_flags=(
           '--rc-only:Filter to remote-control-scoped tokens'
           '--expired:Filter to past-expiry tokens'
-          '--provider:Override the provider (claude|codex)'
+          '--provider:Override the provider (claude|codex|kimi|opencode)'
           '--help:Show list-flag reference'
         )
         _describe 'list flag' list_flags
@@ -2945,12 +3172,12 @@ _hats_complete_arg() {
       ;;
     flip)
       if [[ "$words[CURRENT-1]" == "--to" ]]; then
-        local -a harnesses; harnesses=(claude-code codex claude-via-kimi-anthropic)
+        local -a harnesses; harnesses=(claude-code codex claude-via-kimi-anthropic opencode)
         _describe 'harness' harnesses
       else
         local -a flip_flags
         flip_flags=(
-          '--to:Target harness (claude-code|codex|claude-via-kimi-anthropic)'
+          '--to:Target harness (claude-code|codex|claude-via-kimi-anthropic|opencode)'
           '--reason:Human-readable rotation reason'
           '--dry-run:Preview without executing'
           '--help:Show flip help'
@@ -3028,7 +3255,7 @@ _build_export_manifest() {
   local name="$1" acct_dir="$2" include_sessions="$3"
   local -a isolated=()
   local f
-  for f in .credentials.json .oauth-token .claude.json auth.json config.toml; do
+  for f in .credentials.json .oauth-token .claude.json auth.json config.toml opencode.json opencode.jsonc; do
     [ -e "$acct_dir/$f" ] && [ ! -L "$acct_dir/$f" ] && isolated+=("$f")
   done
   [ "$include_sessions" = "1" ] && [ -d "$acct_dir/sessions" ] && isolated+=("sessions")
@@ -3093,7 +3320,7 @@ cmd_export() {
   _build_export_manifest "$name" "$acct_dir" "$include_sessions" > "$stage/MANIFEST.json"
 
   local f
-  for f in .credentials.json .oauth-token .claude.json auth.json config.toml; do
+  for f in .credentials.json .oauth-token .claude.json auth.json config.toml opencode.json opencode.jsonc; do
     [ -e "$acct_dir/$f" ] && [ ! -L "$acct_dir/$f" ] && cp -p "$acct_dir/$f" "$stage/$f"
   done
   if [ "$include_sessions" = "1" ] && [ -d "$acct_dir/sessions" ]; then
@@ -3196,7 +3423,7 @@ _validate_archive_entries() {
   while IFS= read -r line; do
     case "$line" in
       /*|*..*|*$'\n'*) echo "rejected archive entry: $line" >&2; bad=1 ;;
-      MANIFEST.json|.credentials.json|.oauth-token|.claude.json|auth.json|config.toml) echo "$line" ;;
+      MANIFEST.json|.credentials.json|.oauth-token|.claude.json|auth.json|config.toml|opencode.json|opencode.jsonc) echo "$line" ;;
       sessions/*)      echo "$line" ;;
       *)               echo "rejected unexpected archive entry: $line" >&2; bad=1 ;;
     esac
@@ -3334,7 +3561,7 @@ PYEOF
   # Copy staged files into the account dir. Preserve mode 600 for credential
   # files since tar --no-same-permissions stripped it.
   local f
-  for f in .credentials.json .oauth-token .claude.json auth.json config.toml; do
+  for f in .credentials.json .oauth-token .claude.json auth.json config.toml opencode.json opencode.jsonc; do
     if [ -e "$stage/extracted/$f" ]; then
       cp -p "$stage/extracted/$f" "$target_dir/$f"
       case "$f" in
@@ -3375,6 +3602,12 @@ _verify_one_account() {
   local marker=" "
   [ "$name" = "$default" ] && marker="*"
   echo "  $marker $name"
+
+  if [ -z "$PRIMARY_AUTH_FILE" ]; then
+    echo "    PASS no provider-owned credential file expected"
+    echo "    PASS $RUNTIME_ENV_VAR=$acct_dir"
+    return
+  fi
 
   if [ ! -f "$cfile" ]; then
     echo "    FAIL credentials file missing: $(basename "$cfile")"
@@ -3887,7 +4120,7 @@ _seed_kimi_claude_config_from_donor() {
   # Idempotent: each field copied ONLY when target is missing or empty.
   # Existing operator-customized values preserved. Errs if NO donor has an
   # oauthAccount and target also lacks one (operator has never logged into
-  # any Anthropic account via hats — they must `hats add <name>` first).
+  # any Anthropic account via hats — they must `hats claude add <name>` first).
   local acct_dir="$1"
   local key="${2:-}"
   local target="$acct_dir/.claude.json"
@@ -3972,7 +4205,7 @@ for dp in donors:
 if donor_d is None and not is_populated(d.get("oauthAccount")):
     sys.stderr.write(
         "kimi: no OAuth'd claude cred available to seed donor fields for "
-        + target + ". Log into any Anthropic account first via 'hats add <name>'.\n"
+        + target + ". Log into any Anthropic account first via 'hats claude add <name>'.\n"
     )
     sys.exit(1)
 
@@ -4020,6 +4253,10 @@ _ensure_kimi_onboarding_flag_claude() {
   # Backwards-compat shim: delegate to _seed_kimi_claude_config_from_donor.
   # The consolidated helper supersedes the old single-purpose shape.
   _seed_kimi_claude_config_from_donor "$@"
+}
+
+_ensure_kimi_onboarding_flag_kimi() {
+  _ensure_kimi_onboarding_flag_claude "$@"
 }
 
 _ensure_kimi_onboarding_flag_codex() {
@@ -4202,7 +4439,7 @@ _ensure_kimi_account_dir_claude() {
   local acct_dir
   acct_dir=$(_account_dir "$HATS_KIMI_ACCOUNT_NAME")
   if [ ! -d "$acct_dir" ]; then
-    [ -d "$PROVIDER_DIR" ] || die "hats not initialized. Run 'hats init' first."
+    [ -d "$PROVIDER_DIR" ] || die "hats not initialized. Run 'hats claude init' first."
     mkdir -p "$acct_dir"
     echo '{}' > "$acct_dir/.claude.json"
     _setup_account_dir "$HATS_KIMI_ACCOUNT_NAME"
@@ -4210,7 +4447,11 @@ _ensure_kimi_account_dir_claude() {
   fi
   # Always (re-)ensure the OAuth-bypass flag is set, even when the acct_dir
   # pre-existed — upgrades from pre-fix hats need the flag too.
-  _ensure_kimi_onboarding_flag_claude "$acct_dir"
+  _ensure_kimi_onboarding_flag_claude "$acct_dir" || true
+}
+
+_ensure_kimi_account_dir_kimi() {
+  _ensure_kimi_account_dir_claude "$@"
 }
 
 _ensure_kimi_account_dir_codex() {
@@ -4323,7 +4564,7 @@ Subcommands:
   doctor      Verify Infisical fetch, endpoint reachability, env-isolation.
   fetch-key   Fetch + print a key-prefix summary (no secret leaked).
 
-The 'kimi' shell function (emitted by 'hats shell-init') inlines
+The 'kimi' shell function (emitted by 'hats kimi shell-init') inlines
 ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY + CLAUDE_CONFIG_DIR on the
 \`claude --dangerously-skip-permissions\` invocation — env vars never
 leak to the parent shell or subsequent sessions.
@@ -4417,6 +4658,10 @@ _kimi_doctor_endpoint_claude() {
   esac
 }
 
+_kimi_doctor_endpoint_kimi() {
+  _kimi_doctor_endpoint_claude "$@"
+}
+
 _kimi_doctor_endpoint_codex() {
   # HEAD on the OpenAI-compatible base URL. Kimi's coding-agent host
   # answers /chat/completions; without auth it returns 401/404 which
@@ -4448,6 +4693,10 @@ _kimi_doctor_env_isolation_claude() {
   return 1
 }
 
+_kimi_doctor_env_isolation_kimi() {
+  _kimi_doctor_env_isolation_claude "$@"
+}
+
 _kimi_doctor_env_isolation_codex() {
   # OPENAI_BASE_URL is NOT honored by codex (documented variance) so its
   # presence in the parent shell is harmless for codex-kimi — but a leaked
@@ -4475,6 +4724,10 @@ _kimi_doctor_onboarding_bypass_claude() {
   fi
   echo "  FAIL hasCompletedOnboarding flag missing in $_flag_file — OAuth wall will fire. Run 'hats kimi init'."
   return 1
+}
+
+_kimi_doctor_onboarding_bypass_kimi() {
+  _kimi_doctor_onboarding_bypass_claude "$@"
 }
 
 _kimi_doctor_onboarding_bypass_codex() {
@@ -4575,6 +4828,10 @@ PY
   esac
 }
 
+_kimi_doctor_apikey_approved_kimi() {
+  _kimi_doctor_apikey_approved_claude "$@"
+}
+
 _kimi_doctor_apikey_approved_codex() {
   # B-11/A-28 variance: codex api_key auth has no interactive prompt.
   :
@@ -4602,6 +4859,10 @@ sys.exit(0 if isinstance(oa, dict) and oa else 1)
   fi
   echo "  FAIL oauthAccount stanza missing in $_flag_file — interactive 'kimi' will show 'Not logged in'. Run 'hats kimi init'."
   return 1
+}
+
+_kimi_doctor_oauth_stanza_kimi() {
+  _kimi_doctor_oauth_stanza_claude "$@"
 }
 
 _kimi_doctor_oauth_stanza_codex() {
@@ -4642,6 +4903,10 @@ PY
   esac
 }
 
+_kimi_doctor_mcp_servers_kimi() {
+  _kimi_doctor_mcp_servers_claude "$@"
+}
+
 _kimi_doctor_mcp_servers_codex() {
   # B-11/A-28 variance: codex's MCP servers live in ~/.codex/config.toml
   # globally, not per-account; hats-codex-engineer's canary confirmed
@@ -4653,8 +4918,10 @@ _kimi_doctor_mcp_servers() { _call_provider_variant kimi_doctor_mcp_servers "$@"
 
 cmd_providers() {
   echo "Supported providers:"
-  echo "  claude"
-  echo "  codex"
+  echo "  claude     Claude Code (CLAUDE_CONFIG_DIR)"
+  echo "  codex      Codex CLI (CODEX_HOME)"
+  echo "  kimi       Kimi via Claude Code Anthropic-compatible endpoint"
+  echo "  opencode   OpenCode (OPENCODE_CONFIG_DIR)"
   echo ""
   echo "Default provider: $(_default_provider)"
 }
@@ -4748,18 +5015,20 @@ cmd_version() {
 
 cmd_help() {
   cat <<EOF
-hats $VERSION — Switch between coding-agent accounts (Claude Code, Codex, Kimi)
+hats $VERSION — Switch between coding-agent accounts (Claude Code, Codex, Kimi, OpenCode)
 
 Usage:
-  hats <command> [args]              # Claude Code (unprefixed default — backcompat, NOT priority)
   hats <provider> <command> [args]   # Provider-specific mode
-  hats <backend> <command> [args]    # Backend-alias (kimi) on the default provider
   hats <provider> <backend> <cmd>    # Backend-alias on a specific provider (e.g. 'hats codex kimi')
+  hats <global-command> [args]       # help, providers, completion, audit, rotation, version
 
-Providers + backends (all first-class per README harness matrix):
+Providers (first-class dispatch):
   claude      Claude Code — CLAUDE_CONFIG_DIR isolation
   codex       Codex CLI   — CODEX_HOME isolation
-  kimi        Kimi (Moonshot) Anthropic-compat via claude-code — 'hats kimi'
+  kimi        Kimi (Moonshot) Anthropic-compat via claude-code
+  opencode   OpenCode — OPENCODE_CONFIG_DIR isolation
+
+Backend compatibility path:
   codex kimi  Kimi OpenAI-compat via codex — 'hats codex kimi' (currently DISABLED,
               see docs/codex-kimi-compat.md for wire_api incompat + LiteLLM workaround)
 
@@ -4770,7 +5039,7 @@ Account Management:
   rename <old> <new>   Rename an account
   default [name]       Get or set the default account
   list [flags]         Show all accounts and auth status
-                       Flags: --rc-only --expired --provider <claude|codex>
+                       Flags: --rc-only --expired --provider <provider>
 
 Session Management:
   swap <name> [args]   Run the provider CLI with the account's isolated home
@@ -4779,7 +5048,7 @@ Rotation (credential governance):
   flip <agent> --to <h>
                        Cross-harness credential rotation for mesh agents.
                        --to <harness>  Target: claude-code | codex |
-                                       claude-via-kimi-anthropic
+                                       claude-via-kimi-anthropic | opencode
                        --reason <text> Rotation reason (logged)
                        --dry-run       Preview without executing
                        Trust-tier enforcement: ops agents cannot flip to
@@ -4816,7 +5085,7 @@ Portability:
 Backends:
   kimi <subcmd>        Kimi (Moonshot) Anthropic-compatible endpoint.
                        Subcommands: init | doctor | fetch-key.
-                       Shell function (from 'hats shell-init') inlines
+                       Shell function (from 'hats kimi shell-init') inlines
                        ANTHROPIC_BASE_URL + API key — env never leaks.
   codex kimi <subcmd>  Kimi OpenAI-compatible endpoint for codex.
                        Base URL lives in config.toml (codex ignores
@@ -4829,10 +5098,10 @@ Backends:
 
 Examples:
   # Claude Code
-  hats init
-  hats add work
-  hats rename work personal
-  hats swap work -- --model opus
+  hats claude init
+  hats claude add work
+  hats claude rename work personal
+  hats claude swap work -- --model opus
 
   # Codex
   hats codex init
@@ -4841,10 +5110,16 @@ Examples:
   hats codex add remote --device-auth
   hats codex swap personal -- exec "summarize this repo"
 
-  # Kimi (claude-code, Anthropic-compat)
+  # Kimi (first-class provider, Claude Code Anthropic-compat)
   hats kimi init
   hats kimi doctor
-  eval "\$(hats shell-init)" && kimi "summarize this repo"
+  hats kimi swap -- "summarize this repo"
+  eval "\$(hats kimi shell-init)" && kimi "summarize this repo"
+
+  # OpenCode
+  hats opencode init
+  hats opencode add personal
+  hats opencode swap personal -- run "summarize this repo"
 
   # Kimi (codex, OpenAI-compat — currently DISABLED, see docs/codex-kimi-compat.md)
   hats codex kimi init
@@ -4855,8 +5130,11 @@ Directory Structure:
   ~/.hats/claude/<name>/   Per-account Claude config directory
   ~/.hats/codex/base/      Shared Codex resources
   ~/.hats/codex/<name>/    Per-account Codex home directory
+  ~/.hats/opencode/base/   Shared OpenCode resources
+  ~/.hats/opencode/<name>/ Per-account OpenCode config directory
   ~/.claude                Symlink to default Claude account
   ~/.codex                 Symlink to default Codex account
+  ~/.config/opencode       Symlink to default OpenCode account
 
 Environment Variables:
   HATS_DIR             Hats root directory (default: ~/.hats)
@@ -4890,36 +5168,46 @@ set -- "${args[@]+"${args[@]}"}"
 export HATS_NO_COLOR
 
 provider_candidate="${1:-}"
+provider_explicit=0
 if _is_supported_provider "$provider_candidate"; then
   _configure_provider "$provider_candidate"
+  provider_explicit=1
   shift
 else
   _configure_provider "claude"
 fi
 
+_require_provider_prefix() {
+  [ "$provider_explicit" -eq 1 ] && return 0
+  local cmd="${1:-command}"
+  die "Provider required for '$cmd'. Use 'hats claude $cmd', 'hats codex $cmd', 'hats kimi $cmd', or 'hats opencode $cmd'."
+}
+
 case "${1:-}" in
-  init)             cmd_init ;;
-  add)              shift; cmd_add "$@" ;;
-  remove|rm)        cmd_remove "${2:-}" ;;
-  rename|mv)        cmd_rename "${2:-}" "${3:-}" ;;
-  list|ls)          shift; cmd_list "$@" ;;
-  swap)             shift; cmd_swap "$@" ;;
+  init)             _require_provider_prefix init; cmd_init ;;
+  add)              _require_provider_prefix add; shift; cmd_add "$@" ;;
+  remove|rm)        _require_provider_prefix "${1:-remove}"; cmd_remove "${2:-}" ;;
+  rename|mv)        _require_provider_prefix "${1:-rename}"; cmd_rename "${2:-}" "${3:-}" ;;
+  list|ls)          _require_provider_prefix "${1:-list}"; shift; cmd_list "$@" ;;
+  swap)             _require_provider_prefix swap; shift; cmd_swap "$@" ;;
   flip)             shift; cmd_flip "$@" ;;
-  default)          cmd_default "${2:-}" ;;
-  link)             cmd_link "${2:-}" "${3:-}" ;;
-  unlink)           cmd_unlink "${2:-}" "${3:-}" ;;
-  status)           cmd_status "${2:-}" ;;
-  shell-init)       shift; cmd_shell_init "$@" ;;
-  fix)              cmd_fix | _colorize_stream; exit "${PIPESTATUS[0]}" ;;
-  doctor)           shift; cmd_doctor "$@" | _colorize_stream; exit "${PIPESTATUS[0]}" ;;
-  verify)           shift; cmd_verify "$@" | _colorize_stream; exit "${PIPESTATUS[0]}" ;;
+  default)          _require_provider_prefix default; cmd_default "${2:-}" ;;
+  link)             _require_provider_prefix link; cmd_link "${2:-}" "${3:-}" ;;
+  unlink)           _require_provider_prefix unlink; cmd_unlink "${2:-}" "${3:-}" ;;
+  status)           _require_provider_prefix status; cmd_status "${2:-}" ;;
+  shell-init)       _require_provider_prefix shell-init; shift; cmd_shell_init "$@" ;;
+  fix)              _require_provider_prefix fix; cmd_fix | _colorize_stream; exit "${PIPESTATUS[0]}" ;;
+  doctor)           _require_provider_prefix doctor; shift; if [ "$CURRENT_PROVIDER" = "kimi" ]; then cmd_kimi_doctor "$@" | _colorize_stream; else cmd_doctor "$@" | _colorize_stream; fi; exit "${PIPESTATUS[0]}" ;;
+  verify)           _require_provider_prefix verify; shift; cmd_verify "$@" | _colorize_stream; exit "${PIPESTATUS[0]}" ;;
   completion)       cmd_completion "${2:-}" ;;
   providers)        cmd_providers ;;
   audit)            shift; cmd_audit "$@" ;;
-  export)           shift; cmd_export "$@" ;;
-  import)           shift; cmd_import "$@" ;;
+  export)           _require_provider_prefix export; shift; cmd_export "$@" ;;
+  import)           _require_provider_prefix import; shift; cmd_import "$@" ;;
   rotation)         shift; cmd_rotation "$@" ;;
-  kimi)             shift; cmd_kimi "$@" ;;
+  fetch-key)        _require_provider_prefix fetch-key; shift; [ "$CURRENT_PROVIDER" = "kimi" ] || die "fetch-key is only supported for hats kimi"; cmd_kimi fetch-key "$@" ;;
+  _approve_key)     _require_provider_prefix _approve_key; shift; [ "$CURRENT_PROVIDER" = "kimi" ] || die "_approve_key is only supported for hats kimi"; _configure_provider "claude"; cmd_kimi _approve_key "$@" ;;
+  kimi)             _require_provider_prefix kimi; shift; cmd_kimi "$@" ;;
   version|-v|--version) cmd_version ;;
   help|-h|--help|"") cmd_help ;;
   *)
