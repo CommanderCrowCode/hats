@@ -34,28 +34,29 @@ hats claude add personal
 # Set your default (bare `claude` runs as this account)
 hats claude default work
 
-# Use it
-hats claude swap personal              # starts claude as "personal"
-hats claude swap work -- --model opus  # pass flags to claude
+# Use it (universal — provider resolved automatically from account name)
+hats swap personal              # starts the provider for "personal"
+hats swap work -- --model opus  # pass flags to the provider
 
-# Or add shell functions to your .zshrc/.bashrc
-eval "$(hats claude shell-init)"
+# Or add shell functions to your .zshrc/.bashrc (all providers at once)
+eval "$(hats shell-init)"
 personal                        # just type the account name
 work --model opus               # with arguments
+codex_work
+opencode_work
+
+# Provider-specific commands still work when you need them
+hats claude swap personal
+hats codex swap work
+hats opencode swap work
 
 # Codex support
 hats codex init
 hats codex add work
-hats codex swap work
-eval "$(hats codex shell-init)"
-codex_work
 
 # OpenCode support
 hats opencode init
 hats opencode add work
-hats opencode swap work
-eval "$(hats opencode shell-init)"
-opencode_work
 ```
 
 ## Install
@@ -225,20 +226,17 @@ hats <provider> status [account]
 ### Shell Integration
 
 ```bash
-# Claude functions:
+# All providers at once (default yolo/skip-permissions mode):
+eval "$(hats shell-init)"
+
+# Provider-specific when you need selective emission:
 eval "$(hats claude shell-init)"
-
-# Codex functions:
 eval "$(hats codex shell-init)"
-
-# Kimi function:
 eval "$(hats kimi shell-init)"
-
-# OpenCode functions:
 eval "$(hats opencode shell-init)"
 
-# With auto-skip permissions:
-eval "$(hats claude shell-init --skip-permissions)"
+# Opt out of skip-permissions for one emission:
+eval "$(hats shell-init --no-skip-permissions)"
 ```
 
 This generates a function for each account. Claude accounts keep the bare namespace (`work`, `personal`) for backcompat. Other providers are prefixed (`codex_work`, `opencode_work`) to avoid collisions, and Kimi emits the fixed `kimi` function.
@@ -393,6 +391,12 @@ When any filter is active, the summary line reports `X of Y account(s) matched`.
 | `HATS_NO_COLOR` | `0` | Same as `NO_COLOR`, hats-scoped alias |
 | `HATS_AUDIT` | `0` | Set to `1` to enable the audit log (off by default) |
 | `HATS_AUDIT_LOG` | `$HATS_DIR/audit.log` | Override the audit-log path |
+| `HATS_NO_SKIP_PERMISSIONS` | `0` | Set to `1` to opt OUT of the default yolo/skip-permissions mode |
+
+**Yolo mode is the default.** `hats swap` and `hats shell-init` automatically inject
+skip-permissions flags for every provider that supports them. To opt out, either:
+- Set `HATS_NO_SKIP_PERMISSIONS=1` for a one-off session, or
+- Add `skip_permissions = "false"` to `~/.hats/config.toml` under `[hats]` to disable globally.
 
 ### File Layout
 

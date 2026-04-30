@@ -376,6 +376,23 @@ _migrate_legacy_default() {
   _sed_i '/^default[[:space:]]*=/d' "$HATS_CONFIG"
 }
 
+_should_skip_permissions() {
+  [ "${HATS_NO_SKIP_PERMISSIONS:-0}" = "1" ] && return 1
+  local val
+  val=$(_config_get "skip_permissions")
+  [ "$val" = "false" ] && return 1
+  return 0
+}
+
+_skip_permissions_flag() {
+  case "$CURRENT_PROVIDER" in
+    claude) echo "--dangerously-skip-permissions" ;;
+    codex)  echo "--yolo" ;;
+    kimi|opencode) echo "--dangerously-skip-permissions" ;;
+    *) echo "" ;;
+  esac
+}
+
 _default_provider() {
   local val
   val=$(_config_get "default_provider")
@@ -455,6 +472,175 @@ _set_default() {
   _config_set "default_provider" "$CURRENT_PROVIDER"
   _config_set "$DEFAULT_KEY" "$name"
   _sync_runtime_symlink "$name"
+}
+
+_account_registry_path() {
+  echo "$HATS_DIR/accounts.json"
+}
+
+_ensure_account_registry() {
+  local reg="$(_account_registry_path)"
+  [ -f "$reg" ] || echo '{}' > "$reg"
+  python3 - "$HATS_DIR" "$reg" <<'PYEOF'
+import json, os, sys
+hats_dir, reg_path = sys.argv[1], sys.argv[2]
+try:
+    with open(reg_path) as f:
+        registry = json.load(f)
+except Exception:
+    registry = {}
+
+collisions = []
+changed = False
+
+for provider in ("claude", "codex", "opencode"):
+    pdir = os.path.join(hats_dir, provider)
+    if not os.path.isdir(pdir):
+        continue
+    for name in os.listdir(pdir):
+        path = os.path.join(pdir, name)
+        if not os.path.isdir(path) or name == "base":
+            continue
+        # The 'kimi' directory under claude/ belongs to the kimi provider,
+        # not claude. Skip it here so the kimi special case below handles it.
+        if provider == "claude" and name == "kimi":
+            continue
+        # The 'kimi' directory under codex/ is the codex-kimi backend,
+        # not a regular codex account. Skip it to avoid colliding with
+        # the kimi provider's fixed 'kimi' account.
+        if provider == "codex" and name == "kimi":
+            continue
+        if name in registry:
+            if registry[name] != provider:
+                collisions.append(f"  '{name}' found under both {registry[name]} and {provider}")
+        else:
+            registry[name] = provider
+            changed = True
+
+# Kimi special case
+kimi_dir = os.path.join(hats_dir, "claude", "kimi")
+if os.path.isdir(kimi_dir):
+    if "kimi" in registry and registry["kimi"] != "kimi":
+        collisions.append(f"  'kimi' found under both {registry['kimi']} and kimi")
+    elif "kimi" not in registry:
+        registry["kimi"] = "kimi"
+        changed = True
+
+if collisions:
+    print("ERROR: Account name collisions detected. Account names must be unique across all providers.", file=sys.stderr)
+    print("Please rename one of each conflicting pair before continuing:", file=sys.stderr)
+    for c in collisions:
+        print(c, file=sys.stderr)
+    sys.exit(1)
+
+if changed:
+    with open(reg_path, "w") as f:
+        json.dump(registry, f, indent=2, sort_keys=True)
+        f.write("\n")
+PYEOF
+}
+
+_account_provider_from_registry() {
+  local name="$1"
+  _ensure_account_registry
+  local provider
+  provider=$(python3 - "$(_account_registry_path)" "$name" "$HATS_DIR" <<'PYEOF'
+import json, os, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    name = sys.argv[2]
+    hats_dir = sys.argv[3]
+    provider = d.get(name, "")
+    if provider:
+        pdir = os.path.join(hats_dir, provider)
+        if provider == "kimi":
+            pdir = os.path.join(hats_dir, "claude")
+        if not os.path.isdir(os.path.join(pdir, name)):
+            provider = ""
+    print(provider)
+except Exception:
+    print("")
+PYEOF
+)
+  echo "$provider"
+}
+
+_resolve_account_provider() {
+  local name="$1"
+  local provider
+  provider=$(_account_provider_from_registry "$name")
+  [ -n "$provider" ] || die "Account '$name' not found."
+  echo "$provider"
+}
+
+_register_account() {
+  local name="$1" provider="$2"
+  _ensure_account_registry
+  python3 - "$(_account_registry_path)" "$name" "$provider" <<'PYEOF'
+import json, sys
+path, name, provider = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+data[name] = provider
+with open(path, "w") as f:
+    json.dump(data, f, indent=2, sort_keys=True)
+    f.write("\n")
+PYEOF
+}
+
+_deregister_account() {
+  local name="$1"
+  _ensure_account_registry
+  python3 - "$(_account_registry_path)" "$name" <<'PYEOF'
+import json, sys
+path, name = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+data.pop(name, None)
+with open(path, "w") as f:
+    json.dump(data, f, indent=2, sort_keys=True)
+    f.write("\n")
+PYEOF
+}
+
+_accounts_for_provider() {
+  local provider="${1:-$CURRENT_PROVIDER}"
+  _ensure_account_registry
+  python3 - "$(_account_registry_path)" "$provider" "$HATS_DIR" <<'PYEOF'
+import json, os, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    provider = sys.argv[2]
+    hats_dir = sys.argv[3]
+    for name in sorted(d.keys()):
+        if d[name] == provider:
+            pdir = os.path.join(hats_dir, provider)
+            if provider == "kimi":
+                pdir = os.path.join(hats_dir, "claude")
+            if os.path.isdir(os.path.join(pdir, name)):
+                print(name)
+except Exception:
+    pass
+PYEOF
+}
+
+_all_registered_accounts() {
+  _ensure_account_registry
+  python3 - "$(_account_registry_path)" <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    for name in sorted(d.keys()):
+        print(name)
+except Exception:
+    pass
+PYEOF
 }
 
 _ensure_codex_base_config() {
@@ -1222,6 +1408,10 @@ _run_provider_login() {
 
 _run_provider_command_claude() {
   local acct_dir="$1"; shift
+  local _skip_args=()
+  if _should_skip_permissions; then
+    _skip_args=(--dangerously-skip-permissions)
+  fi
   if _claude_uses_oauth_token_file; then
     local token_file="$acct_dir/$PRIMARY_AUTH_FILE"
     [ -f "$token_file" ] || die "Account '$(basename "$acct_dir")' has no token file. $(_provider_add_failure_hint "$(basename "$acct_dir")")"
@@ -1229,17 +1419,21 @@ _run_provider_command_claude() {
     token=$(cat "$token_file" 2>/dev/null || true)
     [ -n "$token" ] || die "Account '$(basename "$acct_dir")' has an empty token file. Re-run: $(_provider_add_failure_hint "$(basename "$acct_dir")")"
     env -u ANTHROPIC_BASE_URL -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
-      CLAUDE_CODE_OAUTH_TOKEN="$token" CLAUDE_CONFIG_DIR="$acct_dir" claude "$@"
+      CLAUDE_CODE_OAUTH_TOKEN="$token" CLAUDE_CONFIG_DIR="$acct_dir" claude "${_skip_args[@]}" "$@"
     return
   fi
   env -u ANTHROPIC_BASE_URL -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
-    CLAUDE_CONFIG_DIR="$acct_dir" claude "$@"
+    CLAUDE_CONFIG_DIR="$acct_dir" claude "${_skip_args[@]}" "$@"
 }
 
 _run_provider_command_codex() {
   local acct_dir="$1"; shift
+  local _skip_args=()
+  if _should_skip_permissions; then
+    _skip_args=(--yolo)
+  fi
   env -u OPENAI_API_KEY -u CODEX_API_KEY \
-    CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' "$@"
+    CODEX_HOME="$acct_dir" codex -c 'cli_auth_credentials_store="file"' "${_skip_args[@]}" "$@"
 }
 
 _run_provider_command_kimi() {
@@ -1261,7 +1455,11 @@ _run_provider_command_kimi() {
 
 _run_provider_command_opencode() {
   local acct_dir="$1"; shift
-  OPENCODE_CONFIG_DIR="$acct_dir" opencode "$@"
+  local _skip_args=()
+  if _should_skip_permissions; then
+    _skip_args=(--dangerously-skip-permissions)
+  fi
+  OPENCODE_CONFIG_DIR="$acct_dir" opencode "${_skip_args[@]}" "$@"
 }
 
 _run_provider_command() {
@@ -1558,7 +1756,12 @@ cmd_add() {
 
   _validate_name "$name"
   [ -d "$PROVIDER_DIR" ] || die "hats not initialized for $CURRENT_PROVIDER. Run '$(_hats_cmd_prefix) init'."
-  _account_exists "$name" && die "Account '$name' already exists."
+  _account_exists "$name" && die "Account '$name' already exists under $CURRENT_PROVIDER."
+  local existing_provider
+  existing_provider=$(_account_provider_from_registry "$name")
+  if [ -n "$existing_provider" ]; then
+    die "Account '$name' already exists under $existing_provider. Account names must be unique across all providers."
+  fi
 
   local acct_dir
   acct_dir=$(_account_dir "$name")
@@ -1573,12 +1776,14 @@ cmd_add() {
   _run_provider_login "$acct_dir" "$auth_mode" "$name"
 
   if [ -z "$PRIMARY_AUTH_FILE" ]; then
+    _register_account "$name" "$CURRENT_PROVIDER"
     echo ""
     echo "Account '$name' added."
     _sync_new_account_defaults "$name"
     _show_account_status "$name" "$(_default_account)"
     _audit_log "add" "account" "$name"
   elif [ -f "$(_credential_file "$name")" ]; then
+    _register_account "$name" "$CURRENT_PROVIDER"
     chmod 600 "$(_credential_file "$name")" 2>/dev/null || true
     echo ""
     echo "Account '$name' added."
@@ -1610,6 +1815,7 @@ cmd_remove() {
   fi
 
   rm -rf "$(_account_dir "$name")"
+  _deregister_account "$name"
   echo "Account '$name' removed."
   _audit_log "remove" "account" "$name"
 
@@ -1631,10 +1837,17 @@ cmd_rename() {
 
   _account_exists "$old_name" || die "Account '$old_name' not found."
   _validate_name "$new_name"
-  _account_exists "$new_name" && die "Account '$new_name' already exists."
+  _account_exists "$new_name" && die "Account '$new_name' already exists under $CURRENT_PROVIDER."
+  local existing_provider
+  existing_provider=$(_account_provider_from_registry "$new_name")
+  if [ -n "$existing_provider" ]; then
+    die "Account '$new_name' already exists under $existing_provider. Account names must be unique across all providers."
+  fi
   [ "$old_name" = "$new_name" ] && die "Old and new account names must differ."
 
   mv "$(_account_dir "$old_name")" "$(_account_dir "$new_name")"
+  _deregister_account "$old_name"
+  _register_account "$new_name" "$CURRENT_PROVIDER"
   echo "Account '$old_name' renamed to '$new_name'."
   _audit_log "rename" "from" "$old_name" "to" "$new_name"
 
@@ -1779,6 +1992,17 @@ cmd_default() {
   echo "Default account set to '$name'."
   echo "$RUNTIME_DIR -> $PROVIDER_DIR/$name/"
   _audit_log "default" "account" "$name"
+}
+
+cmd_universal_swap() {
+  local name="${1:-}"
+  [ -z "$name" ] && die "Usage: hats swap <name> [-- args...]"
+  local provider
+  provider=$(_resolve_account_provider "$name") || exit 1
+  _configure_provider "$provider"
+  shift
+  [ "${1:-}" = "--" ] && shift
+  cmd_swap "$name" "$@"
 }
 
 cmd_swap() {
@@ -2418,20 +2642,37 @@ _rotation_rollback() {
   echo "  hats flip $agent_name --to $from_harness --reason \"rollback:$event_id\""
 }
 
+cmd_universal_shell_init() {
+  for provider in claude codex opencode kimi; do
+    local accounts
+    accounts=$(_accounts_for_provider "$provider")
+    [ -n "$accounts" ] || continue
+    _configure_provider "$provider"
+    cmd_shell_init "$@"
+  done
+}
+
 cmd_shell_init() {
   local extra_args=""
+  local skip_explicit=0
   local arg
   for arg in "$@"; do
     case "$arg" in
       --skip-permissions)
-        if [ "$CURRENT_PROVIDER" = "claude" ] || [ "$CURRENT_PROVIDER" = "kimi" ]; then
-          extra_args=" --dangerously-skip-permissions"
-        else
-          die "--skip-permissions is only supported for Claude Code shell shims."
-        fi
+        extra_args=" $(_skip_permissions_flag)"
+        skip_explicit=1
+        ;;
+      --no-skip-permissions)
+        extra_args=""
+        skip_explicit=1
         ;;
     esac
   done
+
+  # Default yolo: inject skip flag unless explicitly opted out.
+  if [ "$skip_explicit" -eq 0 ] && _should_skip_permissions; then
+    extra_args=" $(_skip_permissions_flag)"
+  fi
 
   cat <<HEADER
 # Generated by hats shell-init for $CURRENT_PROVIDER
@@ -2507,7 +2748,7 @@ function ${fn_name} {
 KIMICODEXFN
     elif [ "$CURRENT_PROVIDER" = "codex" ]; then
       echo "unalias -- ${fn_name} 2>/dev/null || true"
-      echo "function ${fn_name} { ( env -u OPENAI_API_KEY -u CODEX_API_KEY $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND -c 'cli_auth_credentials_store=\"file\"' \"\$@\" ); }"
+      echo "function ${fn_name} { ( env -u OPENAI_API_KEY -u CODEX_API_KEY $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND -c 'cli_auth_credentials_store=\"file\"'${extra_args} \"\$@\" ); }"
     elif { [ "$CURRENT_PROVIDER" = "claude" ] || [ "$CURRENT_PROVIDER" = "kimi" ]; } && [ "$name" = "$HATS_KIMI_ACCOUNT_NAME" ]; then
       # Kimi is API-key-backed, not OAuth — emit the specialized env-isolated
       # function instead of the generic CLAUDE_CONFIG_DIR-swap one-liner. The
@@ -2579,7 +2820,7 @@ function ${fn_name} {
 CLAUDEOAUTHFN
     elif [ "$CURRENT_PROVIDER" = "opencode" ]; then
       echo "unalias -- ${fn_name} 2>/dev/null || true"
-      echo "function ${fn_name} { ( $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND \"\$@\" ); }"
+      echo "function ${fn_name} { ( $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND${extra_args} \"\$@\" ); }"
     else
       echo "unalias -- ${fn_name} 2>/dev/null || true"
       echo "function ${fn_name} { ( env -u ANTHROPIC_BASE_URL -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN $RUNTIME_ENV_VAR=\"$acct_dir\" $RUNTIME_COMMAND${extra_args} \"\$@\" ); }"
@@ -3613,7 +3854,7 @@ cmd_import() {
   local decrypted="$stage/bundle.tar"
   local header
   header=$(head -c 64 "$in_file" 2>/dev/null || true)
-  if printf '%s' "$header" | grep -q 'age-encryption.org'; then
+  if printf '%s' "$header" | LC_ALL=C grep -q 'age-encryption.org'; then
     command -v age >/dev/null 2>&1 || die "archive is age-encrypted but 'age' is not on PATH."
     # age herestring + pipe collision is the same as in cmd_export — leave
     # age in interactive mode; no env-var path.
@@ -3622,7 +3863,7 @@ cmd_import() {
     fi
     age -d -o "$decrypted" "$in_file" \
       || die "age decryption failed"
-  elif printf '%s' "$header" | grep -q '^Salted__'; then
+  elif printf '%s' "$header" | LC_ALL=C grep -q '^Salted__'; then
     command -v openssl >/dev/null 2>&1 || die "archive is openssl-encrypted but 'openssl' is not on PATH."
     [ -n "${HATS_EXPORT_PASSWORD:-}" ] \
       || die "openssl-encrypted archive requires HATS_EXPORT_PASSWORD env var for decryption."
@@ -4160,7 +4401,7 @@ EOF
   fi
   if command -v "$RUNTIME_COMMAND" >/dev/null 2>&1; then
     local ver
-    ver=$("$RUNTIME_COMMAND" --version 2>/dev/null | head -1)
+    ver=$("$RUNTIME_COMMAND" --version 2>/dev/null | head -1) || true
     echo "  OK   $RUNTIME_COMMAND found${ver:+ ($ver)}"
   else
     echo "  WARN $RUNTIME_COMMAND not on PATH — accounts can't launch sessions"
@@ -5337,13 +5578,25 @@ case "${1:-}" in
   remove|rm)        _require_provider_prefix "${1:-remove}"; cmd_remove "${2:-}" ;;
   rename|mv)        _require_provider_prefix "${1:-rename}"; cmd_rename "${2:-}" "${3:-}" ;;
   list|ls)          _require_provider_prefix "${1:-list}"; shift; cmd_list "$@" ;;
-  swap)             _require_provider_prefix swap; shift; cmd_swap "$@" ;;
+  swap)
+    if [ "$provider_explicit" -eq 1 ]; then
+      shift; cmd_swap "$@"
+    else
+      shift; cmd_universal_swap "$@"
+    fi
+    ;;
   flip)             shift; cmd_flip "$@" ;;
   default)          _require_provider_prefix default; cmd_default "${2:-}" ;;
   link)             _require_provider_prefix link; cmd_link "${2:-}" "${3:-}" ;;
   unlink)           _require_provider_prefix unlink; cmd_unlink "${2:-}" "${3:-}" ;;
   status)           _require_provider_prefix status; cmd_status "${2:-}" ;;
-  shell-init)       _require_provider_prefix shell-init; shift; cmd_shell_init "$@" ;;
+  shell-init)
+    if [ "$provider_explicit" -eq 1 ]; then
+      shift; cmd_shell_init "$@"
+    else
+      cmd_universal_shell_init "$@"
+    fi
+    ;;
   fix)              _require_provider_prefix fix; cmd_fix | _colorize_stream; exit "${PIPESTATUS[0]}" ;;
   doctor)           _require_provider_prefix doctor; shift; if [ "$CURRENT_PROVIDER" = "kimi" ]; then cmd_kimi_doctor "$@" | _colorize_stream; else cmd_doctor "$@" | _colorize_stream; fi; exit "${PIPESTATUS[0]}" ;;
   verify)           _require_provider_prefix verify; shift; cmd_verify "$@" | _colorize_stream; exit "${PIPESTATUS[0]}" ;;

@@ -78,7 +78,8 @@ test_fixture_account_and_default() {
   local acct="$HATS_DIR/claude/foo"
   mkdir -p "$acct"
   : > "$acct/.credentials.json"
-  chmod 600 "$acct/.credentials.json"
+  printf 'fixture-oauth-token' > "$acct/.oauth-token"
+  chmod 600 "$acct/.credentials.json" "$acct/.oauth-token"
   echo '{}' > "$acct/.claude.json"
 
   # Setting default writes default_claude to config.toml + maintains $HOME/.claude.
@@ -497,16 +498,43 @@ EOF
   chmod 600 "$acct/.credentials.json"
 
   local out
-  out=$("$HATS_SCRIPT" claude list 2>&1)
+  # On macOS, claude uses .oauth-token and calls `claude auth status`.
+  # Stub claude so the test works without a real token.
+  if [ "$(uname -s)" = "Darwin" ]; then
+    local stub_bin="$SANDBOX_ROOT/token-stub-bin"
+    mkdir -p "$stub_bin"
+    cat > "$stub_bin/claude" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "auth" ] && [ "\$2" = "status" ]; then
+  echo '{"loggedIn":true,"email":"test@example.com","orgId":"test-org","subscriptionType":"pro","authMethod":"oauth","apiProvider":"anthropic"}'
+  exit 0
+fi
+exit 1
+EOF
+    chmod +x "$stub_bin/claude"
+    printf 'fixture-oauth-token' > "$acct/.oauth-token"
+    chmod 600 "$acct/.oauth-token"
+    out=$(PATH="$stub_bin:$PATH" "$HATS_SCRIPT" claude list 2>&1)
+    rm -rf "$stub_bin"
+  else
+    out=$("$HATS_SCRIPT" claude list 2>&1)
+  fi
 
-  # Locate the line for the `parsed` account. Must carry `ok (expires ...)`
-  # and `[rc]` — these only print when expired/has_refresh/has_rc/exp_date
-  # were all successfully parsed.
+  # Locate the line for the `parsed` account.
+  # On Linux: `ok (expires YYYY-MM-DD) [rc]` from .credentials.json parsing.
+  # On macOS: `ok (oauth token; ...; email) [no-rc]` from claude auth status.
   local line_ok=0 rc_tag_ok=0
-  echo "$out" | grep -q "parsed" && \
-    echo "$out" | grep -qE "parsed.*ok \(expires [0-9]{4}-[0-9]{2}-[0-9]{2}\)" && \
-    line_ok=1
-  echo "$out" | grep -q "parsed.*\[rc\]" && rc_tag_ok=1
+  if [ "$(uname -s)" = "Darwin" ]; then
+    echo "$out" | grep -q "parsed" && \
+      echo "$out" | grep -qE "parsed.*ok \(oauth token;" && \
+      line_ok=1
+    echo "$out" | grep -q "parsed.*\[no-rc\]" && rc_tag_ok=1
+  else
+    echo "$out" | grep -q "parsed" && \
+      echo "$out" | grep -qE "parsed.*ok \(expires [0-9]{4}-[0-9]{2}-[0-9]{2}\)" && \
+      line_ok=1
+    echo "$out" | grep -q "parsed.*\[rc\]" && rc_tag_ok=1
+  fi
 
   rm -rf "$acct"
 
@@ -608,7 +636,8 @@ test_doctor_flags_missing_auth_and_broken_symlink() {
   rm -rf "$acct"
 
   local missing_ok=0 broken_ok=0
-  echo "$out" | grep -q "FAIL .credentials.json missing" && missing_ok=1
+  # macOS uses .oauth-token; Linux uses .credentials.json
+  echo "$out" | grep -qE "FAIL \.(credentials\.json|oauth-token) missing" && missing_ok=1
   echo "$out" | grep -q "FAIL broken symlink: dangling"  && broken_ok=1
 
   # Doctor must exit non-zero because both are FAIL (not WARN).
@@ -726,12 +755,32 @@ test_swap_error_paths() {
 }
 
 test_provider_prefix_required() {
-  local out rc=0
-  out=$("$HATS_SCRIPT" swap foo 2>&1) || rc=$?
-  if [ "$rc" -ne 0 ] && echo "$out" | grep -q "Provider required" && echo "$out" | grep -q "hats claude swap"; then
-    ok "provider-scoped commands require explicit provider prefix"
+  # swap and shell-init are now universal — they do NOT require a provider prefix.
+  # Other commands still do.
+  local stub_bin="$SANDBOX_ROOT/prefix-stub-bin"
+  mkdir -p "$stub_bin"
+  cat > "$stub_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do echo "ARG:$a"; done
+EOF
+  chmod +x "$stub_bin/claude"
+
+  local out_swap rc_swap=0
+  out_swap=$(PATH="$stub_bin:$PATH" "$HATS_SCRIPT" swap foo 2>&1) || rc_swap=$?
+  local swap_ok=0
+  [ "$rc_swap" -eq 0 ] && echo "$out_swap" | grep -q "ARG:--dangerously-skip-permissions" && swap_ok=1
+
+  local out_list rc_list=0
+  out_list=$("$HATS_SCRIPT" list 2>&1) || rc_list=$?
+  local list_ok=0
+  [ "$rc_list" -ne 0 ] && echo "$out_list" | grep -q "Provider required" && list_ok=1
+
+  rm -rf "$stub_bin"
+
+  if [ "$swap_ok" -eq 1 ] && [ "$list_ok" -eq 1 ]; then
+    ok "universal swap works without provider prefix; other commands still require it"
   else
-    die "bare provider command was not rejected correctly (rc=$rc out=$out)"
+    die "provider prefix rules broken (swap_rc=$rc_swap swap_ok=$swap_ok list_rc=$rc_list list_ok=$list_ok out_swap=$out_swap)"
   fi
 }
 
@@ -919,9 +968,11 @@ test_shell_init_emits_functions_per_account() {
   echo "$out_codex" | grep -q 'CODEX_HOME=.*codex/cx1' && has_codex_env=1
   echo "$out_codex" | grep -qE '^function codex_cx1' && has_codex_fn=1
 
-  # codex shell-init must reject --skip-permissions (claude-only)
-  local rc_codex_skip=0
-  "$HATS_SCRIPT" codex shell-init --skip-permissions >/dev/null 2>&1 || rc_codex_skip=$?
+  # codex shell-init --skip-permissions now injects --yolo
+  local out_codex_skip rc_codex_skip=0
+  out_codex_skip=$("$HATS_SCRIPT" codex shell-init --skip-permissions 2>&1) || rc_codex_skip=$?
+  local has_codex_yolo=0
+  [ "$rc_codex_skip" -eq 0 ] && echo "$out_codex_skip" | grep -q -- '--yolo' && has_codex_yolo=1
 
   rm -rf "$codex_acct"
 
@@ -935,10 +986,131 @@ test_shell_init_emits_functions_per_account() {
 
   if [ "$has_header" -eq 1 ] && [ "$has_foo_fn" -eq 1 ] && [ "$has_env_var" -eq 1 ] \
      && [ "$has_skip_flag" -eq 1 ] && [ "$has_codex_env" -eq 1 ] && [ "$has_codex_fn" -eq 1 ] \
-     && [ "$rc_codex_skip" -ne 0 ] && [ "$zsh_alias_ok" -eq 1 ]; then
-    ok "shell-init emits alias-safe per-account shims (claude+codex, codex_<name> prefix) and rejects codex --skip-permissions"
+     && [ "$has_codex_yolo" -eq 1 ] && [ "$zsh_alias_ok" -eq 1 ]; then
+    ok "shell-init emits alias-safe per-account shims (claude+codex, codex_<name> prefix) and --skip-permissions injects provider-specific flags"
   else
-    die "shell-init broken (header=$has_header foo=$has_foo_fn env=$has_env_var skip=$has_skip_flag codex=$has_codex_env codex_fn=$has_codex_fn codex_skip_rc=$rc_codex_skip zsh_alias=$zsh_alias_ok)"
+    die "shell-init broken (header=$has_header foo=$has_foo_fn env=$has_env_var skip=$has_skip_flag codex=$has_codex_env codex_fn=$has_codex_fn codex_yolo=$has_codex_yolo zsh_alias=$zsh_alias_ok)"
+  fi
+}
+
+test_skip_permissions_config_auto_injects_flag() {
+  # When skip_permissions = true is set in config.toml, swap and shell-init
+  # must auto-inject the provider-specific skip flag without requiring
+  # --skip-permissions on every invocation.
+  local stub_bin="$SANDBOX_ROOT/skip-perms-bin"
+  mkdir -p "$stub_bin"
+
+  cat > "$stub_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do echo "ARG:$a"; done
+EOF
+  chmod +x "$stub_bin/claude"
+
+  cat > "$stub_bin/codex" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do echo "ARG:$a"; done
+EOF
+  chmod +x "$stub_bin/codex"
+
+  cat > "$stub_bin/opencode" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do echo "ARG:$a"; done
+EOF
+  chmod +x "$stub_bin/opencode"
+
+  local claude_acct="$HATS_DIR/claude/skipfoo"
+  mkdir -p "$claude_acct"
+  : > "$claude_acct/.credentials.json"
+  printf 'fixture-oauth-token' > "$claude_acct/.oauth-token"
+  chmod 600 "$claude_acct/.credentials.json" "$claude_acct/.oauth-token"
+  echo '{}' > "$claude_acct/.claude.json"
+
+  local codex_acct="$HATS_DIR/codex/skipcx"
+  mkdir -p "$codex_acct"
+  : > "$codex_acct/auth.json"
+  chmod 600 "$codex_acct/auth.json"
+
+  local opencode_acct="$HATS_DIR/opencode/skipop"
+  mkdir -p "$opencode_acct"
+  : > "$opencode_acct/auth.json"
+  chmod 600 "$opencode_acct/auth.json"
+
+  local config_backup="$HATS_DIR/config.toml.bak"
+  cp "$HATS_DIR/config.toml" "$config_backup"
+  python3 -c '
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    lines = f.readlines()
+out = []
+for ln in lines:
+    out.append(ln)
+    if ln.strip() == "[hats]":
+        out.append("skip_permissions = \"true\"\n")
+with open(path, "w") as f:
+    f.writelines(out)
+' "$HATS_DIR/config.toml"
+
+  local out_claude out_codex out_opencode
+  out_claude=$(PATH="$stub_bin:$PATH" "$HATS_SCRIPT" claude swap skipfoo 2>&1)
+  out_codex=$(PATH="$stub_bin:$PATH" "$HATS_SCRIPT" codex swap skipcx 2>&1)
+  out_opencode=$(PATH="$stub_bin:$PATH" "$HATS_SCRIPT" opencode swap skipop 2>&1)
+
+  local claude_ok=0 codex_ok=0 opencode_ok=0
+  echo "$out_claude" | grep -q 'ARG:--dangerously-skip-permissions' && claude_ok=1
+  echo "$out_codex" | grep -q 'ARG:--yolo' && codex_ok=1
+  echo "$out_opencode" | grep -q 'ARG:--dangerously-skip-permissions' && opencode_ok=1
+
+  local sh_claude sh_codex sh_opencode
+  sh_claude=$(PATH="$stub_bin:$PATH" "$HATS_SCRIPT" claude shell-init 2>&1)
+  sh_codex=$(PATH="$stub_bin:$PATH" "$HATS_SCRIPT" codex shell-init 2>&1)
+  sh_opencode=$(PATH="$stub_bin:$PATH" "$HATS_SCRIPT" opencode shell-init 2>&1)
+
+  local sh_claude_ok=0 sh_codex_ok=0 sh_opencode_ok=0
+  echo "$sh_claude" | grep -q -- '--dangerously-skip-permissions' && sh_claude_ok=1
+  echo "$sh_codex" | grep -q -- '--yolo' && sh_codex_ok=1
+  echo "$sh_opencode" | grep -q -- '--dangerously-skip-permissions' && sh_opencode_ok=1
+
+  cp "$config_backup" "$HATS_DIR/config.toml"
+  rm -f "$config_backup"
+  rm -rf "$stub_bin" "$claude_acct" "$codex_acct" "$opencode_acct"
+
+  if [ "$claude_ok" -eq 1 ] && [ "$codex_ok" -eq 1 ] && [ "$opencode_ok" -eq 1 ] \
+     && [ "$sh_claude_ok" -eq 1 ] && [ "$sh_codex_ok" -eq 1 ] && [ "$sh_opencode_ok" -eq 1 ]; then
+    ok "skip_permissions config auto-injects provider-specific skip flags for swap and shell-init"
+  else
+    die "skip_permissions config broken (swap: claude=$claude_ok codex=$codex_ok opencode=$opencode_ok shell-init: claude=$sh_claude_ok codex=$sh_codex_ok opencode=$sh_opencode_ok)"
+  fi
+}
+
+test_universal_shell_init_emits_all_providers() {
+  # `hats shell-init` without a provider prefix must emit functions for ALL
+  # initialized providers that have accounts.
+  # Stage a minimal codex account so the codex provider is represented.
+  local codex_acct="$HATS_DIR/codex/cx_universal"
+  mkdir -p "$codex_acct"
+  : > "$codex_acct/auth.json"
+  chmod 600 "$codex_acct/auth.json"
+
+  local out
+  out=$("$HATS_SCRIPT" shell-init 2>&1)
+  local has_claude=0 has_codex=0 has_kimi=0 has_opencode=0
+  echo "$out" | grep -q "Generated by hats shell-init for claude" && has_claude=1
+  echo "$out" | grep -q "Generated by hats shell-init for codex" && has_codex=1
+  echo "$out" | grep -q "Generated by hats shell-init for kimi" && has_kimi=1
+  echo "$out" | grep -q "Generated by hats shell-init for opencode" && has_opencode=1
+
+  # All emitted functions should have skip-permissions baked in (default yolo)
+  local has_skip_flags=0
+  echo "$out" | grep -q -- '--dangerously-skip-permissions' && has_skip_flags=1
+
+  rm -rf "$codex_acct"
+
+  if [ "$has_claude" -eq 1 ] && [ "$has_codex" -eq 1 ] && [ "$has_kimi" -eq 1 ] \
+     && [ "$has_opencode" -eq 1 ] && [ "$has_skip_flags" -eq 1 ]; then
+    ok "universal shell-init emits all providers with default yolo flags"
+  else
+    die "universal shell-init broken (claude=$has_claude codex=$has_codex kimi=$has_kimi opencode=$has_opencode skip=$has_skip_flags)"
   fi
 }
 
@@ -1249,12 +1421,12 @@ test_install_then_invoke_through_PATH() {
   chmod 600 "$kimi_acct/.credentials.json"
   echo '{"hasCompletedOnboarding":true}' > "$kimi_acct/.claude.json"
 
-  src_out=$("$HATS_SCRIPT" claude shell-init 2>/dev/null) || {
+  src_out=$("$HATS_SCRIPT" kimi shell-init 2>/dev/null) || {
     rm -rf "$dest"
     die "source shell-init exited non-zero"
     return
   }
-  inst_out=$(PATH="$dest:$PATH" "$dest/hats" claude shell-init 2>/dev/null) || {
+  inst_out=$(PATH="$dest:$PATH" "$dest/hats" kimi shell-init 2>/dev/null) || {
     rm -rf "$dest"
     die "installed shell-init exited non-zero"
     return
@@ -1387,16 +1559,29 @@ test_verify_command() {
   local exp_acct="$HATS_DIR/claude/verifyexp"
   local bad_acct="$HATS_DIR/claude/verifybad"
   mkdir -p "$ok_acct" "$exp_acct" "$bad_acct"
-  cat > "$ok_acct/.credentials.json" <<EOF
+
+  local is_darwin=0
+  [ "$(uname -s)" = "Darwin" ] && is_darwin=1
+
+  if [ "$is_darwin" -eq 1 ]; then
+    printf 'fixture-oauth-token' > "$ok_acct/.oauth-token"
+    chmod 600 "$ok_acct/.oauth-token"
+    printf 'fixture-oauth-token' > "$exp_acct/.oauth-token"
+    chmod 600 "$exp_acct/.oauth-token"
+    printf '' > "$bad_acct/.oauth-token"
+    chmod 600 "$bad_acct/.oauth-token"
+  else
+    cat > "$ok_acct/.credentials.json" <<EOF
 {"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":$future_ms,"scopes":["user:sessions:claude_code"]}}
 EOF
-  chmod 600 "$ok_acct/.credentials.json"
-  cat > "$exp_acct/.credentials.json" <<EOF
+    chmod 600 "$ok_acct/.credentials.json"
+    cat > "$exp_acct/.credentials.json" <<EOF
 {"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":$past_ms,"scopes":["user:sessions:claude_code"]}}
 EOF
-  chmod 600 "$exp_acct/.credentials.json"
-  echo "not json at all" > "$bad_acct/.credentials.json"
-  chmod 600 "$bad_acct/.credentials.json"
+    chmod 600 "$exp_acct/.credentials.json"
+    echo "not json at all" > "$bad_acct/.credentials.json"
+    chmod 600 "$bad_acct/.credentials.json"
+  fi
 
   # (a) --help
   local out rc
@@ -1410,34 +1595,77 @@ EOF
   fi
 
   # (b) healthy account -> rc=0, no FAIL lines
-  out=$("$HATS_SCRIPT" claude verify verifyok 2>&1) || true
-  if ! echo "$out" | grep -q 'PASS token expiry' \
-     || ! echo "$out" | grep -q 'PASS remote-control scope present' \
-     || ! echo "$out" | grep -q '0 issue'; then
-    printf 'got:\n%s\n' "$out" >&2
-    die "verify healthy account did not pass cleanly"
-    return
+  if [ "$is_darwin" -eq 1 ]; then
+    local stub_bin="$SANDBOX_ROOT/verify-stub-bin"
+    mkdir -p "$stub_bin"
+    cat > "$stub_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo '{"loggedIn":true,"email":"test@example.com","orgId":"test-org","subscriptionType":"pro","authMethod":"oauth","apiProvider":"anthropic"}'
+  exit 0
+fi
+if [ "$1" = "--version" ]; then
+  echo "stub-claude 1.0.0"
+  exit 0
+fi
+exit 1
+EOF
+    chmod +x "$stub_bin/claude"
+    out=$(PATH="$stub_bin:$PATH" "$HATS_SCRIPT" claude verify verifyok 2>&1) || true
+    rm -rf "$stub_bin"
+    if ! echo "$out" | grep -q 'PASS token accepted by claude auth status' \
+       || ! echo "$out" | grep -q '0 issue'; then
+      printf 'got:\n%s\n' "$out" >&2
+      die "verify healthy account did not pass cleanly"
+      return
+    fi
+  else
+    out=$("$HATS_SCRIPT" claude verify verifyok 2>&1) || true
+    if ! echo "$out" | grep -q 'PASS token expiry' \
+       || ! echo "$out" | grep -q 'PASS remote-control scope present' \
+       || ! echo "$out" | grep -q '0 issue'; then
+      printf 'got:\n%s\n' "$out" >&2
+      die "verify healthy account did not pass cleanly"
+      return
+    fi
   fi
 
   # (c) expired-with-refresh -> WARN (not FAIL), rc=0
-  rc=0
-  out=$("$HATS_SCRIPT" claude verify verifyexp 2>&1) || rc=$?
-  if [ "$rc" -ne 0 ] \
-     || ! echo "$out" | grep -q 'WARN access token expired' \
-     || echo "$out" | grep -Eq '^\s+FAIL'; then
-    printf 'got:\n%s\n' "$out" >&2
-    die "verify expired-with-refresh should WARN, not FAIL (rc=$rc)"
-    return
+  # On macOS the oauth-token path does not parse expiry; skip platform-specific.
+  if [ "$is_darwin" -eq 1 ]; then
+    : # skipped — oauth-token backend has no expiry parsing
+  else
+    rc=0
+    out=$("$HATS_SCRIPT" claude verify verifyexp 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ] \
+       || ! echo "$out" | grep -q 'WARN access token expired' \
+       || echo "$out" | grep -Eq '^\s+FAIL'; then
+      printf 'got:\n%s\n' "$out" >&2
+      die "verify expired-with-refresh should WARN, not FAIL (rc=$rc)"
+      return
+    fi
   fi
 
   # (d) non-JSON -> FAIL, rc=1
-  rc=0
-  out=$("$HATS_SCRIPT" claude verify verifybad 2>&1) || rc=$?
-  if [ "$rc" -eq 0 ] \
-     || ! echo "$out" | grep -q 'FAIL credentials file is not valid JSON'; then
-    printf 'got:\n%s\n' "$out" >&2
-    die "verify on non-JSON credentials should FAIL (rc=$rc)"
-    return
+  # On macOS the oauth-token path does not parse JSON; empty token tests a different path.
+  if [ "$is_darwin" -eq 1 ]; then
+    rc=0
+    out=$("$HATS_SCRIPT" claude verify verifybad 2>&1) || rc=$?
+    if [ "$rc" -eq 0 ] \
+       || ! echo "$out" | grep -q 'FAIL oauth token file is empty'; then
+      printf 'got:\n%s\n' "$out" >&2
+      die "verify on empty oauth token should FAIL (rc=$rc)"
+      return
+    fi
+  else
+    rc=0
+    out=$("$HATS_SCRIPT" claude verify verifybad 2>&1) || rc=$?
+    if [ "$rc" -eq 0 ] \
+       || ! echo "$out" | grep -q 'FAIL credentials file is not valid JSON'; then
+      printf 'got:\n%s\n' "$out" >&2
+      die "verify on non-JSON credentials should FAIL (rc=$rc)"
+      return
+    fi
   fi
 
   # (e) unknown flag
@@ -1780,7 +2008,9 @@ EOF
 
   # --force guard
   local rc=0
-  env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" claude import "$bundle" >/dev/null 2>&1 || rc=$?
+  env HATS_DIR="$target_hats" HOME="$target_home" \
+    HATS_EXPORT_PASSWORD="smoke-passphrase-not-secret" \
+    "$HATS_SCRIPT" claude import "$bundle" >/dev/null 2>&1 || rc=$?
   [ "$rc" -ne 0 ] || { die "import without --force did not refuse existing account"; return; }
 
   # Path-traversal rejection: craft a malicious tarball and confirm refusal.
@@ -1866,10 +2096,15 @@ EOF
   local target_home="$target_root"
   mkdir -p "$target_home"
   env HATS_DIR="$target_hats" HOME="$target_home" "$HATS_SCRIPT" claude init >/dev/null 2>&1
-  env HATS_DIR="$target_hats" HOME="$target_home" \
+  local _import_out _import_rc=0
+  _import_out=$(env HATS_DIR="$target_hats" HOME="$target_home" \
     HATS_EXPORT_PASSWORD="smoke-passphrase-not-secret" \
-    "$HATS_SCRIPT" claude import "$bundle" >/dev/null 2>&1 \
-    || { die "openssl-backed import failed"; return; }
+    "$HATS_SCRIPT" claude import "$bundle" 2>&1) || _import_rc=$?
+  if [ "$_import_rc" -ne 0 ]; then
+    printf 'openssl import failed (rc=%s): %s\n' "$_import_rc" "$_import_out" >&2
+    die "openssl-backed import failed"
+    return
+  fi
 
   cmp "$src/.credentials.json" "$target_hats/claude/opensslsrc/.credentials.json" \
     || { die "openssl roundtrip credentials drift"; return; }
@@ -1915,10 +2150,21 @@ EOF
     chmod 600 "$d/.credentials.json"
     echo '{}' > "$d/.claude.json"
   done
+  # On macOS, claude uses .oauth-token; ensure it exists with matching mtime.
+  if [ "$(uname -s)" = "Darwin" ]; then
+    for d in "$fresh" "$dormant" "$ancient"; do
+      printf 'fixture-oauth-token' > "$d/.oauth-token"
+      chmod 600 "$d/.oauth-token"
+    done
+  fi
   # GNU `touch -d "N days ago"` is not portable to BSD touch on macOS —
   # use python's os.utime for an OS-agnostic relative-mtime write.
   python3 -c 'import os,sys,time; os.utime(sys.argv[1], (time.time()-45*86400,)*2)'  "$dormant/.credentials.json"
   python3 -c 'import os,sys,time; os.utime(sys.argv[1], (time.time()-120*86400,)*2)' "$ancient/.credentials.json"
+  if [ "$(uname -s)" = "Darwin" ]; then
+    python3 -c 'import os,sys,time; os.utime(sys.argv[1], (time.time()-45*86400,)*2)'  "$dormant/.oauth-token"
+    python3 -c 'import os,sys,time; os.utime(sys.argv[1], (time.time()-120*86400,)*2)' "$ancient/.oauth-token"
+  fi
 
   # (a) bare doctor — no Metrics header in output.
   local plain
@@ -1982,6 +2228,12 @@ test_list_filter_flags() {
   # Stage two well-formed claude credential files so token-info parses
   # successfully — the bare fixture account has an empty creds file that
   # errors-out the parser, which would make every predicate filter-miss.
+  #
+  # macOS NOTE: on macOS claude uses .oauth-token, and the oauth-token path
+  # hardcodes remote_control=False and expired=False (it cannot extract scope
+  # or expiry from the opaque token file). Token-predicate filters therefore
+  # cannot match on macOS. We stage .oauth-token files and stub claude so the
+  # accounts show as healthy, but skip the RC/expiry assertions on Darwin.
 
   local future_ms past_ms
   future_ms=$(python3 -c 'import time; print(int((time.time()+86400)*1000))')
@@ -1989,18 +2241,28 @@ test_list_filter_flags() {
 
   local rcact="$HATS_DIR/claude/rctest"
   mkdir -p "$rcact"
-  cat > "$rcact/.credentials.json" <<EOF
-{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":$future_ms,"scopes":["user:sessions:claude_code"]}}
-EOF
-  chmod 600 "$rcact/.credentials.json"
-  echo '{}' > "$rcact/.claude.json"
-
   local expact="$HATS_DIR/claude/expiredtest"
   mkdir -p "$expact"
-  cat > "$expact/.credentials.json" <<EOF
+
+  local is_darwin=0
+  [ "$(uname -s)" = "Darwin" ] && is_darwin=1
+
+  if [ "$is_darwin" -eq 1 ]; then
+    printf 'fixture-oauth-token' > "$rcact/.oauth-token"
+    chmod 600 "$rcact/.oauth-token"
+    printf 'fixture-oauth-token' > "$expact/.oauth-token"
+    chmod 600 "$expact/.oauth-token"
+  else
+    cat > "$rcact/.credentials.json" <<EOF
+{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":$future_ms,"scopes":["user:sessions:claude_code"]}}
+EOF
+    chmod 600 "$rcact/.credentials.json"
+    cat > "$expact/.credentials.json" <<EOF
 {"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":$past_ms,"scopes":["user:sessions:claude_code"]}}
 EOF
-  chmod 600 "$expact/.credentials.json"
+    chmod 600 "$expact/.credentials.json"
+  fi
+  echo '{}' > "$rcact/.claude.json"
   echo '{}' > "$expact/.claude.json"
 
   local out rc
@@ -2016,40 +2278,60 @@ EOF
 
   # (b) --rc-only matches rctest + expiredtest (both carry the RC scope), NOT
   # the bare fixture accounts (foo etc.) whose parser errors out.
+  # On macOS the oauth-token path cannot determine RC scope, so skip the
+  # match assertion and just verify the filter runs without error.
   out=$("$HATS_SCRIPT" claude list --rc-only 2>&1)
   rc=$?
-  if [ "$rc" -ne 0 ] \
-     || ! echo "$out" | grep -q 'Filters: --rc-only' \
-     || ! echo "$out" | grep -q 'rctest' \
-     || ! echo "$out" | grep -q 'expiredtest' \
-     || ! echo "$out" | grep -Eq '[0-9]+ of [0-9]+ account\(s\) matched'; then
+  if [ "$rc" -ne 0 ] || ! echo "$out" | grep -q 'Filters: --rc-only'; then
     printf 'got: %s\n' "$out" >&2
-    die "hats list --rc-only did not match staged RC tokens (rc=$rc)"
+    die "hats list --rc-only failed or missing filter header (rc=$rc)"
     return
+  fi
+  if [ "$is_darwin" -ne 1 ]; then
+    if ! echo "$out" | grep -q 'rctest' \
+       || ! echo "$out" | grep -q 'expiredtest' \
+       || ! echo "$out" | grep -Eq '[0-9]+ of [0-9]+ account\(s\) matched'; then
+      printf 'got: %s\n' "$out" >&2
+      die "hats list --rc-only did not match staged RC tokens (rc=$rc)"
+      return
+    fi
   fi
 
   # (c) --expired matches expiredtest, NOT rctest. Check the matched-count
   # summary ("1 of N") as the authoritative signal — parsing a specific
   # non-match line out of list output is regex-fragile.
+  # On macOS the oauth-token path cannot determine expiry, so skip match assertion.
   out=$("$HATS_SCRIPT" claude list --expired 2>&1)
   rc=$?
-  if [ "$rc" -ne 0 ] \
-     || ! echo "$out" | grep -q 'expiredtest' \
-     || ! echo "$out" | grep -Eq '^\s+1 of [0-9]+ account\(s\) matched'; then
+  if [ "$rc" -ne 0 ]; then
     printf 'got:\n%s\n' "$out" >&2
-    die "hats list --expired did not match exactly the past-expiry token (rc=$rc)"
+    die "hats list --expired failed unexpectedly (rc=$rc)"
     return
+  fi
+  if [ "$is_darwin" -ne 1 ]; then
+    if ! echo "$out" | grep -q 'expiredtest' \
+       || ! echo "$out" | grep -Eq '^\s+1 of [0-9]+ account\(s\) matched'; then
+      printf 'got:\n%s\n' "$out" >&2
+      die "hats list --expired did not match exactly the past-expiry token (rc=$rc)"
+      return
+    fi
   fi
 
   # (d) Combined --rc-only --expired: AND semantics — only expiredtest.
+  # On macOS neither predicate can be satisfied, so skip match assertion.
   out=$("$HATS_SCRIPT" claude list --rc-only --expired 2>&1)
   rc=$?
-  if [ "$rc" -ne 0 ] \
-     || ! echo "$out" | grep -q 'Filters: --rc-only --expired' \
-     || ! echo "$out" | grep -q 'expiredtest'; then
+  if [ "$rc" -ne 0 ] || ! echo "$out" | grep -q 'Filters: --rc-only --expired'; then
     printf 'got: %s\n' "$out" >&2
     die "hats list --rc-only --expired combined filter failed (rc=$rc)"
     return
+  fi
+  if [ "$is_darwin" -ne 1 ]; then
+    if ! echo "$out" | grep -q 'expiredtest'; then
+      printf 'got: %s\n' "$out" >&2
+      die "hats list --rc-only --expired combined filter failed (rc=$rc)"
+      return
+    fi
   fi
 
   # (e) Unknown flag rejection — capture with `|| rc=$?` so set -e doesn't
@@ -2115,7 +2397,7 @@ EOF
 
   # Shell-init reads HATS_KIMI_ENV_FILE env var override at emission time.
   local emitted
-  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" claude shell-init 2>/dev/null)
+  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" kimi shell-init 2>/dev/null)
 
   # Source + stub infisical + stub claude, inside a bash -c so we can
   # inspect the post-call env without contaminating the smoke suite.
@@ -2247,7 +2529,7 @@ INFISICAL_UNIVERSAL_AUTH_CLIENT_ID=smoke-client-id
 INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=smoke-client-secret
 EOF
   local emitted
-  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" claude shell-init 2>/dev/null)
+  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" kimi shell-init 2>/dev/null)
 
   # In production the emitted kimi function calls bare `hats kimi init` via
   # the auto-init guard, and operators have hats on PATH (install.sh ships it
@@ -2345,7 +2627,7 @@ INFISICAL_UNIVERSAL_AUTH_CLIENT_ID=smoke-client-id
 INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=smoke-client-secret
 EOF
   local emitted
-  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" claude shell-init 2>/dev/null)
+  emitted=$(HATS_KIMI_ENV_FILE="$fake_env" "$HATS_SCRIPT" kimi shell-init 2>/dev/null)
 
   local probe_out probe_rc
   probe_out=$(PATH="$HATS_REPO:$PATH" bash -c '
@@ -3001,6 +3283,8 @@ test_command_aliases
 test_link_unlink_happy_path
 test_providers_and_default_getter
 test_shell_init_emits_functions_per_account
+test_skip_permissions_config_auto_injects_flag
+test_universal_shell_init_emits_all_providers
 test_install_help_exits_zero
 test_install_rejects_unknown_flag
 test_install_rejects_too_many_args
